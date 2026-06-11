@@ -100,14 +100,14 @@ function open_matvec_thread(ci_vector::TPSCIstate{T,N,R}, cluster_ops, clustered
     println(" Number of jobs:    ", length(jobs_vec))
     println(" Number of threads: ", Threads.nthreads())
     BLAS.set_num_threads(1)
-    #Threads.@threads for job in jobs_vec
+    #Threads.@threads :static for job in jobs_vec
   
     flush(stdout)
 
     #@time for job in jobs_vec
     #@qthreads for job in jobs_vec
     @printf(" %-50s", "Compute matrix-vector: ")
-    @time @Threads.threads for job in jobs_vec
+    @time @Threads.threads :static for job in jobs_vec
         fock_bra = job[1]
         tid = Threads.threadid()
         _open_matvec_thread_job(job[2], fock_bra, cluster_ops, nbody, thresh, 

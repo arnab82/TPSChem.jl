@@ -5,7 +5,6 @@ version = "0.1.0"
 
 [deps]
 Arpack = "7d9fca2a-8960-54d3-9f78-7d1dccf2cb97"
-BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 Combinatorics = "861a8166-3701-5b0c-9a16-15d98fcdc6aa"
 Compat = "34da2185-b29b-5c13-b0c7-acf172513d20"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
@@ -21,7 +20,6 @@ Optim = "429524aa-4258-5aef-a3af-852621145aeb"
 OrderedCollections = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
 Parameters = "d96e819e-fc66-5662-9728-84c9c7592b0a"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
-Profile = "9abbd945-dff8-562f-b5e8-e1ebf5ef1b79"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 TensorOperations = "6aa20fa7-93e2-5fca-9bc0-fbd0db3c71a2"
@@ -36,7 +34,6 @@ TPSChemPyCallExt = "PyCall"
 
 [compat]
 Arpack = "0.5"
-BenchmarkTools = "1"
 Combinatorics = "1"
 Compat = "4"
 IterTools = "1"

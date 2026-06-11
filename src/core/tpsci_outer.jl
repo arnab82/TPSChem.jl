@@ -1,6 +1,5 @@
 using TimerOutputs
 using .BlockDavidson
-using BenchmarkTools
 
 """
     build_full_H(ci_vector::TPSCIstate, cluster_ops, clustered_ham::ClusteredOperator)
@@ -127,7 +126,7 @@ function build_full_H_parallel( ci_vector_l::TPSCIstate{T,N,R}, ci_vector_r::TPS
     #jobs = jobs[perm]
     
     #for job in jobs
-    Threads.@threads for job in jobs
+    Threads.@threads :static for job in jobs
         do_job(job)
         #@btime $do_job($job)
     end
@@ -510,7 +509,7 @@ function tps_ci_matvec(ci_vector::TPSCIstate{T,N,R}, cluster_ops, clustered_ham:
     end
 
     #for job in jobs
-    Threads.@threads for job in jobs
+    Threads.@threads :static for job in jobs
         do_job(job)
         #@btime $do_job($job)
     end
@@ -672,7 +671,7 @@ function compute_expectation_value_parallel(ci_vector::TPSCIstate{T,N,R}, cluste
     end
 
     #for job in jobs
-    #Threads.@threads for job in jobs
+    #Threads.@threads :static for job in jobs
     @qthreads for job in jobs
         do_job(job)
         #@btime $do_job($job)

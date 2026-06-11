@@ -1,4 +1,3 @@
-using BenchmarkTools
 tuckA = TPSChem.Tucker(rand(12,11,1,1,1,10,1,1,3,10,2,1,1,10,1,1,1,1,1,1));
 tuckB = TPSChem.Tucker(rand(12,11,1,1,1,10,1,1,3,10,2,1,1,10,1,1,1,1,1,1));
 

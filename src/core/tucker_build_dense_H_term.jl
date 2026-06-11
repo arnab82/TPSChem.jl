@@ -222,7 +222,7 @@ function build_dense_H_term(term::ClusteredTerm2B, cluster_ops, fock_bra, bra, c
     
     tmp = reshape2(tmp, (size(gamma1,1), size(Ul,2), size(gamma1,3)))
     g1 = reshape2(g1, (size(gamma1,1), size(Ul,2), size(Ur,2)))
-    
+
     @tensor begin
         tmp[p,k,J] = Ul[I,k] * gamma1[p,I,J]
         g1[p,k,l] = Ur[J,l] * tmp[p,k,J]
@@ -237,7 +237,7 @@ function build_dense_H_term(term::ClusteredTerm2B, cluster_ops, fock_bra, bra, c
     
     tmp = reshape2(tmp, (size(gamma2,1), size(Ul,2), size(gamma2,3)))
     g2 = reshape2(g2, (size(gamma2,1), size(Ul,2), size(Ur,2)))
-    
+
     @tensor begin
         tmp[p,k,J] = Ul[I,k] * gamma2[p,I,J]
         g2[p,k,l] = Ur[J,l] * tmp[p,k,J]

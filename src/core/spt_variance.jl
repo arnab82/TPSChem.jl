@@ -258,7 +258,7 @@ function compute_spt_sigma_norm_blockwise(ref::BSTstate{T,N,R}, cluster_ops, clu
     nprinted = 0
 
     alloc = @allocated t = @elapsed begin
-        @Threads.threads for (jobi, job) in collect(enumerate(jobs_vec))
+        @Threads.threads :static for (jobi, job) in collect(enumerate(jobs_vec))
             fock_sig = job[1]
             tid = Threads.threadid()
 
@@ -392,7 +392,7 @@ function compute_spt_sigma_norm_blockwise_new(ref::BSTstate{T,N,R}, cluster_ops,
     nprinted = 0
 
     alloc = @allocated t = @elapsed begin
-        @Threads.threads for jobi in eachindex(jobs_vec)
+        @Threads.threads :static for jobi in eachindex(jobs_vec)
             fock_sig, job = jobs_vec[jobi]
             tid = Threads.threadid()
 
@@ -828,7 +828,7 @@ function compute_spt_sigma_norm_blockwise_alternative(
     verbose < 2 || print(" |")
 
     alloc = @allocated t = @elapsed begin
-        @Threads.threads for jobi in 1:nj
+        @Threads.threads :static for jobi in 1:nj
             fock_sig, job = jobs_vec[jobi]
             tid = Threads.threadid()
 

@@ -1,6 +1,5 @@
 using LinearAlgebra 
 using Printf
-using Profile
 using LinearMaps
 using ...InCoreIntegrals
 using ..ActiveSpaceSolvers

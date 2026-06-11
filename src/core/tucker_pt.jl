@@ -735,11 +735,11 @@ function compute_pt2_energy(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
     verbose < 2 || println(" |----------------------------------------------------------------------------------------------------|")
     verbose < 2 || println(" |0%                                                                                              100%|")
     verbose < 2 || print(" |")
-    #@profilehtml @Threads.threads for job in jobs_vec
+    #@profilehtml @Threads.threads :static for job in jobs_vec
     nprinted = 0
     alloc = @allocated t = @elapsed begin
         
-        @Threads.threads for (jobi,job) in collect(enumerate(jobs_vec))
+        @Threads.threads :static for (jobi,job) in collect(enumerate(jobs_vec))
         #for (jobi,job) in collect(enumerate(jobs_vec))
             fock_sig = job[1]
             tid = Threads.threadid()
@@ -1055,11 +1055,11 @@ function compute_pt2_energy2(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
     verbose < 2 || println(" |----------------------------------------------------------------------------------------------------|")
     verbose < 2 || println(" |0%                                                                                              100%|")
     verbose < 2 || print(" |")
-    #@profilehtml @Threads.threads for job in jobs_vec
+    #@profilehtml @Threads.threads :static for job in jobs_vec
     nprinted = 0
     alloc = @allocated t = @elapsed begin
         
-        @Threads.threads for (jobi,job) in collect(enumerate(jobs_vec))
+        @Threads.threads :static for (jobi,job) in collect(enumerate(jobs_vec))
         #for (jobi,job) in collect(enumerate(jobs_vec))
             fock_sig = job[1]
             tid = Threads.threadid()
@@ -1508,7 +1508,7 @@ function compute_pt2_energy_blockwise(ref::BSTstate{T,N,R}, cluster_ops, cluster
 
     nprinted = 0
     alloc = @allocated t = @elapsed begin
-        @Threads.threads for (jobi, (fock_sig, job)) in collect(enumerate(jobs_vec))
+        @Threads.threads :static for (jobi, (fock_sig, job)) in collect(enumerate(jobs_vec))
             tid = Threads.threadid()
             e2_thread[tid] .+= _pt2_job_blockwise(fock_sig, job, ref_vec,
                                                cluster_ops, clustered_ham,

@@ -136,12 +136,12 @@ function compute_pt2_energy(ci_vector_in::TPSCIstate{T,N,R}, cluster_ops, cluste
     verbose < 1 || println("   |----------------------------------------------------------------------------------------------------|")
     verbose < 1 || println("   |0%                                                                                              100%|")
     verbose < 1 || print("   |")
-    #@profilehtml @Threads.threads for job in jobs_vec
+    #@profilehtml @Threads.threads :static for job in jobs_vec
     t = @elapsed begin
         #@qthreads for job in jobs_vec
         #@time for job in jobs_vec
         
-        @Threads.threads for (jobi,job) in collect(enumerate(jobs_vec))
+        @Threads.threads :static for (jobi,job) in collect(enumerate(jobs_vec))
         #for (jobi,job) in collect(enumerate(jobs_vec))
             fock_bra = job[1]
             tid = Threads.threadid()

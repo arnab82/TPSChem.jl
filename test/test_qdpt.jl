@@ -4,7 +4,6 @@ using TPSChem
 using Printf
 using Test
 using LinearAlgebra
-using Profile 
 using JLD2
 
 # load data

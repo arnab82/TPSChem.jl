@@ -169,28 +169,26 @@ function build_sigma!(sigma_vector::BSTstate{T,N,R}, ci_vector::BSTstate{T,N,R},
     verbose < 2 || println(" length of sigma vector: ", length(sigma_vector))
     flush(stdout)
     jobs = []
-    output = [[] for i in 1:Threads.maxthreadid()]
+    output_lock = ReentrantLock()
+    output = []
     for (fock_bra, configs_bra) in sigma_vector
         for (config_bra, tuck_bra) in configs_bra
             push!(jobs, [fock_bra, config_bra])
         end
     end
-    
-    # set up scratch arrays
-    nscr = 10 
-    scr_f = Vector{Vector{Vector{T}} }()
-    for tid in 1:Threads.maxthreadid()
-        tmp = Vector{Vector{T}}() 
-        [push!(tmp, zeros(T,1000)) for i in 1:nscr]
-        push!(scr_f, tmp)
-    end
-   
-    function do_job(job)
-        
+
+    nscr = 10
+
+    # Per-task scratch (allocated per job) to avoid races with Julia's dynamic
+    # scheduler -- same pattern as build_sigma_cepa!. Indexing scratch by
+    # threadid() is unsafe when tasks can migrate between threads.
+    function do_job(job, scr_f)
+
         fock_bra = job[1]
         config_bra = job[2]
         coeff_bra = sigma_vector[fock_bra][config_bra]
-        
+        task_output = []
+
         for (fock_ket, configs_ket) in ci_vector
             fock_trans = fock_bra - fock_ket
 
@@ -207,38 +205,35 @@ function build_sigma!(sigma_vector::BSTstate{T,N,R}, ci_vector::BSTstate{T,N,R},
                     check_term(term, fock_bra, config_bra, fock_ket, config_ket) || continue
 
                     # these methods dispatched on type of term
-                    #coeff_bra.core .= form_sigma_block!(term, cluster_ops, fock_bra, config_bra,
-                    #                              fock_ket, config_ket,
-                    #                              coeff_bra, coeff_ket,
-                    #                              cache=cache)
                     out = form_sigma_block!(term, cluster_ops, fock_bra, config_bra,
                                                   fock_ket, config_ket,
                                                   coeff_bra, coeff_ket,
-                                                  scr_f[Threads.threadid()],
+                                                  scr_f,
                                                   cache=cache)
 
-                    push!(output[Threads.threadid()], (fock_bra, config_bra, out))
+                    push!(task_output, (fock_bra, config_bra, out))
 
 
                 end
             end
         end
+        lock(output_lock) do
+            append!(output, task_output)
+        end
     end
-   
+
     Threads.@threads for job in jobs
     #for job in jobs
-        do_job(job)
+        do_job(job, [zeros(T,1000) for _ in 1:nscr])
     end
 
     flush(stdout)
 
-    for tid in output
-        for out in tid
-            fock_bra = out[1]
-            config_bra = out[2]
-            core = out[3]
-            add!(sigma_vector[fock_bra][config_bra].core, core)
-        end
+    for out in output
+        fock_bra = out[1]
+        config_bra = out[2]
+        core = out[3]
+        add!(sigma_vector[fock_bra][config_bra].core, core)
     end
     return
     #=}}}=#

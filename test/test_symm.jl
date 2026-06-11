@@ -5,7 +5,6 @@ using Test
 using LinearMaps
 using Arpack
 using Random
-using Profile 
 
 
 @testset "symm" begin

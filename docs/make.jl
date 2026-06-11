@@ -73,5 +73,4 @@ deploydocs(
     devbranch = "main",
     #push_preview = true,
     target= "build",
-    deps = Deps.pip("pygments", "mkdocs", "python-markdown-math")
 )

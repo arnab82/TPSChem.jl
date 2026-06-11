@@ -784,7 +784,7 @@ function build_compressed_1st_order_state(ψ::BSTstate{T,N,R}, cluster_ops, clus
     BLAS.set_num_threads(1)
     
     @printf(" %-50s", "Compute matrix-vector: ")
-    @time @Threads.threads for (fock_σ, jobs) in jobs_vec
+    @time @Threads.threads :static for (fock_σ, jobs) in jobs_vec
         tid = Threads.threadid()
         _build_compressed_1st_order_state_job(fock_σ, jobs, jobs_out[tid],
                 cluster_ops, nbody, thresh, max_number, prescreen, compress_twice,
@@ -1005,7 +1005,7 @@ function build_compressed_1st_order_state_old(ket_cts::BSTstate{T,N,R}, cluster_
         
     @printf(" %-50s%10i\n", "Number of tasks: ", length(keys_to_loop))
     @printf(" %-50s\n", "Compute tasks: ")
-    stats = @timed Threads.@threads for fock_trans in keys_to_loop
+    stats = @timed Threads.@threads :static for fock_trans in keys_to_loop
         for (ket_fock, ket_tconfigs) in ket_cts
             terms = clustered_ham[fock_trans]
 

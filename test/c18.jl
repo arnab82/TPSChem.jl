@@ -2,7 +2,6 @@ using TPSChem
 using Printf
 using Test
 using LinearAlgebra
-using Profile 
 using Random
 
 using PyCall
