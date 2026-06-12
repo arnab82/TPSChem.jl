@@ -87,9 +87,9 @@ function cmf_ci_iteration(mol::Molecule, C, rdm1a, rdm1b, clusters, fspace;
         ints_i = pyscf_build_ints(mol, C[:,ci.orb_list], Dembed);
         #
         # use pyscf to compute FCI energy
-        e, d1a,d1b, d2 = pyscf_fci(ints_i,fspace[ci.idx][1],fspace[ci.idx][2],
-                                          max_cycle=ci_max_iter, conv_tol=ci_conv_tol, verbose=verbose)
-        rdm1_dict[ci.idx] = [d1a,d1b]
+        e, d1a, d1b, d2, _ = pyscf_fci(ints_i, fspace[ci.idx][1], fspace[ci.idx][2],
+                                        max_cycle=ci_max_iter, conv_tol=ci_conv_tol, verbose=verbose)
+        rdm1_dict[ci.idx] = d1a + d1b   # spin-summed 1-RDM
         rdm2_dict[ci.idx] = d2
     end
     e_curr = compute_cmf_energy(mol, C, rdm1_dict, rdm2_dict, clusters, verbose=verbose)
@@ -101,14 +101,8 @@ function cmf_ci_iteration(mol::Molecule, C, rdm1a, rdm1b, clusters, fspace;
     rdm1a_out = zeros(size(rdm1a))
     rdm1b_out = zeros(size(rdm1b))
     for ci in clusters
-        # for (iidx,i) in enumerate(ci.orb_list)
-        # 	for (jidx,j) in enumerate(ci.orb_list)
-        # 		rdm1a_out[i,j] = rdm1_dict[ci.idx][iidx,jidx]
-        # 		rdm1b_out[i,j] = rdm1_dict[ci.idx][iidx,jidx]
-        # 	end
-        # end
-        rdm1a_out[ci.orb_list, ci.orb_list] .= rdm1_dict[ci.idx]
-        rdm1b_out[ci.orb_list, ci.orb_list] .= rdm1_dict[ci.idx]
+        rdm1a_out[ci.orb_list, ci.orb_list] .= rdm1_dict[ci.idx] ./ 2
+        rdm1b_out[ci.orb_list, ci.orb_list] .= rdm1_dict[ci.idx] ./ 2
     end
     return e_curr,rdm1a_out, rdm1b_out, rdm1_dict, rdm2_dict
 end
