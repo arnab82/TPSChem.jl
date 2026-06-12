@@ -3,7 +3,7 @@
 ## Overview
 
 This note derives the theory and working equations for computing one-electron
-properties and absorption spectra from TPSCI (and BS/BST) wavefunctions.
+properties and absorption spectra from TPSCI (and BS/SPT) wavefunctions.
 The key objects are the **transition one-particle reduced density matrix (1-RDM)**
 and its contraction with one-electron property integrals.
 

@@ -38,7 +38,7 @@ ept1 = TPSChem.compute_pt2_energy(vtpsci, cluster_ops, clustered_ham, thresh_foi
 
 
 
-# BST
+# SPT
 #
 
 # start by defining P/Q spaces
@@ -54,7 +54,7 @@ for ci in clusters
     push!(p_spaces, ssi)
 end
 
-ci_vector = BSTstate(clusters, p_spaces, cluster_bases, R=3) 
+ci_vector = SPTstate(clusters, p_spaces, cluster_bases, R=3) 
 
 na = 5
 nb = 4
@@ -68,7 +68,7 @@ println(" PT2 - tpsci")
 display(ept1)
 println(" PT2 - bst")
 display(ept2)
-println(" TPSCI and BST pt2 corrections should be identical - they are not, BST is problably wrong for multidimensional P-space, which was not well tested")
+println(" TPSCI and SPT pt2 corrections should be identical - they are not, SPT is problably wrong for multidimensional P-space, which was not well tested")
 
 
 

@@ -49,7 +49,7 @@ add_subspace!(ssi, init_fspace[5], 1:1)
 push!(p_spaces, ssi)
 
 
-ci_vector = BSTstate(clusters, p_spaces, cluster_bases, R=4) 
+ci_vector = SPTstate(clusters, p_spaces, cluster_bases, R=4) 
 
 na = sum([i[1] for i in init_fspace]) 
 nb = sum([i[2] for i in init_fspace]) 
@@ -60,7 +60,7 @@ e_ci, vbst = TPSChem.ci_solve(ci_vector, cluster_ops, clustered_ham);
 
 # --- Run one variational sweep ------------------------------------------------
 thresh = 1e-2
-e_var, v_var = TPSChem.block_sparse_tucker(vbst, cluster_ops, clustered_ham;
+e_var, v_var = TPSChem.subspace_product_tucker(vbst, cluster_ops, clustered_ham;
     max_iter    = 10,
     nbody       = 4,
     H0          = "Hcmf",

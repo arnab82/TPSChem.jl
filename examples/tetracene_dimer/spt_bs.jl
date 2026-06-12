@@ -30,7 +30,7 @@ display(v)
 # e_ci, v_ci = TPSChem.ci_solve(v, cluster_ops, clustered_ham, solver="davidson");
 e_ci, v_ci = TPSChem.ci_solve(v, cluster_ops, clustered_ham, solver="krylovkit", verbose=2);
 
-v_bst = TPSChem.BSTstate(v_ci, thresh=1e-5)
+v_bst = TPSChem.SPTstate(v_ci, thresh=1e-5)
 
 display(v_bst)
 TPSChem.randomize!(v_bst)
@@ -41,10 +41,10 @@ display(v_bst)
                                     nbody=4,
                                     thresh=1e-3)
 σ = TPSChem.compress(σ, thresh=1e-5)
-v2 = BSTstate(σ,R=10)
+v2 = SPTstate(σ,R=10)
 TPSChem.eye!(v2)
 e_ci, v2 = TPSChem.ci_solve(v2, cluster_ops, clustered_ham);
-e_var, v_var = TPSChem.block_sparse_tucker(v2, cluster_ops, clustered_ham,
+e_var, v_var = TPSChem.subspace_product_tucker(v2, cluster_ops, clustered_ham,
                                                max_iter    = 20,
                                                nbody       = 4,
                                                H0          = "Hcmf",

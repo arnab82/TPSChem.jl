@@ -1,5 +1,5 @@
 """
-    function add_double_excitons!(ts::BSTstate{T,N,R}, 
+    function add_double_excitons!(ts::SPTstate{T,N,R}, 
                               fock::FockConfig{N}) where {T,N,R}
 
 Modify the current state by adding the "biexitonic" basis for the specified `FockConfig`. 
@@ -8,7 +8,7 @@ and then adds the excited states. E.g.,
     |PPPP> += |QQPP> + |PQQP> + |PPQQ> + |QPPQ> 
 """
 
-function add_double_excitons!(ts::BSTstate{T,N,R}, fock::FockConfig{N},num_states::Integer) where {T,N,R}
+function add_double_excitons!(ts::SPTstate{T,N,R}, fock::FockConfig{N},num_states::Integer) where {T,N,R}
     ref_config = [ts.p_spaces[ci.idx][fock[ci.idx]] for ci in ts.clusters]
     num_clusters = length(ts.clusters)
     valid_pairs = [(i, j) for i in 1:num_clusters for j in i+1:num_clusters]
@@ -40,7 +40,7 @@ function add_double_excitons!(ts::BSTstate{T,N,R}, fock::FockConfig{N},num_state
 end
 
 """
-    function add_single_excitons!(ts::BSTstate{T,N,R}, 
+    function add_single_excitons!(ts::SPTstate{T,N,R}, 
                               fock::FockConfig{N}, 
                               cluster_bases::Vector{ClusterBasis}) where {T,N,R}
 
@@ -49,7 +49,7 @@ This basically, starts from a reference state where only the p-spaces are includ
 and then adds the excited states. E.g., 
     |PPPP> += |QPPP> + |PQPP> + |PPQP> + |PPPQ> 
 """
-function add_single_excitons!(ts::BSTstate{T,N,R}, 
+function add_single_excitons!(ts::SPTstate{T,N,R}, 
         fock::FockConfig{N},num_states::Integer) where {T,N,R}
     #={{{=#
     #length(size(v)) == 1 || error(" Only takes vectors", size(v))
@@ -80,12 +80,12 @@ function add_single_excitons!(ts::BSTstate{T,N,R},
 end
 #=}}}=#
 """
-    add_1electron_transfers!(v::BSTstate{T,N,R}, fspace0::FockConfig{N}, nroots)
+    add_1electron_transfers!(v::SPTstate{T,N,R}, fspace0::FockConfig{N}, nroots)
 
 Add `nroots` number of 1-electron transfers to the system represented by `v`.
 
 # Arguments
-- `v::BSTstate{T,N,R}`: The state of the system.
+- `v::SPTstate{T,N,R}`: The state of the system.
 - `fspace0::FockConfig{N}`: The Fock space configuration.
 - `nroots`: 1-electron transfers to be added for number of roots.
 # Returns
@@ -93,7 +93,7 @@ Add `nroots` number of 1-electron transfers to the system represented by `v`.
 
 """
 
-function add_1electron_transfers!(v::BSTstate{T,N,R},fspace0::FockConfig{N},nroots) where {T,N,R}
+function add_1electron_transfers!(v::SPTstate{T,N,R},fspace0::FockConfig{N},nroots) where {T,N,R}
     # Loop over all fock sectors
     for (fspace, tconfigs) in [v.data...]
         # Alpha transfer
@@ -151,19 +151,19 @@ end
 
 
 """
-    add_spin_flip_states!(v::BSTstate{T,N,R}, fspace0::FockConfig{N}, nroots)
+    add_spin_flip_states!(v::SPTstate{T,N,R}, fspace0::FockConfig{N}, nroots)
 
 Add spin flip states for nroots to the system represented by `v`.
 
 # Arguments
-- `v::BSTstate{T,N,R}`: The state of the system.
+- `v::SPTstate{T,N,R}`: The state of the system.
 - `fspace0::FockConfig{N}`: The Fock space configuration.
 - `nroots`: spin flip states to be added for number of roots.
 # Returns
 - `v` is modified in place.
 
 """
-function add_spin_flip_states!(v::BSTstate{T,N,R},fspace0::FockConfig{N},nroots) where {T,N,R}
+function add_spin_flip_states!(v::SPTstate{T,N,R},fspace0::FockConfig{N},nroots) where {T,N,R}
     # Loop over all fock sectors
     for (fspace, tconfigs) in [v.data...]
 #ba

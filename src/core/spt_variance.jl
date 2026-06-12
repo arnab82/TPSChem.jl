@@ -2,10 +2,10 @@ using TPSChem
 using LinearAlgebra
 using Printf
 
-# Block-by-block computation of Hσ = <X|H|0> and its norm, without storing a global BSTstate σ
+# Block-by-block computation of Hσ = <X|H|0> and its norm, without storing a global SPTstate σ
 #
 # This mirrors the FOIS construction logic in `_pt2_job2` and the sigma-block logic in `_pt2_job`,
-# but instead of building a global `sig::BSTstate`, it:
+# but instead of building a global `sig::SPTstate`, it:
 #   - Groups contributions per (sig_fock, sig_tconfig)
 #   - For each block, builds σ_block = <X|H|0> via form_sigma_block_expand
 #   - Immediately computes ⟨σ_block|σ_block⟩ and discards the block
@@ -22,7 +22,7 @@ block σ_block = <X|H|0> for that block only and return ⟨σ_block|σ_block⟩ 
 function _sigma_block_norm2(term_list::Vector{NTuple{4,Any}},
                             sig_fock::FockConfig{N},
                             sig_tconfig::TuckerConfig{N},
-                            ket::BSTstate{T,N,R},
+                            ket::SPTstate{T,N,R},
                             cluster_ops,
                             clustered_ham;
                             thresh::T, max_number) where {T,N,R}
@@ -72,10 +72,10 @@ function _sigma_block_norm2(term_list::Vector{NTuple{4,Any}},
 
     # Compute local ⟨σ_block|σ_block⟩.
     #
-    # We can do this by wrapping σ_block into a tiny BSTstate with just this block,
-    # then using the existing orth_dot, and discarding the BSTstate right away.
+    # We can do this by wrapping σ_block into a tiny SPTstate with just this block,
+    # then using the existing orth_dot, and discarding the SPTstate right away.
 
-    σ_state = BSTstate(ket.clusters, ket.p_spaces, ket.q_spaces, T=T, R=R)
+    σ_state = SPTstate(ket.clusters, ket.p_spaces, ket.q_spaces, T=T, R=R)
     add_fockconfig!(σ_state, sig_fock)
     σ_state[sig_fock][sig_tconfig] = σ_block
 
@@ -92,13 +92,13 @@ end
 Block-by-block job for computing ⟨X|H|0⟩·⟨X|H|0⟩ in the FOIS defined by `job` and `sig_fock`.
 
 It:
-  - Does *not* store a global σ or sig BSTstate
+  - Does *not* store a global σ or sig SPTstate
   - Groups contributions per (sig_fock, sig_tconfig)
   - For each FOIS block, builds σ_block = <X|H|0> via `_sigma_block_norm2`
   - Immediately accumulates ⟨σ_block|σ_block⟩ into a per-root accumulator
 """
 function _pt2_job_sigma_norm_blockwise(sig_fock, job,
-                                       ket::BSTstate{T,N,R},
+                                       ket::SPTstate{T,N,R},
                                        cluster_ops, clustered_ham,
                                        nbody, verbose, thresh, max_number,
                                        prescreen) where {T,N,R}
@@ -168,7 +168,7 @@ end
 # Driver: compute approximate ⟨X|H|0⟩⟨X|H|0⟩ (per root) over the global FOIS, block-by-block
 
 """
-    compute_spt_sigma_norm2_blockwise(ref::BSTstate, cluster_ops, clustered_ham;
+    compute_spt_sigma_norm2_blockwise(ref::SPTstate, cluster_ops, clustered_ham;
                                       H0="Hcmf", nbody=4, thresh_foi=1e-6,
                                       max_number=nothing, opt_ref=true,
                                       ci_tol=1e-6, verbose=1, prescreen=false)
@@ -179,7 +179,7 @@ Compute, in parallel, the FOIS approximation to ⟨X|H|0⟩⟨X|H|0⟩ for each 
 
 This uses the same FOIS definition as `compute_pt2_energy2`, but never stores a full σ.
 """
-function compute_spt_sigma_norm_blockwise(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function compute_spt_sigma_norm_blockwise(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
                                            H0          = "Hcmf",
                                            nbody       = 4,
                                            thresh_foi  = 1e-6,
@@ -190,7 +190,7 @@ function compute_spt_sigma_norm_blockwise(ref::BSTstate{T,N,R}, cluster_ops, clu
                                            prescreen   = false) where {T,N,R}
 
     println()
-    println(" |.......................BST-σ·σ (blockwise).....................................")
+    println(" |.......................SPT-σ·σ (blockwise).....................................")
     verbose < 1 || println(" H0          : ", H0          )
     verbose < 1 || println(" nbody       : ", nbody       )
     verbose < 1 || println(" thresh_foi  : ", thresh_foi  )
@@ -301,7 +301,7 @@ end
 # --- Driver over all Fock sectors ------------------------------------------
 
 """
-    compute_spt_sigma_norm_blockwise(ref::BSTstate, cluster_ops, clustered_ham;
+    compute_spt_sigma_norm_blockwise(ref::SPTstate, cluster_ops, clustered_ham;
                                      H0="Hcmf", nbody=4, thresh_foi=1e-6,
                                      max_number=nothing, opt_ref=true,
                                      ci_tol=1e-6, verbose=1, prescreen=false)
@@ -312,7 +312,7 @@ Compute, in parallel, the FOIS approximation to ⟨X|H|0⟩⟨X|H|0⟩ for each 
 
 This uses the same FOIS definition as `compute_pt2_energy2`, but never stores a full σ.
 """
-function compute_spt_sigma_norm_blockwise_new(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function compute_spt_sigma_norm_blockwise_new(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
                                           H0          = "Hcmf",
                                           nbody       = 4,
                                           thresh_foi  = 1e-6,
@@ -323,7 +323,7 @@ function compute_spt_sigma_norm_blockwise_new(ref::BSTstate{T,N,R}, cluster_ops,
                                           prescreen   = false) where {T,N,R}
 
     println()
-    println(" |.......................BST-σ·σ (blockwise).....................................")
+    println(" |.......................SPT-σ·σ (blockwise).....................................")
     verbose < 1 || println(" H0          : ", H0          )
     verbose < 1 || println(" nbody       : ", nbody       )
     verbose < 1 || println(" thresh_foi  : ", thresh_foi  )
@@ -464,7 +464,7 @@ end
 
 After `nonorth_add` / `compress`, Tucker factor matrices are orthonormal
 (they come from SVD).  In that case ‖T_r‖² = ‖core[r]‖².
-This avoids wrapping in a BSTstate and calling orth_dot.
+This avoids wrapping in a SPTstate and calling orth_dot.
 
 We verify orthonormality via a cheap check on the first factor.
 Falls back to full nonorth_dot if factors are not orthonormal.
@@ -519,7 +519,7 @@ end
 #   - check_term NOT called again (caller already filtered)
 #   - Passes pre-allocated scr to nonorth_add(tucks, scr) — no heap allocs
 #     inside the Tucker combination step
-#   - Computes ‖σ_block‖² directly from cores, no BSTstate wrapper
+#   - Computes ‖σ_block‖² directly from cores, no SPTstate wrapper
 #   - Reuses buf.tucks across block calls (no Vector alloc)
 # =============================================================================
 
@@ -527,7 +527,7 @@ function _sigma_block_norm2_fast(
         contribs    :: Vector{SigmaContrib{T,N,R}},
         sig_fock    :: FockConfig{N},
         sig_tconfig :: TuckerConfig{N},
-        ket         :: BSTstate{T,N,R},
+        ket         :: SPTstate{T,N,R},
         cluster_ops,
         clustered_ham,
         buf         :: BlockwiseScratch{T,N,R};
@@ -604,7 +604,7 @@ end
 function _pt2_job_sigma_norm_blockwise_fast(
         sig_fock    :: FockConfig{N},
         job,
-        ket         :: BSTstate{T,N,R},
+        ket         :: SPTstate{T,N,R},
         cluster_ops,
         clustered_ham,
         buf         :: BlockwiseScratch{T,N,R},
@@ -727,7 +727,7 @@ Drop-in replacement for `compute_spt_sigma_norm_blockwise`.
 Computes ∑_X |⟨X|H|0_r⟩|² for each root r without storing a global σ.
 
 Key speedups over the original:
-  1. `tucker_core_norm2`: ‖σ_block‖² from cores only — no BSTstate wrapping
+  1. `tucker_core_norm2`: ‖σ_block‖² from cores only — no SPTstate wrapping
   2. `nonorth_add(tucks, scr)`: scratch-buffer overload — fewer heap allocs
   3. `SigmaContrib`: typed struct — no Any boxing in the contribution dict
   4. `check_term` called once per entry, not twice
@@ -740,7 +740,7 @@ Key speedups over the original:
      For K>1, compress is still applied before `nonorth_add` to reduce rank.
 """
 function compute_spt_sigma_norm_blockwise_alternative(
-        ref          :: BSTstate{T,N,R},
+        ref          :: SPTstate{T,N,R},
         cluster_ops,
         clustered_ham;
         H0           = "Hcmf",
@@ -757,7 +757,7 @@ function compute_spt_sigma_norm_blockwise_alternative(
     ci_tol_T = T(ci_tol)
 
     println()
-    println(" |.......................BST-σ·σ (blockwise, fast)...........................")
+    println(" |.......................SPT-σ·σ (blockwise, fast)...........................")
     verbose < 1 || println(" H0          : ", H0)
     verbose < 1 || println(" nbody       : ", nbody)
     verbose < 1 || println(" thresh_foi  : ", thresh_T)

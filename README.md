@@ -17,7 +17,7 @@ A Julia package for coarse-grained electronic structure calculations in a tensor
 1. `CMF-PT2` - Second order PT2 correction on top of `CMF` using a barycentric Moller-Plesset-type partitioning.
 1. `CMF-CEPA` - A CEPA-type formalism on top of CMF. First published [here](https://arxiv.org/abs/2206.02333).
 1. `TPSCI` - a generalization of the CIPSI method to a TPS basis. Essentially, one starts with a small number of TPS functions, solves the Schrodinger equation in this small subspace, then uses perturbation theory to determine which TPS's to add to improve the energy. This is done iteratively until the results stop changing. First published [here](https://pubs.acs.org/doi/10.1021/acs.jctc.0c00141).
-1. `BST` - Block Sparse Tucker compression of the TPS wavefunction.
+1. `SPT` - Subspace Product Tucker compression of the TPS wavefunction.
 
 ## Package structure
 
@@ -33,7 +33,7 @@ single package. Each former package lives on as a submodule with its own README:
 | [`TPSChem.ActiveSpaceSolvers`](src/ActiveSpaceSolvers/README.md) | FCI: `FCIAnsatz`, `solve`, `Solution`, RDMs, cluster operators | ActiveSpaceSolvers.jl |
 | [`TPSChem.ClusterMeanField`](src/ClusterMeanField/README.md) | CMF reference states: `cmf_ci`, `cmf_oo` (+ PySCF helpers via extension) | ClusterMeanField.jl |
 
-The TPSCI/BST/CEPA methods themselves live in the top-level `TPSChem` module
+The TPSCI/SPT/CEPA methods themselves live in the top-level `TPSChem` module
 ([`src/core/`](src/core)), which re-exports the commonly used names from the
 submodules — `using TPSChem` is all most scripts need.
 

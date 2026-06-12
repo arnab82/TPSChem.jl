@@ -289,9 +289,9 @@ ENV["PYTHON"] = Sys.which("python")
     
     #TPSChem.print_fock_occupations(ci_vector)
 
-    cts_ref  = TPSChem.BSTstate(ref_vector, thresh=-1);
+    cts_ref  = TPSChem.SPTstate(ref_vector, thresh=-1);
   
-    cts = TPSChem.BSTstate(ci_vector, thresh=1e-5)
+    cts = TPSChem.SPTstate(ci_vector, thresh=1e-5)
     #display(cts_fois)
     if false  
         TPSChem.scale!(ci_vector, 1.0/sqrt(TPSChem.dot(ci_vector, ci_vector)[1]))
@@ -301,7 +301,7 @@ ENV["PYTHON"] = Sys.which("python")
         TPSChem.print_fock_occupations(ci_vector)
 
         println(" Now compress and resolve")
-        cts = TPSChem.BSTstate(ci_vector, thresh=1e-5)
+        cts = TPSChem.SPTstate(ci_vector, thresh=1e-5)
         #TPSChem.compress!(cts,thresh=1e-5)
         TPSChem.normalize!(cts)
         display(length(cts))

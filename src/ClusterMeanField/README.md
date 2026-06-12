@@ -3,7 +3,7 @@
 *Formerly the standalone package [ClusterMeanField.jl](https://github.com/nmayhall-vt/ClusterMeanField.jl).*
 
 Cluster Mean Field (CMF): variationally optimize a product of cluster states — the
-reference wavefunction that TPSCI, BST, and the CMF-PT2/CEPA methods all build on.
+reference wavefunction that TPSCI, SPT, and the CMF-PT2/CEPA methods all build on.
 `cmf_ci` optimizes the cluster CI coefficients for fixed orbitals; `cmf_oo` also
 optimizes the orbitals.
 

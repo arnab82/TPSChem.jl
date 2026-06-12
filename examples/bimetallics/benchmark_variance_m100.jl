@@ -42,14 +42,14 @@ add_subspace!(ssi, (1,2), 1:1)
 add_subspace!(ssi, (0,3), 1:1)
 push!(p_spaces, ssi)
 
-ci_vector = BSTstate(clusters, p_spaces, cluster_bases, R=4)
+ci_vector = SPTstate(clusters, p_spaces, cluster_bases, R=4)
 TPSChem.fill_p_space!(ci_vector, 6, 6)
 TPSChem.eye!(ci_vector)
 _, vbst = TPSChem.ci_solve(ci_vector, cluster_ops, clustered_ham)
 
 # --- Helper: run one variational sweep ----------------------------------------
 function run_bst(v0, thresh)
-    return TPSChem.block_sparse_tucker(v0, cluster_ops, clustered_ham;
+    return TPSChem.subspace_product_tucker(v0, cluster_ops, clustered_ham;
         max_iter    = 20,
         nbody       = 4,
         H0          = "Hcmf",

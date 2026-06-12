@@ -80,7 +80,7 @@ end
 
     nroots=3
 
-    # BST
+    # SPT
     #
     
     # start by defining P/Q spaces
@@ -96,7 +96,7 @@ end
         push!(p_spaces, ssi)
     end
 
-    ci_vector = BSTstate(clusters, p_spaces, cluster_bases, R=3) 
+    ci_vector = SPTstate(clusters, p_spaces, cluster_bases, R=3) 
     
     na = 5
     nb = 4
@@ -104,7 +104,7 @@ end
     TPSChem.eye!(ci_vector)
     e_ci, v = TPSChem.ci_solve(ci_vector, cluster_ops, clustered_ham)
 
-    e_var, v_var = block_sparse_tucker( v, cluster_ops, clustered_ham,
+    e_var, v_var = subspace_product_tucker( v, cluster_ops, clustered_ham,
                                         max_iter    = 20,
                                         nbody       = 4,
                                         H0          = "Hcmf",
@@ -167,7 +167,7 @@ end
     # 
     # Test the thresh_spin keyword
 
-    e_var, v_var = block_sparse_tucker( v, cluster_ops, clustered_ham,
+    e_var, v_var = subspace_product_tucker( v, cluster_ops, clustered_ham,
                                         max_iter    = 20,
                                         nbody       = 4,
                                         H0          = "Hcmf",

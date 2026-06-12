@@ -21,8 +21,8 @@ module TestVariance
     end
 
     """
-    Build a BSTstate seed (BST CI solve) from cluster_bases.
-    Returns (energies, vbst) — used as the starting point for block_sparse_tucker.
+    Build a SPTstate seed (SPT CI solve) from cluster_bases.
+    Returns (energies, vbst) — used as the starting point for subspace_product_tucker.
     """
     function build_seed(clusters, cluster_ops, clustered_ham, cluster_bases)
         init_fspace = FockConfig([(5,2),(4,4),(2,5)])
@@ -48,7 +48,7 @@ module TestVariance
         push!(p_spaces, ssi)
 
 
-        ci_vector = BSTstate(clusters, p_spaces, cluster_bases, R=4)
+        ci_vector = SPTstate(clusters, p_spaces, cluster_bases, R=4)
         na = 6
         nb = 6
         TPSChem.fill_p_space!(ci_vector, na, nb)
@@ -57,12 +57,12 @@ module TestVariance
     end
 
     """
-    Run block_sparse_tucker at `thresh`, starting from `seed_state`.
+    Run subspace_product_tucker at `thresh`, starting from `seed_state`.
     Returns (energies, v_var).
     """
     function build_vvar(thresh, clusters, cluster_ops, clustered_ham,
                         cluster_bases, seed_state)
-        e, v = TPSChem.block_sparse_tucker(
+        e, v = TPSChem.subspace_product_tucker(
             seed_state, cluster_ops, clustered_ham;
             max_iter    = 10,
             nbody       = 4,

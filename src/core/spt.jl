@@ -1,7 +1,7 @@
 using TimerOutputs
 
 """
-    function block_sparse_tucker(input_vec::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+    function subspace_product_tucker(input_vec::SPTstate{T,N,R}, cluster_ops, clustered_ham;
         max_iter        = 20,
         max_iter_pt     = 200, # max number of iterations for solving for PT1
         nbody           = 4,
@@ -17,7 +17,7 @@ using TimerOutputs
         tol_tucker      = 1e-6 ) where {T,N,R}
 
 # Arguments
-- `input_vec::BSTstate`: initial state
+- `input_vec::SPTstate`: initial state
 - `cluster_ops`: local cluster operators
 - `clustered_ham::ClusteredOperator`: hamiltonian
 - `max_iter = 20`: max number of iterations
@@ -37,11 +37,11 @@ using TimerOutputs
 - `solver`: 
 # Returns
 - `e_var::Float64`: the final variational energy
-- `v_var::BSTstate`: the final variational state
+- `v_var::SPTstate`: the final variational state
 
-See also: [`BSTstate`](@ref), [`Tucker`](@ref)
+See also: [`SPTstate`](@ref), [`Tucker`](@ref)
 """
-function block_sparse_tucker_old(input_vec::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function subspace_product_tucker_old(input_vec::SPTstate{T,N,R}, cluster_ops, clustered_ham;
     max_iter=20,
     max_iter_pt=200, # max number of iterations for solving for PT1
     nbody=4,
@@ -94,7 +94,7 @@ function block_sparse_tucker_old(input_vec::BSTstate{T,N,R}, cluster_ops, cluste
         println()
         println()
         println(" ===================================================================")
-        @printf("     BST Iteration: %4i epsilon: %12.8f\n", iter, thresh_var)
+        @printf("     SPT Iteration: %4i epsilon: %12.8f\n", iter, thresh_var)
         println(" ===================================================================")
 
         #
@@ -270,7 +270,7 @@ function block_sparse_tucker_old(input_vec::BSTstate{T,N,R}, cluster_ops, cluste
             [@printf("%12.8f ", e_pt2[r]) for r in 1:R]
             println()
         end
-        @printf(" %-20s", "E(BST): ")
+        @printf(" %-20s", "E(SPT): ")
         [@printf("%12.8f ", e_var[r]) for r in 1:R]
         println()
         #show(to)
@@ -288,20 +288,20 @@ function block_sparse_tucker_old(input_vec::BSTstate{T,N,R}, cluster_ops, cluste
         @printf("*Converged %-20s", "E(Ref): ")
         [@printf("%12.8f ", e0[r]) for r in 1:R]
         println("")
-        @printf("*Converged %-20s", "E(BST): ")
+        @printf("*Converged %-20s", "E(SPT): ")
         [@printf("%12.8f ", e_var[r]) for r in 1:R]
     else
         @printf(" Not converged %-20s", "E(Ref): ")
         [@printf("%12.8f ", e0[r]) for r in 1:R]
         println("")
-        @printf(" Not converged %-20s", "E(BST): ")
+        @printf(" Not converged %-20s", "E(SPT): ")
         [@printf("%12.8f ", e_var[r]) for r in 1:R]
     end
     println()
     println()
 
 
-    println(" Energies per BST iteration:")
+    println(" Energies per SPT iteration:")
     println("   Projected Energies: ")
     for (i, ei) in enumerate(e_projected_list)
         @printf("   Iter: %3i  ", i)
@@ -323,7 +323,7 @@ end
 
 
 """
-    block_sparse_tucker(input_vec::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+    subspace_product_tucker(input_vec::SPTstate{T,N,R}, cluster_ops, clustered_ham;
                         max_iter=20,
                         nbody=4,
                         H0="Hcmf",
@@ -342,7 +342,7 @@ end
                         verbose=1) where {T,N,R}
 
 # Arguments
-- `input_vec::BSTstate`: initial state
+- `input_vec::SPTstate`: initial state
 - `cluster_ops`: local cluster operators
 - `clustered_ham::ClusteredOperator`: hamiltonian
 - `max_iter = 20`: max number of iterations
@@ -363,11 +363,11 @@ end
 - `verbose`: How much to print? 
 # Returns
 - `e_var::Float64`: the final variational energy
-- `v_var::BSTstate`: the final variational state
+- `v_var::SPTstate`: the final variational state
 
-See also: [`BSTstate`](@ref), [`Tucker`](@ref)
+See also: [`SPTstate`](@ref), [`Tucker`](@ref)
 """
-function block_sparse_tucker(input_vec::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function subspace_product_tucker(input_vec::SPTstate{T,N,R}, cluster_ops, clustered_ham;
     max_iter=20,
     nbody=4,
     H0="Hcmf",
@@ -421,7 +421,7 @@ function block_sparse_tucker(input_vec::BSTstate{T,N,R}, cluster_ops, clustered_
         println()
         println()
         println(" ===================================================================")
-        @printf("     BST Iteration: %4i epsilon: %12.8f\n", iter, thresh_var)
+        @printf("     SPT Iteration: %4i epsilon: %12.8f\n", iter, thresh_var)
         println(" ===================================================================")
 
         #
@@ -590,7 +590,7 @@ function block_sparse_tucker(input_vec::BSTstate{T,N,R}, cluster_ops, clustered_
             [@printf("%12.8f ", e_pt2[r]) for r in 1:R]
             println()
         end
-        @printf(" %-20s", "E(BST): ")
+        @printf(" %-20s", "E(SPT): ")
         [@printf("%12.8f ", e_var[r]) for r in 1:R]
         println()
         #show(to)
@@ -608,20 +608,20 @@ function block_sparse_tucker(input_vec::BSTstate{T,N,R}, cluster_ops, clustered_
         @printf("*Converged %-20s", "E(Ref): ")
         [@printf("%12.8f ", e0[r]) for r in 1:R]
         println("")
-        @printf("*Converged %-20s", "E(BST): ")
+        @printf("*Converged %-20s", "E(SPT): ")
         [@printf("%12.8f ", e_var[r]) for r in 1:R]
     else
         @printf(" Not converged %-20s", "E(Ref): ")
         [@printf("%12.8f ", e0[r]) for r in 1:R]
         println("")
-        @printf(" Not converged %-20s", "E(BST): ")
+        @printf(" Not converged %-20s", "E(SPT): ")
         [@printf("%12.8f ", e_var[r]) for r in 1:R]
     end
     println()
     println()
 
 
-    println(" Energies per BST iteration:")
+    println(" Energies per SPT iteration:")
     println("   Projected Energies: ")
     for (i, ei) in enumerate(e_projected_list)
         @printf("   Iter: %3i  ", i)
@@ -646,9 +646,9 @@ end
 
 
 """
-    function compute_expectation_value(ci_vector::BSTstate{T,N,R}, cluster_ops, clustered_op::TPSChem.ClusteredOperator; nbody) where {T,N,R}
+    function compute_expectation_value(ci_vector::SPTstate{T,N,R}, cluster_ops, clustered_op::TPSChem.ClusteredOperator; nbody) where {T,N,R}
 """
-function compute_expectation_value(vector::BSTstate{T,N,R}, cluster_ops, clustered_op::TPSChem.ClusteredOperator; nbody=4) where {T,N,R}
+function compute_expectation_value(vector::SPTstate{T,N,R}, cluster_ops, clustered_op::TPSChem.ClusteredOperator; nbody=4) where {T,N,R}
     tmp = deepcopy(vector)
     zero!(tmp)
     build_sigma!(tmp, vector, cluster_ops, clustered_op, nbody=nbody)
@@ -657,11 +657,11 @@ end
 
 
 """
-    compute_spin_residual(v::BSTstate{T,N,R}, cluster_ops, thresh) where {T,N,R}
+    compute_spin_residual(v::SPTstate{T,N,R}, cluster_ops, thresh) where {T,N,R}
 
 Compute `|r> = S2|v> - |v><v|S2|v>`
 """
-function compute_spin_residual(v::BSTstate{T,N,R}, cluster_ops; thresh=1e-6) where {T,N,R}
+function compute_spin_residual(v::SPTstate{T,N,R}, cluster_ops; thresh=1e-6) where {T,N,R}
     clustered_S2 = extract_S2(v.clusters)
     s2v = build_compressed_1st_order_state(v, cluster_ops, clustered_S2, thresh=thresh)
 

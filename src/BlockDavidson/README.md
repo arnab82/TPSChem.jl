@@ -4,7 +4,7 @@
 
 Simple block-Davidson/Lanczos solver for the lowest eigenvalues and eigenvectors of a
 matrix or matrix-free `LinearMap`. Used throughout TPSChem for the outer CI
-diagonalizations (TPSCI, BST, FCI).
+diagonalizations (TPSCI, SPT, FCI).
 
 ## Usage
 

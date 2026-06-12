@@ -3,7 +3,7 @@ using Printf
 using Test
 using JLD2 
 
-@testset "BST vs BS" begin
+@testset "SPT vs BS" begin
 
     @load "_testdata_cmf_h12_64bit.jld2"
     
@@ -20,7 +20,7 @@ using JLD2
     e_ci, v_ci = TPSChem.ci_solve(v, cluster_ops, clustered_ham, solver="davidson");
     #e_ci, v_ci = TPSChem.ci_solve(v, cluster_ops, clustered_ham, solver="krylovkit", verbose=2);
 
-    v_bst = TPSChem.BSTstate(v_ci, thresh=1e-5)
+    v_bst = TPSChem.SPTstate(v_ci, thresh=1e-5)
 
     display(v_bst)
     TPSChem.randomize!(v_bst)
@@ -33,7 +33,7 @@ using JLD2
     end
 end
 
-@testset "BST vs BS 2" begin
+@testset "SPT vs BS 2" begin
     @load "_testdata_cmf_he4.jld2"
     
     clustered_ham = TPSChem.extract_ClusteredTerms(ints, clusters)
@@ -53,7 +53,7 @@ end
     e_ci, v_ci = TPSChem.ci_solve(v, cluster_ops, clustered_ham);
     #e_ci, v_ci = TPSChem.ci_solve(v, cluster_ops, clustered_ham, solver="krylovkit", verbose=2);
 
-    v_bst = TPSChem.BSTstate(v_ci, thresh=1e-5)
+    v_bst = TPSChem.SPTstate(v_ci, thresh=1e-5)
 
     display(v_bst)
     #e_ci, v_ci = TPSChem.ci_solve(v, cluster_ops, clustered_ham, solver="davidson");

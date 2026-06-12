@@ -39,10 +39,10 @@ function with_peak_memory(f)
 end
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BST-CEPA-0  (multi-root, ci_vector reference)
+# SPT-CEPA-0  (multi-root, ci_vector reference)
 # ══════════════════════════════════════════════════════════════════════════════
 println("\n" * "="^W)
-println(" BST-CEPA-0  (multi-root BSTstate reference)")
+println(" SPT-CEPA-0  (multi-root SPTstate reference)")
 nroots=4
 # start by defining P/Q spaces
 p_spaces = Vector{ClusterSubspace}()
@@ -66,7 +66,7 @@ add_subspace!(ssi, (1,2), 1:1)
 add_subspace!(ssi, (0,3), 1:1)
 push!(p_spaces, ssi)
 
-ci_vector = BSTstate(clusters, p_spaces, cb_spin, R=4) 
+ci_vector = SPTstate(clusters, p_spaces, cb_spin, R=4) 
 
 na = 6
 nb = 6
@@ -74,7 +74,7 @@ nb = 6
 TPSChem.fill_p_space!(ci_vector, na, nb)
 TPSChem.eye!(ci_vector)
 e_ci, v_bst = TPSChem.ci_solve(ci_vector, cluster_ops, clustered_ham);
-@printf(" BST CI energies: %s\n", string(e_ci))
+@printf(" SPT CI energies: %s\n", string(e_ci))
 
 GC.gc()
 baseline_bst = Base.gc_live_bytes()
@@ -162,7 +162,7 @@ println("─"^W)
         "TPSCI-CEPA-0 :sparse",
         r_tpsci.time, r_tpsci.bytes/2^30, (peak_tpsci-baseline_tpsci)/2^30)
 @printf(" %-20s  %10.2f  %12.3f  %12.3f\n",
-        "BST-CEPA-0",
+        "SPT-CEPA-0",
         r_bst.time, r_bst.bytes/2^30, (peak_bst-baseline_bst)/2^30)
 println("═"^W)
 
@@ -174,8 +174,8 @@ for r in 1:nroots
 end
 println("─"^W)
 for r in 1:nroots
-    @printf(" %-20s  %5i  %16.10f\n", "BST-CEPA-0", r, e_bst[r])
+    @printf(" %-20s  %5i  %16.10f\n", "SPT-CEPA-0", r, e_bst[r])
 end
 println("─"^W)
-@printf(" Max |ΔE| BST vs TPSCI:  %.4e Ha\n", maximum(abs.(e_bst .- e_tpsci)))
+@printf(" Max |ΔE| SPT vs TPSCI:  %.4e Ha\n", maximum(abs.(e_bst .- e_tpsci)))
 println("═"^W)

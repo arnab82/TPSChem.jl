@@ -1,7 +1,7 @@
 using IterativeSolvers
 
  """
-    hylleraas_compressed_mp2a(sig_in::BSTstate{T,N,R}, ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+    hylleraas_compressed_mp2a(sig_in::SPTstate{T,N,R}, ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
     H0="Hcmf",
     tol=1e-6,
     nbody=4,
@@ -55,7 +55,7 @@ After solving, the energy can be obtained as:
 
 
 """
-    compute_pt1_wavefunction(σ_in::BSTstate{T,N,R}, ψ0::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+    compute_pt1_wavefunction(σ_in::SPTstate{T,N,R}, ψ0::SPTstate{T,N,R}, cluster_ops, clustered_ham;
     H0="Hcmf",
     nbody=4,
     verbose=1) where {T,N,R}
@@ -70,7 +70,7 @@ E2 = <0|V|X>ψ1
 
 The local Tucker factors are first canonicalized to avoid having to solve the Hylleraas functional
 """
-function compute_pt1_wavefunction(σ_in::BSTstate{T,N,R}, ψ0::BSTstate{T,N,R}, cluster_ops, clustered_ham, clustered_ham_0, E0, F0;
+function compute_pt1_wavefunction(σ_in::SPTstate{T,N,R}, ψ0::SPTstate{T,N,R}, cluster_ops, clustered_ham, clustered_ham_0, E0, F0;
     H0="Hcmf",
     verbose=1) where {T,N,R}
     
@@ -88,7 +88,7 @@ function compute_pt1_wavefunction(σ_in::BSTstate{T,N,R}, ψ0::BSTstate{T,N,R}, 
     # Rotate the local tucker factors to diagonalize the zeroth order hamiltonians and build F diagonal
     verbose < 2 || @printf(" form_1body_operator_diagonal... \n")
     flush(stdout)
-    Fdiag = BSTstate(σ, R=1)
+    Fdiag = SPTstate(σ, R=1)
     form_1body_operator_diagonal!(σ, Fdiag, cluster_ops, pseudo_canon=true)
     verbose < 2 || @printf(" done.\n")
     flush(stdout)
@@ -163,19 +163,19 @@ function compute_pt1_wavefunction(σ_in::BSTstate{T,N,R}, ψ0::BSTstate{T,N,R}, 
 end
 
 """
-    compute_pt1_wavefunction(σ_in::BSTstate{T,N,R}, ψ0::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+    compute_pt1_wavefunction(σ_in::SPTstate{T,N,R}, ψ0::SPTstate{T,N,R}, cluster_ops, clustered_ham;
     H0="Hcmf",
     nbody=4,
     verbose=1) where {T,N,R}
 
 TBW
 """
-function compute_pt1_wavefunction(σ_in::BSTstate{T,N,R}, ψ0::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function compute_pt1_wavefunction(σ_in::SPTstate{T,N,R}, ψ0::SPTstate{T,N,R}, cluster_ops, clustered_ham;
     H0="Hcmf",
     verbose=1) where {T,N,R}
 
     verbose < 1 || println()
-    verbose < 1 || println(" |...................................BST-PT2............................................")
+    verbose < 1 || println(" |...................................SPT-PT2............................................")
     flush(stdout)
     #
     # Copy data
@@ -245,7 +245,7 @@ end
 
 
 """
-    compute_pt1_wavefunction(ψ0::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+    compute_pt1_wavefunction(ψ0::SPTstate{T,N,R}, cluster_ops, clustered_ham;
     H0 = "Hcmf",
     nbody = 4,
     thresh_foi = 1e-7
@@ -254,7 +254,7 @@ end
 
 TBW
 """
-function compute_pt1_wavefunction(ψ0::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function compute_pt1_wavefunction(ψ0::SPTstate{T,N,R}, cluster_ops, clustered_ham;
     H0 = "Hcmf",
     nbody = 4,
     thresh_foi = 1e-7,
@@ -277,12 +277,12 @@ end
 
 
 """
-    form_1body_operator_diagonal!(sig::BSTstate{T,N,R}, Fdiag::BSTstate{T,N,1}, cluster_ops; H0="Hcmf", pseudo_canon=false) where {T,N,R}
+    form_1body_operator_diagonal!(sig::SPTstate{T,N,R}, Fdiag::SPTstate{T,N,1}, cluster_ops; H0="Hcmf", pseudo_canon=false) where {T,N,R}
 
 TBW
 """
-function form_1body_operator_diagonal!(sig::BSTstate{T,N,R}, Fdiag::BSTstate{T,N,1}, cluster_ops; H0="Hcmf", pseudo_canon=false) where {T,N,R}
-    # Fdiag = BSTstate(v, R=1)
+function form_1body_operator_diagonal!(sig::SPTstate{T,N,R}, Fdiag::SPTstate{T,N,1}, cluster_ops; H0="Hcmf", pseudo_canon=false) where {T,N,R}
+    # Fdiag = SPTstate(v, R=1)
     clusters = sig.clusters
 
     zero!(Fdiag)
@@ -355,7 +355,7 @@ function form_1body_operator_diagonal!(sig::BSTstate{T,N,R}, Fdiag::BSTstate{T,N
 end
 
 
-function hylleraas_compressed_mp2(sig_in::BSTstate{T,N,R}, ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function hylleraas_compressed_mp2(sig_in::SPTstate{T,N,R}, ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
     H0="Hcmf",
     tol=1e-6,
     nbody=4,
@@ -458,8 +458,8 @@ function hylleraas_compressed_mp2(sig_in::BSTstate{T,N,R}, ref::BSTstate{T,N,R},
 
         function mymatvec(x)
 
-            xr = BSTstate(sig, R=1)
-            xl = BSTstate(sig, R=1)
+            xr = SPTstate(sig, R=1)
+            xl = SPTstate(sig, R=1)
 
             #display(size(xr))
             #display(size(x))
@@ -537,7 +537,7 @@ end
 
 
 """
-    function do_fois_pt2(ref::BSTstate, cluster_ops, clustered_ham;
+    function do_fois_pt2(ref::SPTstate, cluster_ops, clustered_ham;
             H0          = "Hcmf",
             max_iter    = 50,
             nbody       = 4,
@@ -548,7 +548,7 @@ end
 
 Do PT2
 """
-function do_fois_pt2(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function do_fois_pt2(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
             H0          = "Hcmf",
             max_iter    = 50,
             nbody       = 4,
@@ -556,7 +556,7 @@ function do_fois_pt2(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
             tol         = 1e-5,
             opt_ref     = true,
             verbose     = true) where {T,N,R}
-    @printf(" |== Solve for BST PT1 Wavefunction ================================\n")
+    @printf(" |== Solve for SPT PT1 Wavefunction ================================\n")
     println(" H0          : ", H0          ) 
     println(" max_iter    : ", max_iter    ) 
     println(" nbody       : ", nbody       ) 
@@ -616,7 +616,7 @@ end
 
 
 """
-    compute_pt2_energy(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+    compute_pt2_energy(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
                             H0          = "Hcmf",
                             nbody       = 4,
                             thresh_foi  = 1e-6,
@@ -627,7 +627,7 @@ end
 
 Directly compute the PT2 energy, in parallel, with each thread handling a single `FockConfig` at a time.
 """
-function compute_pt2_energy(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function compute_pt2_energy(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
                             H0          = "Hcmf",
                             nbody       = 4,
                             thresh_foi  = 1e-6,
@@ -638,7 +638,7 @@ function compute_pt2_energy(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
                             prescreen   = false,
                             compress_twice = false) where {T,N,R}
     println()
-    println(" |...................................BST-PT2............................................")
+    println(" |...................................SPT-PT2............................................")
     verbose < 1 || println(" H0          : ", H0          ) 
     verbose < 1 || println(" nbody       : ", nbody       ) 
     verbose < 1 || println(" thresh_foi  : ", thresh_foi  ) 
@@ -787,10 +787,10 @@ function compute_pt2_energy(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
 end
 
 
-function _pt2_job(sig_fock, job, ket::BSTstate{T,N,R}, cluster_ops, clustered_ham, clustered_ham_0,
+function _pt2_job(sig_fock, job, ket::SPTstate{T,N,R}, cluster_ops, clustered_ham, clustered_ham_0,
     nbody, verbose, thresh, max_number, E0, F0, prescreen, compress_twice) where {T,N,R}
 
-    sig = BSTstate(ket.clusters, ket.p_spaces, ket.q_spaces, T=T, R=R)
+    sig = SPTstate(ket.clusters, ket.p_spaces, ket.q_spaces, T=T, R=R)
     add_fockconfig!(sig, sig_fock)
 
     data = OrderedDict{TuckerConfig{N},Vector{Tucker{T,N,R}}}()
@@ -936,7 +936,7 @@ function _pt2_job(sig_fock, job, ket::BSTstate{T,N,R}, cluster_ops, clustered_ha
 end
 
 """
-    compute_pt2_energy2(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+    compute_pt2_energy2(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
                             H0          = "Hcmf",
                             nbody       = 4,
                             thresh_foi  = 1e-6,
@@ -947,7 +947,7 @@ end
 
 Directly compute the PT2 energy, in parallel, with each thread handling a single `FockConfig` at a time.
 """
-function compute_pt2_energy2(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function compute_pt2_energy2(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
                             H0          = "Hcmf",
                             nbody       = 4,
                             thresh_foi  = 1e-6,
@@ -958,7 +958,7 @@ function compute_pt2_energy2(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
                             prescreen   = false,
                             compress_twice = false) where {T,N,R}
     println()
-    println(" |...................................BST-PT2............................................")
+    println(" |...................................SPT-PT2............................................")
     verbose < 1 || println(" H0          : ", H0          ) 
     verbose < 1 || println(" nbody       : ", nbody       ) 
     verbose < 1 || println(" thresh_foi  : ", thresh_foi  ) 
@@ -1107,7 +1107,7 @@ function compute_pt2_energy2(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
 end
 
 
-function _pt2_job2(sig_fock, job, ket::BSTstate{T,N,R}, cluster_ops, clustered_ham, clustered_ham_0,
+function _pt2_job2(sig_fock, job, ket::SPTstate{T,N,R}, cluster_ops, clustered_ham, clustered_ham_0,
     nbody, verbose, thresh, max_number, E0, F0, prescreen, compress_twice) where {T,N,R}
 
     tconfigs_to_process = Dict{TuckerConfig{N}, Vector{Vector{Any}}}()
@@ -1200,7 +1200,7 @@ function _pt2_job2(sig_fock, job, ket::BSTstate{T,N,R}, cluster_ops, clustered_h
             curr_tuck = compress(curr_tuck, thresh=thresh)
         end
        
-        sig = BSTstate(ket.clusters, ket.p_spaces, ket.q_spaces, T=T, R=R)
+        sig = SPTstate(ket.clusters, ket.p_spaces, ket.q_spaces, T=T, R=R)
         add_fockconfig!(sig, sig_fock)
         sig[sig_fock][sig_tconfig] = curr_tuck
 
@@ -1235,13 +1235,13 @@ end
 #      additional full sweep over all reference blocks and H terms.
 #      Eliminates one build_sigma!(H) call per sig_tconfig.
 #
-#   4. Lightweight F0: creates a minimal single-block BSTstate with canonical
+#   4. Lightweight F0: creates a minimal single-block SPTstate with canonical
 #      Tucker factors (zero cores) and calls build_sigma! with clustered_ham_0
 #      (1-body only, N terms instead of all H terms).
 #
 #   5. Inline ecorr: computes E² contribution without materialising ψ₁.
 #
-# Memory vs _pt2_job: never holds the full FOIS BSTstate; peak per thread ≈
+# Memory vs _pt2_job: never holds the full FOIS SPTstate; peak per thread ≈
 #   metadata + one Tucker block at a time (instead of 4-6× full FOIS).
 # Speed vs _pt2_job2: replaces K_sig × build_sigma!(H) with K_sig × cheap F0.
 # =============================================================================
@@ -1253,7 +1253,7 @@ end
 Compute the PT2 energy correction for one Fock sector using the Tucker-rotation
 approach. See module comment above for algorithm details.
 """
-function _pt2_job_blockwise(sig_fock, job, ket::BSTstate{T,N,R}, cluster_ops,
+function _pt2_job_blockwise(sig_fock, job, ket::SPTstate{T,N,R}, cluster_ops,
                         clustered_ham, clustered_ham_0::ClusteredOperator{N},
                         nbody, thresh, max_number, E0::Vector{T}, F0::Vector{T},
                         prescreen::Bool, H0::String) where {T,N,R}
@@ -1368,12 +1368,12 @@ function _pt2_job_blockwise(sig_fock, job, ket::BSTstate{T,N,R}, cluster_ops,
         #        dimension — equivalent to build_sigma!(σ_canon, ψ0, H) by linearity.
         H_cores_rot = ntuple(r -> transform_basis(curr_tuck_H.core[r], V_rot), R)
 
-        # -- 2e. Minimal single-block BSTstate with canonical Tucker factors (zero cores)
+        # -- 2e. Minimal single-block SPTstate with canonical Tucker factors (zero cores)
         #        for F0 and overlap Sx computation.
         U_canon    = ntuple(i -> curr_tuck_H.factors[i] * V_rot[i], N)
         core_zeros = ntuple(_ -> zeros(T, core_dims), R)
 
-        sig_f0 = BSTstate(ket.clusters, ket.p_spaces, ket.q_spaces, T=T, R=R)
+        sig_f0 = SPTstate(ket.clusters, ket.p_spaces, ket.q_spaces, T=T, R=R)
         add_fockconfig!(sig_f0, sig_fock)
         sig_f0[sig_fock][sig_tconfig] = Tucker{T,N,R}(core_zeros, U_canon)
 
@@ -1415,18 +1415,18 @@ end
 
 
 """
-    compute_pt2_energy_blockwise(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+    compute_pt2_energy_blockwise(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
                                   H0="Hcmf", nbody=4, thresh_foi=1e-6,
                                   max_number=nothing, opt_ref=true, ci_tol=1e-6,
                                   verbose=1, prescreen=false) -> E2
 
 Compute PT2 energy using the block-by-block Tucker-rotation approach
 (`_pt2_job_blockwise`). Numerically equivalent to `compute_pt2_energy` /
-`compute_pt2_energy2` but with lower peak memory (no full FOIS BSTstate per
+`compute_pt2_energy2` but with lower peak memory (no full FOIS SPTstate per
 thread) and faster for many-block Fock sectors (no redundant build_sigma!(H)
 per FOIS block).
 """
-function compute_pt2_energy_blockwise(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function compute_pt2_energy_blockwise(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
                                   H0         = "Hcmf",
                                   nbody      = 4,
                                   thresh_foi = 1e-6,
@@ -1436,7 +1436,7 @@ function compute_pt2_energy_blockwise(ref::BSTstate{T,N,R}, cluster_ops, cluster
                                   verbose    = 1,
                                   prescreen  = false) where {T,N,R}
     println()
-    println(" |...................................BST-PT2 (fast).......................................")
+    println(" |...................................SPT-PT2 (fast).......................................")
     verbose < 1 || println(" H0          : ", H0        )
     verbose < 1 || println(" nbody       : ", nbody     )
     verbose < 1 || println(" thresh_foi  : ", thresh_foi)

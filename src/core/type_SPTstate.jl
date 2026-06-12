@@ -10,22 +10,22 @@ e.g.
 - `p_spaces::Vector{ClusterSubspace}`
 - `q_spaces::Vector{ClusterSubspace}`
 """
-struct BSTstate{T,N,R} 
+struct SPTstate{T,N,R} 
     clusters::Vector{MOCluster}
     data::OrderedDict{FockConfig{N},OrderedDict{TuckerConfig{N},Tucker{T,N,R}}}
     p_spaces::Vector{ClusterSubspace}
     q_spaces::Vector{ClusterSubspace}
 end
-Base.haskey(ts::BSTstate, i) = return haskey(ts.data,i)
-Base.getindex(ts::BSTstate, i) = return ts.data[i]
-Base.setindex!(ts::BSTstate, i, j) = return ts.data[j] = i
-Base.iterate(ts::BSTstate, state=1) = iterate(ts.data, state)
-Base.size(ts::BSTstate{T,N,R}) where {T,N,R} =  (length(ts), R)
-#normalize!(ts::BSTstate) = scale!(ts, 1/sqrt(orth_dot(ts,ts)))
+Base.haskey(ts::SPTstate, i) = return haskey(ts.data,i)
+Base.getindex(ts::SPTstate, i) = return ts.data[i]
+Base.setindex!(ts::SPTstate, i, j) = return ts.data[j] = i
+Base.iterate(ts::SPTstate, state=1) = iterate(ts.data, state)
+Base.size(ts::SPTstate{T,N,R}) where {T,N,R} =  (length(ts), R)
+#normalize!(ts::SPTstate) = scale!(ts, 1/sqrt(orth_dot(ts,ts)))
 
 
 """
-    BSTstate(clusters::Vector{MOCluster}, 
+    SPTstate(clusters::Vector{MOCluster}, 
              p_spaces::Vector{ClusterSubspace},
              cluster_bases::Vector{ClusterBasis}; R=1) where {N} 
 
@@ -38,9 +38,9 @@ specified by `cluster_bases`.
 - `cluster_basis`: list of ClusterBasis types - needed to know the dimensions of the q-spaces
 - `R`: number of roots
 # Returns
-- `BSTstate`
+- `SPTstate`
 """
-function BSTstate(clusters::Vector{MOCluster}, 
+function SPTstate(clusters::Vector{MOCluster}, 
                   p_spaces::Vector{ClusterSubspace},
                   cluster_bases::Vector{ClusterBasis{A,T}}; R=1) where {T,A} 
     #={{{=#
@@ -58,17 +58,17 @@ function BSTstate(clusters::Vector{MOCluster},
 
     data = OrderedDict{FockConfig{N},OrderedDict{TuckerConfig{N},Tucker{T,N,R}} }()
 
-    return BSTstate{T,N,R}(clusters, data, p_spaces, q_spaces) 
+    return SPTstate{T,N,R}(clusters, data, p_spaces, q_spaces) 
 #=}}}=#
 end
 
 
 """
-    BSTstate(clusters::Vector{MOCluster}, 
+    SPTstate(clusters::Vector{MOCluster}, 
         fconfig::FockConfig{N}, 
         cluster_bases::Vector{ClusterBasis}) where {N} 
 
-Constructor using only a single FockConfig. This allows us to turn the CMF state into a BSTstate.
+Constructor using only a single FockConfig. This allows us to turn the CMF state into a SPTstate.
 As such, it chooses the ground state of each cluster in the Fock sector specified by `FockConfig` to be the 
 P space, and then the Q space is defined as the orthogonal complement of this state within the available basis, 
 specified by `cluster_bases`.
@@ -77,9 +77,9 @@ specified by `cluster_bases`.
 - `fconfig`: starting FockConfig 
 - `cluster_basis`: list of ClusterBasis types - needed to know the dimensions of the q-spaces
 # Returns
-- `BSTstate`
+- `SPTstate`
 """
-function BSTstate(clusters::Vector{MOCluster}, 
+function SPTstate(clusters::Vector{MOCluster}, 
         fconfig::FockConfig{N}, 
         cluster_bases::Vector{ClusterBasis{A, T}}; R=1) where {T, N, A} 
     #={{{=#
@@ -102,7 +102,7 @@ function BSTstate(clusters::Vector{MOCluster},
     end
 
     data = OrderedDict{FockConfig{N},OrderedDict{TuckerConfig{N},Tucker{T,N,R}} }()
-    state = BSTstate{T,N,R}(clusters, data, p_spaces, q_spaces) 
+    state = SPTstate{T,N,R}(clusters, data, p_spaces, q_spaces) 
     
     # Replace below with "fill_p_space!"
 
@@ -127,18 +127,18 @@ end
 
 Constructor - create copy, changing T and R optionally 
 # Arguments
-- `v`: input `BSTstate` object 
+- `v`: input `SPTstate` object 
 - `T`: data type of new state 
 - `R`: number of roots in new state 
 # Returns
-- `BSTstate`
+- `SPTstate`
 """
-function BSTstate(v::BSTstate{TT,N,RR}; T=TT, R=RR) where {TT,N,RR}
+function SPTstate(v::SPTstate{TT,N,RR}; T=TT, R=RR) where {TT,N,RR}
     #={{{=#
 
     data = OrderedDict{FockConfig{N},OrderedDict{TuckerConfig{N},Tucker{T,N,R}} }()
    
-    w = BSTstate{T,N,R}(v.clusters, data, v.p_spaces, v.q_spaces)
+    w = SPTstate{T,N,R}(v.clusters, data, v.p_spaces, v.q_spaces)
     for (fock, tconfigs) in v.data
         add_fockconfig!(w, fock)
         for (tconfig, tuck) in tconfigs
@@ -152,18 +152,18 @@ end
 
 Constructor - create copy, of a particular root
 # Arguments
-- `v`: input `BSTstate` object 
+- `v`: input `SPTstate` object 
 - `T`: data type of new state 
 - `R`: specific root in new state 
 # Returns
-- `BSTstate`
+- `SPTstate`
 """
-function BSTstate(v::BSTstate{T,N,R},  root) where {T,N,R}
+function SPTstate(v::SPTstate{T,N,R},  root) where {T,N,R}
     #={{{=#
 
     data = OrderedDict{FockConfig{N},OrderedDict{TuckerConfig{N},Tucker{T,N,1}} }()
    
-    w = BSTstate{T,N,1}(v.clusters, data, v.p_spaces, v.q_spaces)
+    w = SPTstate{T,N,1}(v.clusters, data, v.p_spaces, v.q_spaces)
     for (fock, tconfigs) in v.data
         add_fockconfig!(w, fock)
         for (tconfig, tuck) in tconfigs
@@ -178,7 +178,7 @@ end
 # return Tucker{T,NN,R}(cores, ntuple(i->t.factors[i],NN))
 
 """
-    BSTstate(clusters::Vector{MOCluster}, 
+    SPTstate(clusters::Vector{MOCluster}, 
         p_spaces::Vector{TPSChem.ClusterSubspace}, 
         q_spaces::Vector{TPSChem.ClusterSubspace}) 
 
@@ -188,9 +188,9 @@ Constructor - specify input p and q spaces
 - `p_spaces`: list of p space ranges for each cluster
 - `q_spaces`: list of q space ranges for each cluster
 # Returns
-- `BSTstate`
+- `SPTstate`
 """
-function BSTstate(clusters::Vector{MOCluster}, 
+function SPTstate(clusters::Vector{MOCluster}, 
         p_spaces::Vector{TPSChem.ClusterSubspace}, 
         q_spaces::Vector{TPSChem.ClusterSubspace};
         T=Float64, R=1) 
@@ -200,24 +200,24 @@ function BSTstate(clusters::Vector{MOCluster},
     data = OrderedDict{FockConfig{N},OrderedDict{TuckerConfig{N},Tucker{T,N,R}} }()
      
     #data[fconfig][tconfig] = tdata
-    return BSTstate(clusters, data, p_spaces, q_spaces) 
+    return SPTstate(clusters, data, p_spaces, q_spaces) 
 #=}}}=#
 end
 
 
 """
-    function BSTstate(ts::BSstate{T,N,R}; thresh=-1, max_number=nothing, verbose=0) where {T,N,R}
+    function SPTstate(ts::BSstate{T,N,R}; thresh=-1, max_number=nothing, verbose=0) where {T,N,R}
 
-Create a `BSTstate` from a `BSstate` 
+Create a `SPTstate` from a `BSstate` 
 # Arguments
 - `ts::BSstate`
 - `thresh=-1`: discard singular values smaller than `thresh`
 - `max_number=nothing`: if != `nothing`, only keep up to `max_number` singular vectors per SVD
 - `verbose=0`: print level
 # Returns 
-- `BSTstate`
+- `SPTstate`
 """
-function BSTstate(ts::BSstate{T,N,R}; thresh=-1, max_number=nothing, verbose=0) where {T,N,R}
+function SPTstate(ts::BSstate{T,N,R}; thresh=-1, max_number=nothing, verbose=0) where {T,N,R}
 #={{{=#
 
     fold!(ts)
@@ -239,25 +239,25 @@ function BSTstate(ts::BSstate{T,N,R}; thresh=-1, max_number=nothing, verbose=0) 
             end
         end
     end
-    return BSTstate(ts.clusters, data, ts.p_spaces, ts.q_spaces)
+    return SPTstate(ts.clusters, data, ts.p_spaces, ts.q_spaces)
 end
 #=}}}=#
 
 
 
 """
-    compress(ts::BSTstate{T,N,R}; thresh=-1, max_number=nothing, verbose=0) where {T,N,R}
+    compress(ts::SPTstate{T,N,R}; thresh=-1, max_number=nothing, verbose=0) where {T,N,R}
 
 Compress state via HOSVD
 # Arguments
-- `ts::BSTstate`
+- `ts::SPTstate`
 - `thresh = -1`: threshold for compression
 - `max_number`: only keep certain number of vectors per TuckerConfig
 - `verbose=0`: print level
 # Returns
-- `BSTstate`
+- `SPTstate`
 """
-function compress(ts::BSTstate{T,N,R}; thresh=-1, max_number=nothing, verbose=0) where {T,N,R}
+function compress(ts::SPTstate{T,N,R}; thresh=-1, max_number=nothing, verbose=0) where {T,N,R}
     d = OrderedDict{FockConfig{N}, OrderedDict{TuckerConfig{N}, Tucker{T,N,R}}}() 
     for (fock, tconfigs) in ts.data
         for (tconfig, coeffs) in tconfigs
@@ -272,15 +272,15 @@ function compress(ts::BSTstate{T,N,R}; thresh=-1, max_number=nothing, verbose=0)
             end
         end
     end
-    return BSTstate(ts.clusters, d, ts.p_spaces, ts.q_spaces)
+    return SPTstate(ts.clusters, d, ts.p_spaces, ts.q_spaces)
 end
 
 """
-    compress_iteratively(v::BSTstate, thresh; maxiter=20, verbose=1)
+    compress_iteratively(v::SPTstate, thresh; maxiter=20, verbose=1)
 
 TBW
 """
-function compress_iteratively(v::BSTstate, thresh; maxiter=20, verbose=1)
+function compress_iteratively(v::SPTstate, thresh; maxiter=20, verbose=1)
     for i in 1:maxiter
         dim1 = length(v)
         v = compress(v, thresh=thresh)
@@ -292,13 +292,13 @@ function compress_iteratively(v::BSTstate, thresh; maxiter=20, verbose=1)
 end
 
 """
-    orth_add!(ts1::BSTstate, ts2::BSTstate)
+    orth_add!(ts1::SPTstate, ts2::SPTstate)
 
 Add coeffs in `ts2` to `ts1`
 
 Note: this assumes `t1` and `t2` have the same compression vectors
 """
-function orth_add!(ts1::BSTstate, ts2::BSTstate)
+function orth_add!(ts1::SPTstate, ts2::SPTstate)
 #={{{=#
     for (fock,configs) in ts2
         if haskey(ts1, fock)
@@ -317,13 +317,13 @@ function orth_add!(ts1::BSTstate, ts2::BSTstate)
 end
 
 """
-    nonorth_add!(ts1::BSTstate, ts2::BSTstate; thresh=1e-10)
+    nonorth_add!(ts1::SPTstate, ts2::SPTstate; thresh=1e-10)
 
 Add coeffs in `ts2` to `ts1`
 
 Note: this does not assume `t1` and `t2` have the same compression vectors
 """
-function nonorth_add!(ts1::BSTstate, ts2::BSTstate; thresh=1e-10)
+function nonorth_add!(ts1::SPTstate, ts2::SPTstate; thresh=1e-10)
 #={{{=#
     for (fock,configs) in ts2
         if haskey(ts1, fock)
@@ -343,38 +343,38 @@ function nonorth_add!(ts1::BSTstate, ts2::BSTstate; thresh=1e-10)
 end
 
 """
-    nonorth_add(ts1::BSTstate, ts2::BSTstate; thresh=1e-10)
+    nonorth_add(ts1::SPTstate, ts2::SPTstate; thresh=1e-10)
 
 TBW
 """
-function nonorth_add(ts1::BSTstate, ts2::BSTstate; thresh=1e-10)
+function nonorth_add(ts1::SPTstate, ts2::SPTstate; thresh=1e-10)
     tmp = deepcopy(ts1)
     nonorth_add!(tmp, ts2, thresh=1e-10)
     return tmp
 end
 
 """
-    orth_add(ts1::BSTstate, ts2::BSTstate)
+    orth_add(ts1::SPTstate, ts2::SPTstate)
 
 TBW
 """
-function orth_add(ts1::BSTstate, ts2::BSTstate)
+function orth_add(ts1::SPTstate, ts2::SPTstate)
     tmp = deepcopy(ts1)
     orth_add!(tmp, ts2)
     return tmp
 end
 
 """
-    add_fockconfig!(s::BSTstate, fock::FockConfig)
+    add_fockconfig!(s::SPTstate, fock::FockConfig)
 
 Add an uninitialized `FockConfig` to the current basis. Typically, you'll want to 
 initialize it right after with `add_tuckerconfig!`
 """
-function add_fockconfig!(s::BSTstate{T,N,R}, fock::FockConfig) where {T,N,R}
+function add_fockconfig!(s::SPTstate{T,N,R}, fock::FockConfig) where {T,N,R}
     s.data[fock] = OrderedDict{TuckerConfig, Tucker{T,N,R}}()
 end
 
-function fill_p_space!(s::BSTstate{T,N,R}, na, nb) where {T,N,R}
+function fill_p_space!(s::SPTstate{T,N,R}, na, nb) where {T,N,R}
 
     sectors = [] 
     for ci in s.clusters
@@ -407,9 +407,9 @@ end
 
 
 """
-    Base.length(s::BSTstate)
+    Base.length(s::SPTstate)
 """
-function Base.length(s::BSTstate)
+function Base.length(s::SPTstate)
     l = 0
     for (fock,tconfigs) in s.data
         for (tconfig, tuck) in tconfigs
@@ -420,9 +420,9 @@ function Base.length(s::BSTstate)
 end
 
 """
-    eye!(s::BSTstate)
+    eye!(s::SPTstate)
 """
-function eye!(s::BSTstate{T,N,R}) where {T,N,R}
+function eye!(s::SPTstate{T,N,R}) where {T,N,R}
     set_vector!(s, Matrix{T}(I,size(s)))
 end
     
@@ -447,11 +447,11 @@ function prune_empty_fock_spaces!(s::AbstractState)
     end
 end
 """
-    prune_empty_TuckerConfigs!(s::T) where T<:Union{BSstate, BSTstate}
+    prune_empty_TuckerConfigs!(s::T) where T<:Union{BSstate, SPTstate}
 
 remove fock_spaces that don't have any configurations
 """
-function prune_empty_TuckerConfigs!(s::T) where T<:Union{BSstate, BSTstate}
+function prune_empty_TuckerConfigs!(s::T) where T<:Union{BSstate, SPTstate}
     focklist = keys(s.data)
     for fock in focklist
         tconflist = keys(s.data[fock])
@@ -469,11 +469,11 @@ function prune_empty_TuckerConfigs!(s::T) where T<:Union{BSstate, BSTstate}
 end
 
 """
-    function orthonormalize!(s::BSTstate{T,N,R}) where {T,N,R}
+    function orthonormalize!(s::SPTstate{T,N,R}) where {T,N,R}
 
 orthonormalize
 """
-function orthonormalize!(s::BSTstate{T,N,R}) where {T,N,R}
+function orthonormalize!(s::SPTstate{T,N,R}) where {T,N,R}
     #={{{=#
     v0 = get_vector(s) 
     v0[:,1] .= v0[:,1]./norm(v0[:,1])
@@ -492,11 +492,11 @@ end
 
 
 """
-    function get_vector(ts::BSTstate{T,N,R}) where {T,N,R}
+    function get_vector(ts::SPTstate{T,N,R}) where {T,N,R}
 
 Return a matrix of the core tensors.
 """
-function get_vector(ts::BSTstate{T,N,R}) where {T,N,R}
+function get_vector(ts::SPTstate{T,N,R}) where {T,N,R}
 #={{{=#
     v = zeros(length(ts), R)
     idx = 1
@@ -517,11 +517,11 @@ end
 
 
 """
-    function get_vector(ts::BSTstate{T,N,R}, root::Integer) where {T,N,R}
+    function get_vector(ts::SPTstate{T,N,R}, root::Integer) where {T,N,R}
 
 Return a vector of the variables for `root`. Note that this is the core tensors being returned
 """
-function get_vector(ts::BSTstate{T,N,R}, root::Integer) where {T,N,R}
+function get_vector(ts::SPTstate{T,N,R}, root::Integer) where {T,N,R}
 #={{{=#
     v = zeros(length(ts), 1)
     root <= R || throw(DimensionMismatch)
@@ -541,9 +541,9 @@ end
 
 
 """
-    function set_vector!(ts::BSTstate{T,N,R}, v::Vector{T}, root::Int=1) where {T,N,R}
+    function set_vector!(ts::SPTstate{T,N,R}, v::Vector{T}, root::Int=1) where {T,N,R}
 """
-function set_vector!(ts::BSTstate{T,N,R}, v::Vector{T}; root=1) where {T,N,R}
+function set_vector!(ts::SPTstate{T,N,R}, v::Vector{T}; root=1) where {T,N,R}
 #={{{=#
     #length(size(v)) == 1 || error(" Only takes vectors", size(v))
     nbasis = size(v)[1]
@@ -565,9 +565,9 @@ end
 
 
 """
-    function set_vector!(ts::BSTstate{T,N,R}, v::Matrix{T}) where {T,N,R}
+    function set_vector!(ts::SPTstate{T,N,R}, v::Matrix{T}) where {T,N,R}
 """
-function set_vector!(ts::BSTstate{T,N,R}, v::Matrix{T}) where {T,N,R}
+function set_vector!(ts::SPTstate{T,N,R}, v::Matrix{T}) where {T,N,R}
 #={{{=#
     #length(size(v)) == 1 || error(" Only takes vectors", size(v))
     nbasis = size(v)[1]
@@ -594,7 +594,7 @@ end
 
 """
 """
-function randomize!(s::BSTstate{T,N,R}; seed=nothing) where {T,N,R}
+function randomize!(s::SPTstate{T,N,R}; seed=nothing) where {T,N,R}
 #={{{=#
     for (fock, tconfigs) in s
         for (tconfig, tcoeffs) in tconfigs
@@ -605,9 +605,9 @@ end
 #=}}}=#
 
 """
-    zero!(s::BSTstate)
+    zero!(s::SPTstate)
 """
-function zero!(s::BSTstate{T,N,R}) where {T,N,R}
+function zero!(s::SPTstate{T,N,R}) where {T,N,R}
 #={{{=#
     for (fock, tconfigs) in s
         for (tconfig, tcoeffs) in tconfigs
@@ -620,11 +620,11 @@ end
 #=}}}=#
 
 """
-    Base.display(s::BSTstate; thresh=1e-3)
+    Base.display(s::SPTstate; thresh=1e-3)
 
 Pretty print
 """
-function Base.display(s::BSTstate; thresh=1e-2, root=1)
+function Base.display(s::SPTstate; thresh=1e-2, root=1)
 #={{{=#
     println()
     @printf(" --------------------------------------------------\n")
@@ -677,11 +677,11 @@ function Base.display(s::BSTstate; thresh=1e-2, root=1)
 #=}}}=#
 end
 """
-    print_fock_occupations(s::BSTstate; thresh=1e-3)
+    print_fock_occupations(s::SPTstate; thresh=1e-3)
 
 Pretty print
 """
-function print_fock_occupations(s::BSTstate; thresh=1e-3,root=1)
+function print_fock_occupations(s::SPTstate; thresh=1e-3,root=1)
 #={{{=#
 
     println()
@@ -718,14 +718,14 @@ end
 
 
 """
-    orth_overlap(ts1::TPSChem.BSTstate, ts2::TPSChem.BSTstate)
+    orth_overlap(ts1::TPSChem.SPTstate, ts2::TPSChem.SPTstate)
 
 Overlap between `ts2` and `ts1`
 
 This assumes both `ts1` and `ts2` have the same tucker factors for each `TuckerConfig`
 Returns matrix of overlaps
 """
-function orth_overlap(ts1::BSTstate{T,N,R}, ts2::BSTstate{T,N,R}) where {T,N,R}
+function orth_overlap(ts1::SPTstate{T,N,R}, ts2::SPTstate{T,N,R}) where {T,N,R}
     #={{{=#
     overlap = zeros(T,R,R) 
     for (fock,configs) in ts2
@@ -746,14 +746,14 @@ end
 
 
 """
-    orth_dot(ts1::TPSChem.BSTstate, ts2::TPSChem.BSTstate)
+    orth_dot(ts1::TPSChem.SPTstate, ts2::TPSChem.SPTstate)
 
 Dot product between `ts2` and `ts1`
 
 Warning: this assumes both `ts1` and `ts2` have the same tucker factors for each `TuckerConfig`
 Returns vector of dot products
 """
-function orth_dot(ts1::BSTstate{T,N,R}, ts2::BSTstate{T,N,R}) where {T,N,R}
+function orth_dot(ts1::SPTstate{T,N,R}, ts2::SPTstate{T,N,R}) where {T,N,R}
     #={{{=#
     overlap = zeros(T,R) 
     for (fock,configs) in ts2
@@ -772,11 +772,11 @@ end
 
 
 """
-    nonorth_overlap(ts1::TPSChem.BSTstate, ts2::TPSChem.BSTstate; verbose=0)
+    nonorth_overlap(ts1::TPSChem.SPTstate, ts2::TPSChem.SPTstate; verbose=0)
 
 Dot product between 1ts2` and `ts1` where each have their own Tucker factors
 """
-function nonorth_overlap(ts1::BSTstate{T,N,R}, ts2::BSTstate{T,N,R}; verbose=0) where {T,N,R}
+function nonorth_overlap(ts1::SPTstate{T,N,R}, ts2::SPTstate{T,N,R}; verbose=0) where {T,N,R}
     #={{{=#
     overlap = zeros(T,R,R)
     for (fock,configs) in ts2
@@ -796,11 +796,11 @@ end
 
 
 """
-    nonorth_dot(ts1::TPSChem.BSTstate, ts2::TPSChem.BSTstate; verbose=0)
+    nonorth_dot(ts1::TPSChem.SPTstate, ts2::TPSChem.SPTstate; verbose=0)
 
 Dot product between 1ts2` and `ts1` where each have their own Tucker factors
 """
-function nonorth_dot(ts1::BSTstate{T,N,R}, ts2::BSTstate{T,N,R}; verbose=0) where {T,N,R}
+function nonorth_dot(ts1::SPTstate{T,N,R}, ts2::SPTstate{T,N,R}; verbose=0) where {T,N,R}
     #={{{=#
     overlap = zeros(T,R)
     for (fock,configs) in ts2
@@ -818,11 +818,11 @@ function nonorth_dot(ts1::BSTstate{T,N,R}, ts2::BSTstate{T,N,R}; verbose=0) wher
 end
 
 """
-    scale!(ts::TPSChem.BSTstate, a::T<:Number)
+    scale!(ts::TPSChem.SPTstate, a::T<:Number)
 
 Scale `ts` by a constant
 """
-function scale!(ts::BSTstate{T,N,R}, a::T) where {T<:Number, N,R}
+function scale!(ts::SPTstate{T,N,R}, a::T) where {T<:Number, N,R}
     #={{{=#
     for (fock,configs) in ts
         for (config,tuck) in configs
@@ -834,18 +834,18 @@ function scale!(ts::BSTstate{T,N,R}, a::T) where {T<:Number, N,R}
     #=}}}=#
 end
 
-function scale(ts::BSTstate{T,N,R}, a::T) where {T<:Number, N,R}
+function scale(ts::SPTstate{T,N,R}, a::T) where {T<:Number, N,R}
     tmp = deepcopy(ts)
     scale!(tmp, a)
     return tmp
 end
 
 """
-    function scale!(ts::TPSChem.BSTstate{T,N,R}, a::Vector{T})
+    function scale!(ts::TPSChem.SPTstate{T,N,R}, a::Vector{T})
 
 Scale `ts` by a constant for each state,`R`
 """
-function scale!(ts::BSTstate{T,N,R}, a::Vector{T}) where {T<:Number, N,R}
+function scale!(ts::SPTstate{T,N,R}, a::Vector{T}) where {T<:Number, N,R}
     #={{{=#
     length(a) == R || throw(DimensionMismatch)   
     for (fock,configs) in ts
@@ -859,29 +859,29 @@ function scale!(ts::BSTstate{T,N,R}, a::Vector{T}) where {T<:Number, N,R}
 end
 
 """
-    scale(ts::BSTstate{T,N,R}, a::Vector{T}) where {T<:Number, N,R}
+    scale(ts::SPTstate{T,N,R}, a::Vector{T}) where {T<:Number, N,R}
 
 TBW
 """
-function scale(ts::BSTstate{T,N,R}, a::Vector{T}) where {T<:Number, N,R}
+function scale(ts::SPTstate{T,N,R}, a::Vector{T}) where {T<:Number, N,R}
     tmp = deepcopy(ts)
     scale!(tmp, a)
     return tmp
 end
 
-nroots(v::BSTstate{T,N,R}) where {T,N,R} = R
-type(v::BSTstate{T,N,R}) where {T,N,R} = T
-nclusters(v::BSTstate{T,N,R}) where {T,N,R} = N
+nroots(v::SPTstate{T,N,R}) where {T,N,R} = R
+type(v::SPTstate{T,N,R}) where {T,N,R} = T
+nclusters(v::SPTstate{T,N,R}) where {T,N,R} = N
 
 
 
 
 """
-    add_spin_focksectors(state::BSTstate{T,N,R}) where {T,N,R}
+    add_spin_focksectors(state::SPTstate{T,N,R}) where {T,N,R}
 
-Add the focksectors needed to spin adapt the given `BSTstate`
+Add the focksectors needed to spin adapt the given `SPTstate`
 """
-function add_spin_focksectors(state::BSTstate{T,N,R}) where {T,N,R}
+function add_spin_focksectors(state::SPTstate{T,N,R}) where {T,N,R}
     out = deepcopy(state)
     for (fock, configs) in state.data
         for f in possible_spin_focksectors(state.clusters, fock)
@@ -895,22 +895,22 @@ end
 
 
 """
-    Base.:*(A::BSTstate{T,N,R}, C::T) where {T,N,R}
+    Base.:*(A::SPTstate{T,N,R}, C::T) where {T,N,R}
 
 TBW
 """
-function Base.:*(A::BSTstate{T,N,R}, C::T) where {T,N,R}
+function Base.:*(A::SPTstate{T,N,R}, C::T) where {T,N,R}
     B = deepcopy(A)
     scale!(B, C)
     return B
 end
 
 """
-    Base.:-(A::BSTstate{T,N,R}, B::BSTstate{T,N,R}) where {T,N,R}
+    Base.:-(A::SPTstate{T,N,R}, B::SPTstate{T,N,R}) where {T,N,R}
 
 TBW
 """
-function Base.:-(A::BSTstate{T,N,R}, B::BSTstate{T,N,R}) where {T,N,R}
+function Base.:-(A::SPTstate{T,N,R}, B::SPTstate{T,N,R}) where {T,N,R}
     length(A) == length(B) || throw(DimensionMismatch)
     C = deepcopy(A)
     set_vector!(C, get_vector(A) .- get_vector(B))
@@ -919,11 +919,11 @@ end
 
 
 """
-    Base.:+(A::BSTstate{T,N,R}, B::BSTstate{T,N,R}) where {T,N,R}
+    Base.:+(A::SPTstate{T,N,R}, B::SPTstate{T,N,R}) where {T,N,R}
 
 TBW
 """
-function Base.:+(A::BSTstate{T,N,R}, B::BSTstate{T,N,R}) where {T,N,R}
+function Base.:+(A::SPTstate{T,N,R}, B::SPTstate{T,N,R}) where {T,N,R}
     length(A) == length(B) || throw(DimensionMismatch)
     C = deepcopy(A)
     set_vector!(C, get_vector(A) .+ get_vector(B))
@@ -931,11 +931,11 @@ function Base.:+(A::BSTstate{T,N,R}, B::BSTstate{T,N,R}) where {T,N,R}
 end
 
 """
-    Base.:*(A::BSTstate{T,N,R}, C::AbstractArray) where {T,N,R}
+    Base.:*(A::SPTstate{T,N,R}, C::AbstractArray) where {T,N,R}
 
 TBW
 """
-function Base.:*(A::BSTstate{T,N,R}, C::AbstractArray) where {T,N,R}
+function Base.:*(A::SPTstate{T,N,R}, C::AbstractArray) where {T,N,R}
     B = deepcopy(A)
     zero!(B)
     set_vector!(B, get_vector(A)*C)
@@ -945,11 +945,11 @@ end
 
 
 """
-    project_into_new_basis(v1::BSTstate{T,N,R}, v2::BSTstate{T,N,R}) where {T,N,R}
+    project_into_new_basis(v1::SPTstate{T,N,R}, v2::SPTstate{T,N,R}) where {T,N,R}
 
 Project state `v1`  into the basis defined by `v2`
 """
-function project_into_new_basis(v1::BSTstate{T,N,R}, v2::BSTstate{T,N,R}) where {T,N,R}
+function project_into_new_basis(v1::SPTstate{T,N,R}, v2::SPTstate{T,N,R}) where {T,N,R}
     #
     flush(stdout)
     out = deepcopy(v2)
@@ -977,15 +977,15 @@ function project_into_new_basis(v1::BSTstate{T,N,R}, v2::BSTstate{T,N,R}) where 
 end
 
 """
-    ct_table(s::BSTstate; ne_cluster=10, nroots=1)
+    ct_table(s::SPTstate; ne_cluster=10, nroots=1)
 
 Prints total weight of charge transfer in each root in table formate
 # Arguments
-- `s::BSTstate`
+- `s::SPTstate`
 - `ne_cluster`:  Int, number of total electrons in each cluster
 - `nroots`: Total number of roots
 """
-function ct_table(s::BSTstate{T,N,R}; ne_cluster=10, nroots=1) where {T,N,R}
+function ct_table(s::SPTstate{T,N,R}; ne_cluster=10, nroots=1) where {T,N,R}
     @printf(" -----------------------\n")
     @printf(" --- CHARGE TRANSFER ---\n")
     @printf(" -----------------------\n")

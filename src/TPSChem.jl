@@ -69,7 +69,7 @@ include("core/build_local_quantities.jl")
 
 include("core/type_AbstractState.jl")
 include("core/type_BSstate.jl")
-include("core/type_BSTstate.jl")
+include("core/type_SPTstate.jl")
 include("core/type_TPSCIstate.jl")
 
 include("core/type_ClusteredTerm.jl")
@@ -81,8 +81,8 @@ include("core/tucker_contract_dense_H_with_state.jl")
 include("core/tucker_form_sigma_block_expand.jl")
 include("core/tucker_outer.jl")
 include("core/tucker_pt.jl")
-include("core/bst.jl")
-include("core/bst_helpers.jl")
+include("core/spt.jl")
+include("core/spt_helpers.jl")
 
 include("core/tpsci_inner.jl")
 include("core/tpsci_matvec_thread.jl")
@@ -112,7 +112,7 @@ export ClusterBasis
 export ClusterSubspace
 export ClusteredOperator
 export TPSCIstate
-export BSTstate
+export SPTstate
 export ClusterConfig
 export FockConfig
 export TuckerConfig
@@ -122,7 +122,7 @@ export add_fockconfig!
 export expand_each_fock_space!
 export compute_cluster_ops_2rdm
 export add_spinfree_2rdm_ops!
-export block_sparse_tucker
+export subspace_product_tucker
 export correlation_functions
 export compute_1rdm
 export compute_1rdm_sf

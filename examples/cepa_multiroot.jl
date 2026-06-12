@@ -44,7 +44,7 @@ for ci in clusters
     push!(p_spaces, ssi)
 end
 
-ci_vector = BSTstate(clusters, p_spaces, cluster_bases, R=nroots) 
+ci_vector = SPTstate(clusters, p_spaces, cluster_bases, R=nroots) 
 
 na = 5
 nb = 4

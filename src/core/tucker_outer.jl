@@ -8,11 +8,11 @@ using .BlockDavidson
 
 
 """
-    get_map(ci_vector::BSTstate, cluster_ops, clustered_ham)
+    get_map(ci_vector::SPTstate, cluster_ops, clustered_ham)
 
 Get LinearMap with takes a vector and returns action of H on that vector
 """
-function get_map(ci_vector::BSTstate{T,N,R}, cluster_ops, clustered_ham; shift = nothing, cache=false) where {T,N,R}
+function get_map(ci_vector::SPTstate{T,N,R}, cluster_ops, clustered_ham; shift = nothing, cache=false) where {T,N,R}
     #={{{=#
     iters = 0
     
@@ -45,7 +45,7 @@ end
 #=}}}=#
 
 """
-    function ci_solve(ci_vector_in::BSTstate{T,N,R}, cluster_ops, clustered_ham; 
+    function ci_solve(ci_vector_in::SPTstate{T,N,R}, cluster_ops, clustered_ham; 
                          conv_thresh = 1e-5,
                          max_ss_vecs = 12,
                          max_iter    = 40,
@@ -64,7 +64,7 @@ Solve for ground state in the space spanned by `ci_vector`'s compression vectors
 - `verbose`: print level
 - `solver`: Which solver to use. Options = ["davidson", "krylovkit"]
 """
-function ci_solve(ci_vector_in::BSTstate{T,N,R}, cluster_ops, clustered_ham; 
+function ci_solve(ci_vector_in::SPTstate{T,N,R}, cluster_ops, clustered_ham; 
                          conv_thresh    = 1e-5,
                          max_ss_vecs    = 12,
                          max_iter       = 40,
@@ -75,7 +75,7 @@ function ci_solve(ci_vector_in::BSTstate{T,N,R}, cluster_ops, clustered_ham;
                          nbody          = 4,
                          solver         = "davidson") where {T,N,R}
 #={{{=#
-    @printf(" |== BST CI ========================================================\n")
+    @printf(" |== SPT CI ========================================================\n")
     @printf(" %-50s", "Solve CI with # variables: ")
     @printf("%10i\n", length(ci_vector_in))
     vec = deepcopy(ci_vector_in)
@@ -86,8 +86,8 @@ function ci_solve(ci_vector_in::BSTstate{T,N,R}, cluster_ops, clustered_ham;
 
     # 
     #   Rotate tucker basis to diagonalize CMF hamiltonian for better preconditioning    
-    # Hcmf_diag = BSTstate(deepcopy(vec), R=1) 
-    Hcmf_diag = BSTstate(vec, R=1) 
+    # Hcmf_diag = SPTstate(deepcopy(vec), R=1) 
+    Hcmf_diag = SPTstate(vec, R=1) 
     if precond
         verbose < 2 || @printf(" form_1body_operator_diagonal... \n")
         form_1body_operator_diagonal!(vec, Hcmf_diag, cluster_ops, pseudo_canon=true)
@@ -100,7 +100,7 @@ function ci_solve(ci_vector_in::BSTstate{T,N,R}, cluster_ops, clustered_ham;
     function matvec(v::Matrix{T}) where T
         iters += 1
         #all(size(vec) .== size(v)) || error(DimensionMismatch)
-        vec_i = BSTstate(vec, R=size(v,2))
+        vec_i = SPTstate(vec, R=size(v,2))
         set_vector!(vec_i, v)
 
         sig = deepcopy(vec_i)
@@ -112,7 +112,7 @@ function ci_solve(ci_vector_in::BSTstate{T,N,R}, cluster_ops, clustered_ham;
     function matvec(v::Vector{T}) where T
         iters += 1
         #all(size(vec) .== size(v)) || error(DimensionMismatch)
-        vec_i = BSTstate(vec, R=1)
+        vec_i = SPTstate(vec, R=1)
         set_vector!(vec_i, v)
 
         sig = deepcopy(vec_i)
@@ -221,11 +221,11 @@ end
 
 
 """
-    tucker_cepa_solve!(ref_vector::BSTstate, cepa_vector::BSTstate, cluster_ops, clustered_ham; tol=1e-5, cache=true)
+    tucker_cepa_solve!(ref_vector::SPTstate, cepa_vector::SPTstate, cluster_ops, clustered_ham; tol=1e-5, cache=true)
 
 # Arguments
 - `ref_vector`: Input reference state. 
-- `cepa_vector`: BSTstate which defines the configurational space defining {X}. This 
+- `cepa_vector`: SPTstate which defines the configurational space defining {X}. This 
 should be the first-order interacting space (or some compressed version of it).
 - `cluster_ops`
 - `clustered_ham`
@@ -254,7 +254,7 @@ After solving, the Energy can be obtained as:
     
     E = (Eref + Hax*Cx) / (1 + Sax*Cx)
 """
-function tucker_cepa_solve(ref_vector::BSTstate{T,N,R}, cepa_vector::BSTstate, cluster_ops, clustered_ham,
+function tucker_cepa_solve(ref_vector::SPTstate{T,N,R}, cepa_vector::SPTstate, cluster_ops, clustered_ham,
                            cepa_shift = "cepa",
                            cepa_mit   = 50;
                            tol        = 1e-6,
@@ -357,8 +357,8 @@ function tucker_cepa_solve(ref_vector::BSTstate{T,N,R}, cepa_vector::BSTstate, c
             # matvec: (H_xx - eshift) v, restricted to Q-space (P-space projected out)
             function mymatvec(v)
                 v_q = v .* p_mask   # project input to Q-space
-                xr = BSTstate(x_vector, R=1)
-                xl = BSTstate(x_vector, R=1)
+                xr = SPTstate(x_vector, R=1)
+                xl = SPTstate(x_vector, R=1)
                 set_vector!(xr, vec(v_q), root=1)
                 zero!(xl)
                 build_sigma_cepa!(xl, xr, cluster_ops, clustered_ham, cache=cache)
@@ -443,11 +443,11 @@ function tucker_cepa_solve(ref_vector::BSTstate{T,N,R}, cepa_vector::BSTstate, c
 end#=}}}=#
  
 """
-    tucker_cepa_solve!(ref_vector::BSTstate, cepa_vector::BSTstate, cluster_ops, clustered_ham; tol=1e-5, cache=true)
+    tucker_cepa_solve!(ref_vector::SPTstate, cepa_vector::SPTstate, cluster_ops, clustered_ham; tol=1e-5, cache=true)
 
 # Arguments
 - `ref_vector`: Input reference state. 
-- `cepa_vector`: BSTstate which defines the configurational space defining {X}. This 
+- `cepa_vector`: SPTstate which defines the configurational space defining {X}. This 
 should be the first-order interacting space (or some compressed version of it).
 - `cluster_ops`
 - `clustered_ham`
@@ -475,7 +475,7 @@ Ax=b
 After solving, the Energy can be obtained as:
 E = (Eref + Hax*Cx) / (1 + Sax*Cx)
 """
-function tucker_cepa_solve2(ref_vector::BSTstate, cepa_vector::BSTstate, cluster_ops, clustered_ham; tol=1e-5, cache=true, max_iter=30, verbose=false,nbody=4, do_pt2=false)
+function tucker_cepa_solve2(ref_vector::SPTstate, cepa_vector::SPTstate, cluster_ops, clustered_ham; tol=1e-5, cache=true, max_iter=30, verbose=false,nbody=4, do_pt2=false)
 #={{{=#
     sig = deepcopy(ref_vector)
     zero!(sig)
@@ -554,8 +554,8 @@ function tucker_cepa_solve2(ref_vector::BSTstate, cepa_vector::BSTstate, cluster
     # Currently, we need to solve each root separately, this should be fixed
     # by writing our own CG solver
     function mymatvec(v)
-        xr = BSTstate(x_vector, R=1)
-        xl = BSTstate(x_vector, R=1)
+        xr = SPTstate(x_vector, R=1)
+        xl = SPTstate(x_vector, R=1)
         length(xr) == length(v) || throw(DimensionMismatch())
         set_vector!(xr, vec(v), root=1)
         zero!(xl)
@@ -604,11 +604,11 @@ end#=}}}=#
 
 
 """
-    define_foi_space(v::BSTstate, clustered_ham; nbody=2)
+    define_foi_space(v::SPTstate, clustered_ham; nbody=2)
 Compute the first-order interacting space as defined by clustered_ham
 
 #Arguments
-- `v::BSTstate`: input state
+- `v::SPTstate`: input state
 - `clustered_ham`: Hamiltonian
 - `nbody`: allows one to limit (max 4body) terms in the Hamiltonian considered
 
@@ -616,8 +616,8 @@ Compute the first-order interacting space as defined by clustered_ham
 - `foi::OrderedDict{FockConfig,Vector{TuckerConfig}}`
 
 """
-function define_foi_space(cts::T, clustered_ham; nbody=2) where T<:Union{BSstate, BSTstate}
-    println(" Define the FOI space for BSTstate. nbody = ", nbody)#={{{=#
+function define_foi_space(cts::T, clustered_ham; nbody=2) where T<:Union{BSstate, SPTstate}
+    println(" Define the FOI space for SPTstate. nbody = ", nbody)#={{{=#
 
     foi_space = OrderedDict{FockConfig,Vector{TuckerConfig}}()
 
@@ -696,7 +696,7 @@ end
 
 
 """
-    build_compressed_1st_order_state(ψ::BSTstate{T,N,R}, cluster_ops, clustered_ham; 
+    build_compressed_1st_order_state(ψ::SPTstate{T,N,R}, cluster_ops, clustered_ham; 
     thresh=1e-7, 
     max_number=nothing, 
     nbody=4, 
@@ -706,7 +706,7 @@ end
 
 TBW
 """
-function build_compressed_1st_order_state(ψ::BSTstate{T,N,R}, cluster_ops, clustered_ham; 
+function build_compressed_1st_order_state(ψ::SPTstate{T,N,R}, cluster_ops, clustered_ham; 
     thresh=1e-7, 
     max_number=nothing, 
     nbody=4, 
@@ -716,7 +716,7 @@ function build_compressed_1st_order_state(ψ::BSTstate{T,N,R}, cluster_ops, clus
     )  where {T,N,R}
 
     println(" In build_compressed_1st_order_state")
-    σ = BSTstate(ψ.clusters, ψ.p_spaces, ψ.q_spaces, T=T, R=R)
+    σ = SPTstate(ψ.clusters, ψ.p_spaces, ψ.q_spaces, T=T, R=R)
     clusters = ψ.clusters
     jobs = Dict{FockConfig{N},Vector{Tuple}}()
 
@@ -764,11 +764,11 @@ function build_compressed_1st_order_state(ψ::BSTstate{T,N,R}, cluster_ops, clus
 
     
     scr_v = Vector{Vector{Vector{T}} }()
-    jobs_out = Vector{BSTstate{T,N,R}}()
+    jobs_out = Vector{SPTstate{T,N,R}}()
     for tid in 1:Threads.maxthreadid()
 
-        # Initialize each thread with it's own BSTstate
-        push!(jobs_out, BSTstate(ψ.clusters, ψ.p_spaces, ψ.q_spaces, T=T, R=R))
+        # Initialize each thread with it's own SPTstate
+        push!(jobs_out, SPTstate(ψ.clusters, ψ.p_spaces, ψ.q_spaces, T=T, R=R))
         push!(scr_v, Vector{Vector{Float64}}([zeros(T, 1000) for i in 1:N]))
 
     end
@@ -804,7 +804,7 @@ function build_compressed_1st_order_state(ψ::BSTstate{T,N,R}, cluster_ops, clus
 
 end
 
-function _build_compressed_1st_order_state_job(fock_σ, jobs, σ::BSTstate{T,N,R}, 
+function _build_compressed_1st_order_state_job(fock_σ, jobs, σ::SPTstate{T,N,R}, 
     cluster_ops, nbody, thresh, max_number, prescreen, compress_twice,
     scr_v) where {T,N,R}
 
@@ -923,7 +923,7 @@ end
 
 
 """
-    build_compressed_1st_order_state_old(ket_cts::BSTstate{T,N,R}, cluster_ops, clustered_ham; 
+    build_compressed_1st_order_state_old(ket_cts::SPTstate{T,N,R}, cluster_ops, clustered_ham; 
         thresh=1e-7, 
         max_number=nothing, 
         nbody=4, 
@@ -936,7 +936,7 @@ This is done only partially, where each term is recompressed after being compute
 Lots of overhead probably from compression, but never completely uncompresses.
 
 #Arguments
-- `cts::BSTstate`: input state
+- `cts::SPTstate`: input state
 - `cluster_ops`:
 - `clustered_ham`: Hamiltonian
 - `thresh`: Threshold for each HOSVD 
@@ -945,10 +945,10 @@ Lots of overhead probably from compression, but never completely uncompresses.
 - `compress_twice`: Should we recompress after adding the tuckers together
 
 #Returns
-- `v1::BSTstate`
+- `v1::SPTstate`
 
 """
-function build_compressed_1st_order_state_old(ket_cts::BSTstate{T,N,R}, cluster_ops, clustered_ham; 
+function build_compressed_1st_order_state_old(ket_cts::SPTstate{T,N,R}, cluster_ops, clustered_ham; 
         thresh=1e-7, 
         max_number=nothing, 
         nbody=4, 
@@ -956,7 +956,7 @@ function build_compressed_1st_order_state_old(ket_cts::BSTstate{T,N,R}, cluster_
         prescreen=false) where {T,N,R}
     #
     # Initialize data for our output sigma, which we will convert to a
-    sig_cts = BSTstate(ket_cts.clusters, OrderedDict{FockConfig{N},OrderedDict{TuckerConfig{N},Tucker{T,N,R}} }(),  ket_cts.p_spaces, ket_cts.q_spaces)
+    sig_cts = SPTstate(ket_cts.clusters, OrderedDict{FockConfig{N},OrderedDict{TuckerConfig{N},Tucker{T,N,R}} }(),  ket_cts.p_spaces, ket_cts.q_spaces)
 
     data = OrderedDict{FockConfig{N}, OrderedDict{TuckerConfig{N}, Vector{Tucker{T,N,R}} } }()
     blas_num_threads = BLAS.get_num_threads()
@@ -1211,7 +1211,7 @@ function _add_results!(sig_cts, data, compress_twice, thresh, N)
 end
 
     
-function do_fois_ci(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function do_fois_ci(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
             H0          = "Hcmf",
             max_iter    = 50,
             nbody       = 4,
@@ -1278,7 +1278,7 @@ function do_fois_ci(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
 end
  
 """
-    do_fois_cepa(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+    do_fois_cepa(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
                  max_iter=20,
                  cepa_shift="cepa",
                  cepa_mit=30,
@@ -1292,7 +1292,7 @@ end
 Perform Coupled Electron Pair Approximation (CEPA) calculations.
 
 # Arguments
-            - `ref::BSTstate{T,N,R}`: The reference `BSTstate` object representing the wavefunction.
+            - `ref::SPTstate{T,N,R}`: The reference `SPTstate` object representing the wavefunction.
             - `cluster_ops`: Operators related to the cluster.
             - `clustered_ham`: Clustered Hamiltonian.
             - `max_iter::Int`: Maximum number of iterations for the CEPA solver. Default is 20.
@@ -1310,7 +1310,7 @@ Perform Coupled Electron Pair Approximation (CEPA) calculations.
 """
 
 
-function do_fois_cepa(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function do_fois_cepa(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
     max_iter     = 20,
     cepa_shift   = "cepa",
     cepa_mit     = 30,
@@ -1370,8 +1370,8 @@ function do_fois_cepa(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
     cepa_vec_f = deepcopy(ref_vec)
  
     for i in 1:R
-        ref_vec_i  = TPSChem.BSTstate(ref_vec, i)
-        cepa_vec_i = TPSChem.BSTstate(cepa_vec, i)
+        ref_vec_i  = TPSChem.SPTstate(ref_vec, i)
+        cepa_vec_i = TPSChem.SPTstate(cepa_vec, i)
         zero!(cepa_vec_i)
         println(" Do CEPA: Dim = ", length(cepa_vec_i))
  
@@ -1404,7 +1404,7 @@ function do_fois_cepa(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
     return e_cepa_vec
 end
 """
-    do_fois_cepa(ref::BSTstate{T,N,1}, cluster_ops, clustered_ham;
+    do_fois_cepa(ref::SPTstate{T,N,1}, cluster_ops, clustered_ham;
                  max_iter=20,
                  cepa_shift="cepa",
                  cepa_mit=30,
@@ -1418,7 +1418,7 @@ end
 Perform Coupled Electron Pair Approximation (CEPA) calculations.
 
 # Arguments
-        - `ref::BSTstate{T,N,1}`: The reference `BSTstate` object representing the wavefunction with only one root.
+        - `ref::SPTstate{T,N,1}`: The reference `SPTstate` object representing the wavefunction with only one root.
         - `cluster_ops`: Operators related to the cluster.
         - `clustered_ham`: Clustered Hamiltonian.
         - `max_iter::Int`: Maximum number of iterations for the CEPA solver. Default is 20.
@@ -1432,10 +1432,10 @@ Perform Coupled Electron Pair Approximation (CEPA) calculations.
         - `verbose::Bool`: Whether to print verbose output. Default is true.
 
 # Returns
-        - `Tuple{Float64, BSTstate{T,N,1}}`: The CEPA correlation energy and the updated wavefunction.
+        - `Tuple{Float64, SPTstate{T,N,1}}`: The CEPA correlation energy and the updated wavefunction.
 """
 
-function do_fois_cepa(ref::BSTstate{T,N,1}, cluster_ops, clustered_ham;
+function do_fois_cepa(ref::SPTstate{T,N,1}, cluster_ops, clustered_ham;
                         max_iter=20,
                         cepa_shift="cepa",
                         cepa_mit=30,
@@ -1508,12 +1508,12 @@ end
 
 
 """
-    project_out!(v::BSTstate, w::BSTstate; thresh=1e-16)
+    project_out!(v::SPTstate, w::SPTstate; thresh=1e-16)
 
 Project w out of v 
 |v'> = |v> - |w><w|v>
 """
-function project_out!(v::BSTstate{T,N,Rv}, w::BSTstate{T,N,Rw}; thresh=1e-16) where {T,N,Rv,Rw}
+function project_out!(v::SPTstate{T,N,Rv}, w::SPTstate{T,N,Rw}; thresh=1e-16) where {T,N,Rv,Rw}
 
     #S = nonorth_overlap(w,v)
     #wtmp = deepcopy(w)

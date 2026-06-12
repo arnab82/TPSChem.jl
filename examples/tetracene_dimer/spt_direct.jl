@@ -25,7 +25,7 @@ cluster_ops = TPSChem.compute_cluster_ops(cluster_bases, ints);
 TPSChem.add_cmf_operators!(cluster_ops, cluster_bases, ints, d1.a, d1.b);
 # @save "cmf_op_TD.jld2" clusters init_fspace ints cluster_bases cluster_ops clustered_ham
 nroots = 10
-ci_vector = BSTstate(clusters,TPSChem.FockConfig(init_fspace), cluster_bases, R=nroots);
+ci_vector = SPTstate(clusters,TPSChem.FockConfig(init_fspace), cluster_bases, R=nroots);
 
 
 # # Add the lowest energy single exciton to basis
@@ -43,7 +43,7 @@ display(ci_vector.data)
 TPSChem.eye!(ci_vector)
 display(ci_vector)
 e_ci, v2 = TPSChem.ci_solve(ci_vector, cluster_ops, clustered_ham);
-e_var, v_var = TPSChem.block_sparse_tucker(v2, cluster_ops, clustered_ham,
+e_var, v_var = TPSChem.subspace_product_tucker(v2, cluster_ops, clustered_ham,
                                                max_iter    = 200,
                                                nbody       = 4,
                                                H0          = "Hcmf",
@@ -57,7 +57,7 @@ e_var, v_var = TPSChem.block_sparse_tucker(v2, cluster_ops, clustered_ham,
                                                solver      = "davidson")
 @time ept2 = TPSChem.compute_pt2_energy(v_var, cluster_ops, clustered_ham, thresh_foi=1e-6,prescreen   = true,compress_twice = true)
 @time ept2 = TPSChem.compute_pt2_energy2(v_var, cluster_ops, clustered_ham, thresh_foi=1e-6,prescreen   = true,compress_twice = true)
-e_var, v_var = TPSChem.block_sparse_tucker(v_var, cluster_ops, clustered_ham,
+e_var, v_var = TPSChem.subspace_product_tucker(v_var, cluster_ops, clustered_ham,
                                                max_iter    = 200,
                                                nbody       = 4,
                                                H0          = "Hcmf",

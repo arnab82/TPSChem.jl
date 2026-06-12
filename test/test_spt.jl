@@ -3,22 +3,22 @@ using Printf
 using Test
 using JLD2 
 
-#@testset "BSTstate" begin
+#@testset "SPTstate" begin
 if false 
     @load "_testdata_cmf_h12_64bit.jld2"
-    v = TPSChem.BSTstate(clusters, FockConfig(init_fspace), cluster_bases)
+    v = TPSChem.SPTstate(clusters, FockConfig(init_fspace), cluster_bases)
     
     e_ci, v_ci = TPSChem.ci_solve(v, cluster_ops, clustered_ham)
     display(e_ci)
     @test isapprox(e_ci[1], -18.31710895, atol=1e-8)
 
    
-    v = TPSChem.BSTstate(v,R=1)
+    v = TPSChem.SPTstate(v,R=1)
     xspace  = TPSChem.build_compressed_1st_order_state(v, cluster_ops, clustered_ham, nbody=4, thresh=1e-3)
     xspace = TPSChem.compress(xspace, thresh=1e-3)
 
     TPSChem.nonorth_add!(v, xspace)
-    v = TPSChem.BSTstate(v,R=4)
+    v = TPSChem.SPTstate(v,R=4)
     TPSChem.randomize!(v)
     TPSChem.orthonormalize!(v)
     
@@ -29,7 +29,7 @@ if false
     e_pt, v_pt = TPSChem.do_fois_pt2(v, cluster_ops, clustered_ham, thresh_foi=1e-3, max_iter=50, tol=1e-8)
     
     if true 
-        e_var, v_var = TPSChem.block_sparse_tucker(v, cluster_ops, clustered_ham,
+        e_var, v_var = TPSChem.subspace_product_tucker(v, cluster_ops, clustered_ham,
                                                max_iter    = 20,
                                                nbody       = 4,
                                                H0          = "Hcmf",
@@ -61,7 +61,7 @@ if false
 #end
 end
 
-@testset "BST" begin
+@testset "SPT" begin
 
 
     @load "_testdata_cmf_h12_64bit.jld2"
@@ -69,9 +69,9 @@ end
     cluster_ops = TPSChem.compute_cluster_ops(cluster_bases, ints);
     TPSChem.add_cmf_operators!(cluster_ops, cluster_bases, ints, d1.a, d1.b);
 
-    v = TPSChem.BSTstate(clusters, FockConfig(init_fspace), cluster_bases)
+    v = TPSChem.SPTstate(clusters, FockConfig(init_fspace), cluster_bases)
 
-    e_var, v_var = TPSChem.block_sparse_tucker(v, cluster_ops, clustered_ham,
+    e_var, v_var = TPSChem.subspace_product_tucker(v, cluster_ops, clustered_ham,
                                                max_iter    = 20,
                                                nbody       = 4,
                                                H0          = "Hcmf",

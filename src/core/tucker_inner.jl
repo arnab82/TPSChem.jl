@@ -1,8 +1,8 @@
 
 """
-    build_sigma!(sigma_vector::BSTstate, ci_vector::BSTstate, cluster_ops, clustered_ham)
+    build_sigma!(sigma_vector::SPTstate, ci_vector::SPTstate, cluster_ops, clustered_ham)
 """
-function build_sigma_serial!(sigma_vector::BSTstate{T,N,R}, ci_vector::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function build_sigma_serial!(sigma_vector::SPTstate{T,N,R}, ci_vector::SPTstate{T,N,R}, cluster_ops, clustered_ham;
                              nbody=4, cache=false) where {T,N,R}
     #={{{=# 
 
@@ -47,9 +47,9 @@ end
 
 
 """
-    build_sigma!(sigma_vector::BSTstate, ci_vector::BSTstate, cluster_ops, clustered_ham)
+    build_sigma!(sigma_vector::SPTstate, ci_vector::SPTstate, cluster_ops, clustered_ham)
 """
-function cache_hamiltonian_old(sigma_vector::BSTstate, ci_vector::BSTstate, cluster_ops, clustered_ham; nbody=4)
+function cache_hamiltonian_old(sigma_vector::SPTstate, ci_vector::SPTstate, cluster_ops, clustered_ham; nbody=4)
     #={{{=#
     
 
@@ -87,7 +87,7 @@ function cache_hamiltonian_old(sigma_vector::BSTstate, ci_vector::BSTstate, clus
     #=}}}=#
 end
 
-function cache_hamiltonian(bra::BSTstate{T,N,R}, ket::BSTstate{T,N,R}, cluster_ops, clustered_ham; nbody=4, verbose=0, blas=false) where {T,N,R}
+function cache_hamiltonian(bra::SPTstate{T,N,R}, ket::SPTstate{T,N,R}, cluster_ops, clustered_ham; nbody=4, verbose=0, blas=false) where {T,N,R}
 #={{{=#
     
     # it seems like this is quite a bit faster when turned off:
@@ -159,9 +159,9 @@ end
 #=}}}=#
 
 """
-    build_sigma_parallel!(sigma_vector::BSTstate, ci_vector::BSTstate, cluster_ops, clustered_ham)
+    build_sigma_parallel!(sigma_vector::SPTstate, ci_vector::SPTstate, cluster_ops, clustered_ham)
 """
-function build_sigma!(sigma_vector::BSTstate{T,N,R}, ci_vector::BSTstate{T,N,R}, cluster_ops, clustered_ham; nbody=4, cache=false, verbose=1) where {T,N,R}
+function build_sigma!(sigma_vector::SPTstate{T,N,R}, ci_vector::SPTstate{T,N,R}, cluster_ops, clustered_ham; nbody=4, cache=false, verbose=1) where {T,N,R}
     #={{{=#
 
     verbose < 2 || @printf(" in build_sigma!")
@@ -245,7 +245,7 @@ end
 Thread-safe version of build_sigma! for use in CEPA matvec.
 Uses per-task scratch allocation to avoid races with Julia's dynamic scheduler.
 """
-function build_sigma_cepa!(sigma_vector::BSTstate{T,N,R}, ci_vector::BSTstate{T,N,R}, cluster_ops, clustered_ham; nbody=4, cache=false, verbose=1) where {T,N,R}
+function build_sigma_cepa!(sigma_vector::SPTstate{T,N,R}, ci_vector::SPTstate{T,N,R}, cluster_ops, clustered_ham; nbody=4, cache=false, verbose=1) where {T,N,R}
     #={{{=#
     jobs = []
     for (fock_bra, configs_bra) in sigma_vector
