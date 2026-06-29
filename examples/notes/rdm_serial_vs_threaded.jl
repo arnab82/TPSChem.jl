@@ -14,10 +14,10 @@ Test data: uses the he4 system from the FermiCG test suite.
 Point this at a different jld2 if you have your own system ready.
 """
 
-using QCBase
-using RDM
+using TPSChem.QCBase
+using TPSChem.RDM
 using TPSChem
-using InCoreIntegrals
+using TPSChem.InCoreIntegrals
 using Printf
 using LinearAlgebra
 using JLD2

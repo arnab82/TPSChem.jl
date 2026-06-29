@@ -17,11 +17,11 @@ Usage:
   julia spin_correlators.jl 26                # 26-orbital system
 """
 
-using QCBase
+using TPSChem.QCBase
 using TPSChem
 using NPZ
-using InCoreIntegrals
-using RDM
+using TPSChem.InCoreIntegrals
+using TPSChem.RDM
 using JLD2
 using Printf
 using LinearAlgebra

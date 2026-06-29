@@ -1,11 +1,13 @@
-using QCBase
-using ClusterMeanField
+using TPSChem
+using PyCall
+using TPSChem.QCBase
+using TPSChem.ClusterMeanField
 using NPZ
-using InCoreIntegrals
-using RDM
+using TPSChem.InCoreIntegrals
+using TPSChem.RDM
 using JLD2
 using Printf
-using ActiveSpaceSolvers
+using TPSChem.ActiveSpaceSolvers: FCIAnsatz
 C = npzread("mo_coeffs_26.npy")
 h0 = npzread("ints_h0_26.npy")
 h1 = npzread("ints_h1_26.npy")

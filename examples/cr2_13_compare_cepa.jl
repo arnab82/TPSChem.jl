@@ -1,5 +1,5 @@
-using QCBase
-using RDM
+using TPSChem.QCBase
+using TPSChem.RDM
 using TPSChem
 using Printf
 using JLD2
