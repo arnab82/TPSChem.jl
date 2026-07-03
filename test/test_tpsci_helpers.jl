@@ -67,6 +67,26 @@ using JLD2
     end
 
     # ---------------------------------------------------------------
+    @testset "orth_dot multi-root" begin
+        cfg1 = ClusterConfig(ones(Int, N))
+        cfg2_vec = ones(Int, N)
+        cfg2_vec[1] = 2
+        cfg2 = ClusterConfig(cfg2_vec)
+
+        v1 = TPSCIstate(clusters, ref_fock, R=2)
+        v1[ref_fock][cfg1] = [1.0, 2.0]
+        v1[ref_fock][cfg2] = [3.0, 4.0]
+
+        v2 = TPSCIstate(clusters, ref_fock, R=2)
+        v2[ref_fock][cfg1] = [5.0, 6.0]
+        v2[ref_fock][cfg2] = [7.0, 8.0]
+
+        @test TPSChem.orth_dot(v1, v1) == [10.0, 20.0]
+        @test TPSChem.orth_dot(v1, v2) == [26.0, 44.0]
+        @test TPSChem.orth_dot(v1, v2) == diag(TPSChem.overlap(v1, v2))
+    end
+
+    # ---------------------------------------------------------------
     @testset "correlation_functions with cluster_ops" begin
         # Build a minimal TPSCI state in the reference fock sector
         ci_vector = TPSCIstate(clusters, ref_fock, R=1)
