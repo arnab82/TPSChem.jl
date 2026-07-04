@@ -85,49 +85,37 @@ Build the standard local operator tables used by TPSCI. This intentionally
 does not build the expensive local spin-free 2-RDM table `Ppqsr`; use
 `compute_cluster_ops_2rdm` when calling `compute_2rdm`.
 """
-function compute_cluster_ops(cluster_bases, ints::InCoreInts{T}) where {T}
+function _compute_cluster_ops_for_cluster(cb, ints::InCoreInts{T}; verbose=1) where {T}
 #={{{=#
-    clusters = Vector{MOCluster}()
-    for ci in cluster_bases
-        push!(clusters, ci.cluster)
-    end
-    
-    cluster_ops = Vector{ClusterOps{T}}()
-    for ci in clusters
-        push!(cluster_ops, ClusterOps(ci, T=T)) 
-    end
+        ci = cb.cluster
+        ops = ClusterOps(ci, T=T)
 
-
-    for ci in clusters
-
-        display(ci)
+        verbose < 1 || display(ci)
         flush(stdout)
-
-        cb = cluster_bases[ci.idx]
        
-        cluster_ops[ci.idx]["H"] = TPSChem.tdm_H(cb, subset(ints, ci.orb_list), verbose=0) 
-        cluster_ops[ci.idx]["A"], cluster_ops[ci.idx]["a"] = TPSChem.tdm_A(cb,"alpha") 
-        cluster_ops[ci.idx]["B"], cluster_ops[ci.idx]["b"] = TPSChem.tdm_A(cb,"beta")
-        cluster_ops[ci.idx]["AA"], cluster_ops[ci.idx]["aa"] = TPSChem.tdm_AA(cb,"alpha") 
-        cluster_ops[ci.idx]["BB"], cluster_ops[ci.idx]["bb"] = TPSChem.tdm_AA(cb,"beta") 
-        cluster_ops[ci.idx]["Aa"] = TPSChem.tdm_Aa(cb,"alpha") 
-        cluster_ops[ci.idx]["Bb"] = TPSChem.tdm_Aa(cb,"beta") 
-        cluster_ops[ci.idx]["Ab"], cluster_ops[ci.idx]["Ba"] = TPSChem.tdm_Ab(cb) 
+        ops["H"] = TPSChem.tdm_H(cb, subset(ints, ci.orb_list), verbose=0)
+        ops["A"], ops["a"] = TPSChem.tdm_A(cb,"alpha")
+        ops["B"], ops["b"] = TPSChem.tdm_A(cb,"beta")
+        ops["AA"], ops["aa"] = TPSChem.tdm_AA(cb,"alpha")
+        ops["BB"], ops["bb"] = TPSChem.tdm_AA(cb,"beta")
+        ops["Aa"] = TPSChem.tdm_Aa(cb,"alpha")
+        ops["Bb"] = TPSChem.tdm_Aa(cb,"beta")
+        ops["Ab"], ops["Ba"] = TPSChem.tdm_Ab(cb)
         # remove BA and ba account for these terms 
-        cluster_ops[ci.idx]["AB"], cluster_ops[ci.idx]["ba"], cluster_ops[ci.idx]["BA"], cluster_ops[ci.idx]["ab"] = TPSChem.tdm_AB(cb)
-        cluster_ops[ci.idx]["AAa"], cluster_ops[ci.idx]["Aaa"] = TPSChem.tdm_AAa(cb,"alpha")
-        cluster_ops[ci.idx]["BBb"], cluster_ops[ci.idx]["Bbb"] = TPSChem.tdm_AAa(cb,"beta")
-        cluster_ops[ci.idx]["ABa"], cluster_ops[ci.idx]["Aba"] = TPSChem.tdm_ABa(cb,"alpha")
-        cluster_ops[ci.idx]["ABb"], cluster_ops[ci.idx]["Bba"] = TPSChem.tdm_ABa(cb,"beta")
-        #cluster_ops[ci.idx]["ABa"], cluster_ops[ci.idx]["Aba"], cluster_ops[ci.idx]["BAa"], cluster_ops[ci.idx]["Aab"] = TPSChem.tdm_ABa(cb,"alpha")
-        #cluster_ops[ci.idx]["ABb"], cluster_ops[ci.idx]["Bba"], cluster_ops[ci.idx]["BAb"], cluster_ops[ci.idx]["Bab"] = TPSChem.tdm_ABa(cb,"beta")
+        ops["AB"], ops["ba"], ops["BA"], ops["ab"] = TPSChem.tdm_AB(cb)
+        ops["AAa"], ops["Aaa"] = TPSChem.tdm_AAa(cb,"alpha")
+        ops["BBb"], ops["Bbb"] = TPSChem.tdm_AAa(cb,"beta")
+        ops["ABa"], ops["Aba"] = TPSChem.tdm_ABa(cb,"alpha")
+        ops["ABb"], ops["Bba"] = TPSChem.tdm_ABa(cb,"beta")
+        #ops["ABa"], ops["Aba"], ops["BAa"], ops["Aab"] = TPSChem.tdm_ABa(cb,"alpha")
+        #ops["ABb"], ops["Bba"], ops["BAb"], ops["Bab"] = TPSChem.tdm_ABa(cb,"beta")
        
         # spin operators
         
         #
         # S+
         op = Dict{Tuple,Array}()
-        for (fock,mat) in cluster_ops[ci.idx]["Ab"]
+        for (fock,mat) in ops["Ab"]
             dims = size(mat)
             op[fock] = zeros(dims[2:4]...)
             for j in 1:dims[4]
@@ -138,12 +126,12 @@ function compute_cluster_ops(cluster_bases, ints::InCoreInts{T}) where {T}
                 end
             end
         end
-        cluster_ops[ci.idx]["S+"] = op
+        ops["S+"] = op
         
         #
         # S-
         op = Dict{Tuple,Array}()
-        for (fock,mat) in cluster_ops[ci.idx]["Ba"]
+        for (fock,mat) in ops["Ba"]
             dims = size(mat)
             op[fock] = zeros(dims[2:4]...)
             for j in 1:dims[4]
@@ -154,7 +142,7 @@ function compute_cluster_ops(cluster_bases, ints::InCoreInts{T}) where {T}
                 end
             end
         end
-        cluster_ops[ci.idx]["S-"] = op
+        ops["S-"] = op
         
         #
         # Sz
@@ -169,12 +157,12 @@ function compute_cluster_ops(cluster_bases, ints::InCoreInts{T}) where {T}
             op[focktrans] = reshape(op[focktrans],1,size(op[focktrans],1),size(op[focktrans],2))
 
         end
-        cluster_ops[ci.idx]["Sz"] = op
+        ops["Sz"] = op
 
 
         #
         # S2
-        cluster_ops[ci.idx]["S2"] = TPSChem.tdm_S2(cb, subset(ints, ci.orb_list), verbose=0) 
+        ops["S2"] = TPSChem.tdm_S2(cb, subset(ints, ci.orb_list), verbose=0)
 
 
         to_delete = [
@@ -206,8 +194,8 @@ function compute_cluster_ops(cluster_bases, ints::InCoreInts{T}) where {T}
                      #"bb"
                      ]
         for op in to_delete
-            for (ftran,array) in cluster_ops[ci.idx][op]
-                cluster_ops[ci.idx][op][ftran] .*= 0
+            for (ftran,array) in ops[op]
+                ops[op][ftran] .*= 0
             end
         end
 
@@ -215,25 +203,39 @@ function compute_cluster_ops(cluster_bases, ints::InCoreInts{T}) where {T}
         # Compute single excitation operator
         tmp = Dict{Tuple,Array}()
         for (fock,basis) in cb
-            tmp[(fock,fock)] = (cluster_ops[ci.idx]["Aa"][(fock,fock)] + cluster_ops[ci.idx]["Bb"][(fock,fock)])
+            tmp[(fock,fock)] = (ops["Aa"][(fock,fock)] + ops["Bb"][(fock,fock)])
         end
-        cluster_ops[ci.idx]["E1"] = tmp 
+        ops["E1"] = tmp
 
         
 
         #
         # reshape data into 3index quantities: e.g., (pqr, I, J)
-        for opstring in keys(cluster_ops[ci.idx])
+        for opstring in keys(ops)
             opstring != "H" || continue
             opstring != "S2" || continue
-            for ftrans in keys(cluster_ops[ci.idx][opstring])
-                data = cluster_ops[ci.idx][opstring][ftrans]
+            for ftrans in keys(ops[opstring])
+                data = ops[opstring][ftrans]
                 dim1 = prod(size(data)[1:(length(size(data))-2)])
                 dim2 = size(data)[length(size(data))-1]
                 dim3 = size(data)[length(size(data))-0]
-                cluster_ops[ci.idx][opstring][ftrans] = copy(reshape(data, (dim1,dim2,dim3)))
+                ops[opstring][ftrans] = copy(reshape(data, (dim1,dim2,dim3)))
             end
         end
+    return ops
+end
+    #=}}}=#
+
+function compute_cluster_ops(cluster_bases, ints::InCoreInts{T}) where {T}
+#={{{=#
+    clusters = Vector{MOCluster}()
+    for ci in cluster_bases
+        push!(clusters, ci.cluster)
+    end
+
+    cluster_ops = Vector{ClusterOps{T}}(undef, length(clusters))
+    for ci in clusters
+        cluster_ops[ci.idx] = _compute_cluster_ops_for_cluster(cluster_bases[ci.idx], ints)
     end
     return cluster_ops
 end
@@ -702,11 +704,8 @@ end
 
 Add effective local hamiltonians (local CASCI) type hamiltonians to a `ClusterOps` type for each `Cluster'
 """
-function add_cmf_operators!(ops, bases, ints, Da, Db; verbose=0)
+function _add_cmf_operator_for_cluster!(ops_i, cb, ints, Da, Db; verbose=0)
     #={{{=#
-    n_clusters = length(bases)
-    for ci_idx in 1:n_clusters
-        cb = bases[ci_idx]
         ci = cb.cluster
         verbose == 0 || println()
         verbose == 0 || display(ci)
@@ -734,7 +733,17 @@ function add_cmf_operators!(ops, bases, ints, Da, Db; verbose=0)
                 end
             end
         end
-        ops[ci.idx]["Hcmf"] = dicti
+        ops_i["Hcmf"] = dicti
+    return ops_i
+end
+#=}}}=#
+
+function add_cmf_operators!(ops, bases, ints, Da, Db; verbose=0)
+    #={{{=#
+    n_clusters = length(bases)
+    for ci_idx in 1:n_clusters
+        _add_cmf_operator_for_cluster!(ops[ci_idx], bases[ci_idx], ints, Da, Db,
+                                       verbose=verbose)
     end
     return 
 end

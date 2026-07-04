@@ -89,6 +89,7 @@ include("core/tpsci_matvec_thread.jl")
 include("core/tpsci_pt1_wavefunction.jl")
 include("core/tpsci_pt2_energy.jl")
 include("core/tpsci_outer.jl")
+include("core/tpsci_multinode.jl")
 include("core/tpsci_helpers.jl")
 include("core/tpsci.jl")
 
@@ -137,4 +138,29 @@ export print_stick_spectrum
 export compute_2rdm
 export compute_2rdm_threaded
 export compute_2rdm_blas
+export DistributedTPSCIstate
+export DistributedClusterOps
+export distribute_tpsci_state
+export collect_tpsci_state
+export copy_sharded_state
+export similar_sharded_state
+export restrict_to_basis_sharded
+export compute_cluster_ops_distributed
+export collect_cluster_ops
+export cluster_ops_summary
+export add_cmf_operators_distributed!
+export sharded_state_summary
+export destroy!
+export ensure_tpsci_multinode_workers!
+export open_matvec_distributed
+export open_matvec_sharded
+export tps_ci_matvec_sharded
+export compute_expectation_value_sharded_h0
+export compute_pt1_wavefunction_sharded
+export tpsci_cepa_solve_sharded
+export do_fois_cepa_sharded
+export tps_ci_matvec_distributed
+export tps_ci_davidson_distributed
+export compute_pt1_wavefunction_distributed
+export tpsci_ci_multinode
 end
