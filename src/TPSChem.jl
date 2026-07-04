@@ -90,6 +90,8 @@ include("core/tpsci_pt1_wavefunction.jl")
 include("core/tpsci_pt2_energy.jl")
 include("core/tpsci_outer.jl")
 include("core/tpsci_multinode.jl")
+include("core/tpsci_sharded_davidson.jl")
+include("core/tps_cepa_sharded.jl")
 include("core/tpsci_helpers.jl")
 include("core/tpsci.jl")
 
@@ -163,4 +165,11 @@ export tps_ci_matvec_distributed
 export tps_ci_davidson_distributed
 export compute_pt1_wavefunction_distributed
 export tpsci_ci_multinode
+export tps_ci_davidson_sharded
+export build_block_h_sharded
+export estimate_sharded_H_nnz
+export sharded_H_memory_report
+export compute_diagonal_sharded
+export tps_sharded_cepa_solve
+export do_tps_sharded_cepa
 end

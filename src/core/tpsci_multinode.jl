@@ -1411,72 +1411,10 @@ function restrict_to_basis_sharded(source::DistributedTPSCIstate{T,N,Rs},
                                                 T, Val(Rs))
 end
 
-function _tpsci_cepa_apply_shifted_hq(v::DistributedTPSCIstate{T,N,1},
-                                      cluster_ops, clustered_ham, eshift;
-                                      workers=v.workers,
-                                      threaded_worker=true,
-                                      blas_threads=1) where {T,N}
-    out = tps_ci_matvec_sharded(v, cluster_ops, clustered_ham;
-                                workers=workers,
-                                threaded_worker=threaded_worker,
-                                blas_threads=blas_threads)
-    add_scaled!(out, -eshift, v)
-    return out
-end
-
-function _tpsci_sharded_cg_linsolve(b::DistributedTPSCIstate{T,N,1},
-                                    cluster_ops, clustered_ham;
-                                    eshift,
-                                    tol=1e-5,
-                                    maxiter=300,
-                                    workers=b.workers,
-                                    threaded_worker=true,
-                                    blas_threads=1,
-                                    verbose=0) where {T,N}
-    x = similar_sharded_state(b)
-    r = copy_sharded_state(b)
-    p = copy_sharded_state(r)
-    rr = overlap(r, r)[1, 1]
-    r0 = sqrt(abs(rr))
-    threshold = tol * max(r0, one(T))
-    converged = r0 <= threshold
-    iters = 0
-
-    for it in 1:maxiter
-        converged && break
-        iters = it
-        Ap = _tpsci_cepa_apply_shifted_hq(p, cluster_ops, clustered_ham, eshift;
-                                          workers=workers,
-                                          threaded_worker=threaded_worker,
-                                          blas_threads=blas_threads)
-        pAp = overlap(p, Ap)[1, 1]
-        abs(pAp) > eps(T) ||
-            error("Sharded CEPA CG encountered a near-zero denominator")
-        alpha = rr / pAp
-        add_scaled!(x, alpha, p)
-        add_scaled!(r, -alpha, Ap)
-        destroy!(Ap)
-
-        rr_new = overlap(r, r)[1, 1]
-        resid = sqrt(abs(rr_new))
-        if verbose > 1
-            @printf("   sharded CG iter %4i residual %12.4e\n", it, resid)
-        end
-        if resid <= threshold
-            rr = rr_new
-            converged = true
-            break
-        end
-        beta = rr_new / rr
-        linear_combination!(p, beta, r, one(T))
-        rr = rr_new
-    end
-
-    final_resid = sqrt(abs(rr))
-    destroy!(r)
-    destroy!(p)
-    return x, (iters=iters, residual=final_resid, converged=converged)
-end
+# The sharded CEPA linear solvers and the shifted-Q apply now live in
+# `tps_cepa_sharded.jl` as op-based `tps_sharded_cepa_*` functions, so the
+# matrix-free and block-stored Hamiltonians share one code path. `_tpsci_givens`
+# below is a generic helper still used by the MINRES solver there.
 
 function _tpsci_givens(a::T, b::T) where {T}
     if iszero(b)
@@ -1487,108 +1425,6 @@ function _tpsci_givens(a::T, b::T) where {T}
         r = hypot(a, b)
         return a / r, b / r, r
     end
-end
-
-function _tpsci_sharded_minres_linsolve(b::DistributedTPSCIstate{T,N,1},
-                                        cluster_ops, clustered_ham;
-                                        eshift,
-                                        tol=1e-5,
-                                        abstol=zero(T),
-                                        maxiter=300,
-                                        workers=b.workers,
-                                        threaded_worker=true,
-                                        blas_threads=1,
-                                        verbose=0) where {T,N}
-    x = similar_sharded_state(b)
-    v_prev = similar_sharded_state(b)
-    v_curr = copy_sharded_state(b)
-    v_next = similar_sharded_state(b)
-    w_prev = similar_sharded_state(b)
-    w_curr = similar_sharded_state(b)
-    w_next = similar_sharded_state(b)
-
-    resnorm = norm(v_curr)[1]
-    threshold = max(tol * resnorm, abstol)
-    if resnorm <= threshold
-        for tmp in (v_prev, v_curr, v_next, w_prev, w_curr, w_next)
-            destroy!(tmp)
-        end
-        return x, (iters=0, residual=resnorm, converged=true)
-    end
-
-    scale!(v_curr, inv(resnorm))
-    H = zeros(T, 4)
-    rhs = [resnorm, zero(T)]
-    c_prev = one(T)
-    s_prev = zero(T)
-    c_curr = one(T)
-    s_curr = zero(T)
-    converged = false
-    iters = 0
-
-    for it in 1:maxiter
-        iters = it
-
-        destroy!(v_next)
-        v_next = _tpsci_cepa_apply_shifted_hq(v_curr, cluster_ops,
-                                              clustered_ham, eshift;
-                                              workers=workers,
-                                              threaded_worker=threaded_worker,
-                                              blas_threads=blas_threads)
-        it > 1 && add_scaled!(v_next, -H[2], v_prev)
-
-        proj = overlap(v_curr, v_next)[1, 1]
-        H[3] = real(proj)
-        add_scaled!(v_next, -proj, v_curr)
-
-        H[4] = norm(v_next)[1]
-        H[4] > eps(T) && scale!(v_next, inv(H[4]))
-
-        if it > 2
-            H[1] = s_prev * H[2]
-            H[2] = c_prev * H[2]
-        end
-
-        if it > 1
-            tmp = -s_curr * H[2] + c_curr * H[3]
-            H[2] = c_curr * H[2] + s_curr * H[3]
-            H[3] = tmp
-        end
-
-        c, s, H[3] = _tpsci_givens(H[3], H[4])
-        rhs[2] = -s * rhs[1]
-        rhs[1] = c * rhs[1]
-
-        destroy!(w_next)
-        w_next = copy_sharded_state(v_curr)
-        it > 1 && add_scaled!(w_next, -H[2], w_curr)
-        it > 2 && add_scaled!(w_next, -H[1], w_prev)
-        abs(H[3]) > eps(T) ||
-            error("Sharded CEPA MINRES encountered a near-zero Hessenberg pivot")
-        scale!(w_next, inv(H[3]))
-
-        add_scaled!(x, rhs[1], w_next)
-
-        v_prev, v_curr, v_next = v_curr, v_next, v_prev
-        w_prev, w_curr, w_next = w_curr, w_next, w_prev
-        c_prev, s_prev, c_curr, s_curr = c_curr, s_curr, c, s
-        rhs[1] = rhs[2]
-        H[2] = H[4]
-
-        resnorm = abs(rhs[2])
-        if verbose > 1
-            @printf("   sharded MINRES iter %4i residual %12.4e\n", it, resnorm)
-        end
-        if resnorm <= threshold
-            converged = true
-            break
-        end
-    end
-
-    for tmp in (v_prev, v_curr, v_next, w_prev, w_curr, w_next)
-        destroy!(tmp)
-    end
-    return x, (iters=iters, residual=resnorm, converged=converged)
 end
 
 """
@@ -1611,94 +1447,17 @@ function tpsci_cepa_solve_sharded(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
                                   threaded_worker=true,
                                   blas_threads=1,
                                   verbose=0) where {T,N,R,Rq}
-    worker_ids = ensure_tpsci_multinode_workers!(workers=workers)
-    worker_ids == cepa_vector.workers ||
-        error("tpsci_cepa_solve_sharded requires the CEPA vector on the requested workers")
-    n_clusters = length(ref_vector.clusters)
-
-    @printf(" Sharded CEPA solver: dim_q=%i, R=%i, shift=%s\n",
-            length(cepa_vector), R, cepa_shift)
-
-    Ec = zeros(T, R)
-
-    for i in 1:R
-        @printf(" Compute sharded coupling vector h for root %i\n", i)
-        ref_i = extract_chosen_root(ref_vector, i)
-        dref_i = distribute_tpsci_state(ref_i; workers=worker_ids,
-                                        strategy=:balanced,
-                                        blas_threads=blas_threads)
-        sig_i = open_matvec_sharded(dref_i, cluster_ops, clustered_ham;
-                                    nbody=nbody,
-                                    thresh=thresh_sigma,
-                                    prescreen=false,
-                                    workers=worker_ids,
-                                    threaded_worker=threaded_worker,
-                                    blas_threads=blas_threads)
-        h_i = restrict_to_basis_sharded(sig_i, cepa_vector)
-        destroy!(sig_i)
-        destroy!(dref_i)
-
-        Ec_i = zero(T)
-        Ec_prev_i = T(Inf)
-
-        for it in 1:cepa_mit
-            shift = zero(T)
-            if cepa_shift == "cepa"
-                shift = zero(T)
-            elseif cepa_shift == "acpf"
-                shift = Ec_i * 2.0 / n_clusters
-            elseif cepa_shift == "aqcc"
-                shift = (1.0 - (n_clusters - 3.0) * (n_clusters - 2.0) /
-                         (n_clusters * (n_clusters - 1.0))) * Ec_i
-            elseif cepa_shift == "cisd"
-                shift = Ec_i
-            else
-                error("Unknown cepa_shift: $cepa_shift")
-            end
-
-            @printf(" CEPA Iter %3i  Root %i  Shift = %12.8f\n", it, i, shift)
-            rhs = copy_sharded_state(h_i)
-            scale!(rhs, -one(T))
-            if solver == :minres
-                Cd_i, history = _tpsci_sharded_minres_linsolve(
-                    rhs, cluster_ops, clustered_ham;
-                    eshift=e0[i] + shift,
-                    tol=tol,
-                    maxiter=cg_maxiter,
-                    workers=worker_ids,
-                    threaded_worker=threaded_worker,
-                    blas_threads=blas_threads,
-                    verbose=verbose)
-            elseif solver == :cg || solver == :krylov
-                Cd_i, history = _tpsci_sharded_cg_linsolve(
-                    rhs, cluster_ops, clustered_ham;
-                    eshift=e0[i] + shift,
-                    tol=tol,
-                    maxiter=cg_maxiter,
-                    workers=worker_ids,
-                    threaded_worker=threaded_worker,
-                    blas_threads=blas_threads,
-                    verbose=verbose)
-            else
-                error("Unknown sharded CEPA solver: $solver")
-            end
-            Ec_i = overlap(Cd_i, h_i)[1, 1]
-            if verbose > 0
-                @printf(" Iter %3i  Root %i  nops=%4i  res=%8.2e  E_corr = %16.12f\n",
-                        it, i, history.iters, history.residual, Ec_i)
-            end
-            destroy!(Cd_i)
-            destroy!(rhs)
-
-            cepa_shift == "cepa" && break
-            abs(Ec_i - Ec_prev_i) < tol && break
-            Ec_prev_i = Ec_i
-        end
-
-        Ec[i] = Ec_i
-        destroy!(h_i)
-    end
-    return Ec, e0 .+ Ec
+    # Backward-compatible matrix-free entry point. The implementation now lives in
+    # `tps_sharded_cepa_solve` (op-based); h_storage=:matrixfree reproduces the
+    # original re-contract-every-matvec behavior exactly. For the stored-H (block)
+    # path call tps_sharded_cepa_solve / do_tps_sharded_cepa with h_storage=:blocks.
+    return tps_sharded_cepa_solve(ref_vector, e0, cepa_vector, cluster_ops,
+                                  clustered_ham, cepa_shift, cepa_mit;
+                                  tol=tol, cg_maxiter=cg_maxiter, nbody=nbody,
+                                  thresh_sigma=thresh_sigma, solver=solver,
+                                  h_storage=:matrixfree, workers=workers,
+                                  threaded_worker=threaded_worker,
+                                  blas_threads=blas_threads, verbose=verbose)
 end
 
 """
@@ -1728,97 +1487,19 @@ function do_fois_cepa_sharded(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham
                               threaded_worker=true,
                               blas_threads=1,
                               verbose=1) where {T,N,R}
-    worker_ids = ensure_tpsci_multinode_workers!(workers=workers)
-    @printf("\n-------------------------------------------------------\n")
-    @printf(" Do Sharded CEPA\n")
-    @printf("   thresh_foi              = %-8.1e\n", thresh_foi)
-    @printf("   nbody                   = %-i\n", nbody)
-    @printf("\n")
-    @printf("   Length of Reference     = %-i\n", length(ref))
-    @printf("   Calculation type        = %s\n", cepa_shift)
-    @printf("   Workers                 = %s\n", worker_ids)
-    @printf("\n-------------------------------------------------------\n")
-
-    ref_vec = deepcopy(ref)
-    if e0 === nothing
-        cluster_ops isa DistributedClusterOps &&
-            error("do_fois_cepa_sharded with DistributedClusterOps needs a pre-solved reference and e0 keyword, or a future sharded Davidson reference solve")
-        @printf(" Solve zeroth-order problem. Dimension = %10i\n", length(ref_vec))
-        if reference_solver == :direct
-            @time e0, ref_vec = tps_ci_direct(ref_vec, cluster_ops, clustered_ham,
-                                              conv_thresh=tol)
-        elseif reference_solver == :distributed_davidson
-            orthonormalize!(ref_vec)
-            @time e0, ref_vec = tps_ci_davidson_distributed(
-                ref_vec, cluster_ops, clustered_ham;
-                conv_thresh=tol,
-                max_iter=ci_max_iter,
-                max_ss_vecs=ci_max_ss_vecs,
-                lindep_thresh=ci_lindep_thresh,
-                workers=worker_ids,
-                blas_threads=blas_threads)
-        else
-            error("Unknown reference_solver: $reference_solver")
-        end
-    else
-        e0 = Vector{T}(e0)
-    end
-
-    println()
-    println(" Compute sharded FOIS. Reference space dim = ", length(ref_vec))
-    dref = distribute_tpsci_state(ref_vec; workers=worker_ids,
-                                  strategy=:balanced,
-                                  blas_threads=blas_threads)
-    pt1_vec = open_matvec_sharded(dref, cluster_ops, clustered_ham;
-                                  nbody=nbody,
-                                  thresh=thresh_foi,
-                                  prescreen=false,
-                                  workers=worker_ids,
-                                  threaded_worker=threaded_worker,
-                                  blas_threads=blas_threads)
-    project_out!(pt1_vec, dref)
-
-    if compress
-        norms1 = norm(pt1_vec)
-        dim1 = length(pt1_vec)
-        clip!(pt1_vec, thresh=thresh_clip)
-        norms2 = norm(pt1_vec)
-        dim2 = length(pt1_vec)
-        @printf(" %-50s%10i -> %-10i (thresh = %8.1e)\n",
-                "FOIS Compressed from: ", dim1, dim2, thresh_clip)
-        for i in 1:R
-            @printf(" %-50s%10.2e -> %-10.2e\n",
-                    "Norm of |1>: ", norms1[i], norms2[i])
-        end
-    end
-
-    S10 = overlap(pt1_vec, dref)
-    for i in 1:R
-        @printf(" %-50s%10.6f\n", "Overlap between <1|0>: ", S10[i, i])
-    end
-    destroy!(dref)
-
-    println()
-    println(" Do sharded CEPA: shared FOIS dim = ", length(pt1_vec))
-    @time Ec, e_cepa = tpsci_cepa_solve_sharded(
-        ref_vec, e0, pt1_vec, cluster_ops, clustered_ham,
-        cepa_shift, cepa_mit;
-        tol=tol,
-        cg_maxiter=cg_maxiter,
-        nbody=nbody,
-        thresh_sigma=thresh_sigma,
-        solver=solver,
-        workers=worker_ids,
-        threaded_worker=threaded_worker,
-        blas_threads=blas_threads,
-        verbose=verbose)
-
-    for i in 1:R
-        @printf(" E(cepa) root %i  corr= %12.8f  total= %12.8f\n",
-                i, Ec[i], e_cepa[i])
-    end
-
-    return e_cepa, pt1_vec
+    # Backward-compatible matrix-free entry point; delegates to the consolidated
+    # do_tps_sharded_cepa with h_storage=:matrixfree (identical behavior). Call
+    # do_tps_sharded_cepa directly with h_storage=:blocks for the stored-H path.
+    return do_tps_sharded_cepa(ref, cluster_ops, clustered_ham;
+                               cepa_shift=cepa_shift, cepa_mit=cepa_mit, nbody=nbody,
+                               thresh_foi=thresh_foi, thresh_clip=thresh_clip,
+                               tol=tol, thresh_sigma=thresh_sigma, compress=compress,
+                               reference_solver=reference_solver, solver=solver,
+                               h_storage=:matrixfree, e0=e0, ci_max_iter=ci_max_iter,
+                               ci_max_ss_vecs=ci_max_ss_vecs,
+                               ci_lindep_thresh=ci_lindep_thresh, cg_maxiter=cg_maxiter,
+                               workers=workers, threaded_worker=threaded_worker,
+                               blas_threads=blas_threads, verbose=verbose)
 end
 
 function _tpsci_local_h0_diagonal(cluster_ops, opstring::String, clusters, fock, config, ::Type{T}) where {T}
@@ -2505,6 +2186,9 @@ function tpsci_ci_multinode(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
                             ci_lindep_thresh=1e-12,
                             max_mem_ci=20.0,
                             prescreen=true,
+                            use_sharded=false,
+                            h_storage::Symbol=:auto,
+                            max_mem_H=50.0,
                             workers=Distributed.workers(),
                             threaded_worker=true,
                             blas_threads=1) where {T,N,R}
@@ -2595,13 +2279,41 @@ function tpsci_ci_multinode(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
 
         @timeit to "distributed ci" begin
             orthonormalize!(vec_var)
-            e0, vec_var = tps_ci_davidson_distributed(vec_var, cluster_ops, clustered_ham,
+            if use_sharded
+                # Sharded variational diagonalization: the subspace vectors live
+                # across nodes and are never gathered during the solve. NOTE: the
+                # PT/selection steps below still use the replicated backend, so
+                # vec_var is re-materialized on the master here via
+                # collect_tpsci_state. This distributes the diagonalization
+                # working set (its main memory cost); a fully never-gather loop
+                # additionally needs sharded PT + an ownership-reconciling merge.
+                dvar = distribute_tpsci_state(vec_var; workers=worker_ids,
+                                              strategy=:balanced,
+                                              blas_threads=blas_threads)
+                e0, dvar_out = tps_ci_davidson_sharded(dvar, cluster_ops, clustered_ham;
+                                                       nroots=R,
                                                        conv_thresh=ci_conv,
                                                        max_iter=ci_max_iter,
                                                        max_ss_vecs=ci_max_ss_vecs,
                                                        lindep_thresh=ci_lindep_thresh,
+                                                       h_storage=h_storage,
+                                                       max_mem_H=max_mem_H,
                                                        workers=worker_ids,
-                                                       blas_threads=blas_threads)
+                                                       threaded_worker=threaded_worker,
+                                                       blas_threads=blas_threads,
+                                                       verbose=1)
+                vec_var = collect_tpsci_state(dvar_out)
+                destroy!(dvar_out)
+                destroy!(dvar)
+            else
+                e0, vec_var = tps_ci_davidson_distributed(vec_var, cluster_ops, clustered_ham,
+                                                           conv_thresh=ci_conv,
+                                                           max_iter=ci_max_iter,
+                                                           max_ss_vecs=ci_max_ss_vecs,
+                                                           lindep_thresh=ci_lindep_thresh,
+                                                           workers=worker_ids,
+                                                           blas_threads=blas_threads)
+            end
         end
         flush(stdout)
 
