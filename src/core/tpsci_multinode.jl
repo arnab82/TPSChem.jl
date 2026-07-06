@@ -1681,9 +1681,14 @@ function _tpsci_worker_ids(worker_pool)
     return pids
 end
 
+function _tpsci_active_project_root()
+    project = Base.active_project()
+    return project === nothing ? dirname(dirname(@__DIR__)) : dirname(project)
+end
+
 function ensure_tpsci_multinode_workers!(; workers=Distributed.workers())
     pids = _tpsci_worker_ids(workers)
-    project_root = dirname(dirname(@__DIR__))
+    project_root = _tpsci_active_project_root()
     @sync for pid in pids
         pid == Distributed.myid() && continue
         @async Distributed.remotecall_fetch(

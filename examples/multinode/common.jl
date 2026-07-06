@@ -30,7 +30,13 @@ function init_multinode_workers!()
         filter!(!isempty, hosts)
         isempty(hosts) && error("TPSCHEM_MACHINE_FILE is empty")
         threads = get(ENV, "JULIA_NUM_THREADS", string(Threads.nthreads()))
-        addprocs(hosts; exeflags="--project=$(PROJECT_ROOT) --threads=$(threads)")
+        worker_env = Pair{String,String}[]
+        for name in ("JULIA_DEPOT_PATH", "PATH", "OPENBLAS_NUM_THREADS",
+                     "OMP_NUM_THREADS", "MKL_NUM_THREADS")
+            haskey(ENV, name) && push!(worker_env, name => ENV[name])
+        end
+        addprocs(hosts; exeflags="--project=$(PROJECT_ROOT) --threads=$(threads)",
+                 env=worker_env)
     end
     pids = TPSChem.ensure_tpsci_multinode_workers!(workers=workers())
     @printf("Master process: %i\n", myid())
