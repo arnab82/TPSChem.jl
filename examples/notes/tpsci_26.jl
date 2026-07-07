@@ -247,6 +247,10 @@ display(p)
   # 2-RDM and Exchange Coupling
   # ==============================================================================
   println("\n Computing 2-RDM and exchange coupling constants J_IJ...")
+  if any(!haskey(ops, "Ppqsr") for ops in cluster_ops)
+      println(" Building spin-free 2-RDM operator tables Ppqsr...")
+      TPSChem.add_spinfree_2rdm_ops!(cluster_ops, cluster_bases)
+  end
   Γ = TPSChem.compute_2rdm(v0a, cluster_ops)
 
  # Cluster-pair exchange integrals in CMF basis — from data_cmf_26.jld2
