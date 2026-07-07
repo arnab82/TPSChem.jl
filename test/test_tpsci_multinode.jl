@@ -151,6 +151,91 @@ end
     end
 end
 
+@testset "sharded ownership-reconciling merge (add!)" begin
+    @load "_testdata_cmf_h8.jld2"
+    ref_fock = FockConfig(init_fspace)
+    cluster_bases = TPSChem.compute_cluster_eigenbasis(ints, clusters;
+        verbose=0, max_roots=4, init_fspace=init_fspace, rdm1a=d1.a, rdm1b=d1.b)
+    clustered_ham = TPSChem.extract_ClusteredTerms(ints, clusters)
+    cluster_ops = TPSChem.compute_cluster_ops(cluster_bases, ints)
+    TPSChem.add_cmf_operators!(cluster_ops, cluster_bases, ints, d1.a, d1.b)
+
+    ci = TPSChem.TPSCIstate(clusters, ref_fock, R=2, T=Float64)
+    ci[ref_fock][ClusterConfig([1, 1])] = [1.0, 0.0]
+    ci[ref_fock][ClusterConfig([2, 1])] = [0.0, 1.0]
+
+    dg = TPSChem.distribute_tpsci_state(deepcopy(ci); workers=workers(),
+                                        strategy=:balanced)
+    sig = TPSChem.open_matvec_sharded(dg, cluster_ops, clustered_ham;
+        nbody=4, thresh=1e-8, prescreen=false, verbose=0)
+
+    # The FOIS reaches Fock sectors beyond the reference space.
+    @test length(sig.owners) > length(dg.owners)
+    # Sectors already present keep their owner — the precondition for add!.
+    for (fock, owner) in dg.owners
+        if haskey(sig.owners, fock)
+            @test sig.owners[fock] == owner
+        end
+    end
+
+    # Reference behavior: the same structure merge done locally.
+    local_sig = TPSChem.collect_tpsci_state(sig)
+    expected = deepcopy(ci)
+    TPSChem.zero!(local_sig)
+    TPSChem.add!(expected, local_sig)
+
+    # Sharded structure merge (zero PT coefficients, grow the space).
+    TPSChem.zero!(sig)
+    TPSChem.add!(dg, sig)
+    merged = TPSChem.collect_tpsci_state(dg)
+
+    @test length(dg) == length(expected)
+    for (fock, configs) in expected.data
+        @test haskey(merged.data, fock)
+        for (config, coeffs) in configs
+            @test haskey(merged.data[fock], config)
+            @test isapprox(merged[fock][config], coeffs, atol=1e-14)
+        end
+    end
+
+    TPSChem.destroy!(sig)
+    TPSChem.destroy!(dg)
+end
+
+@testset "never-gather tpsci_ci_sharded vs single-node tpsci_ci" begin
+    @load "_testdata_cmf_h8.jld2"
+    ref_fock = FockConfig(init_fspace)
+    cluster_bases = TPSChem.compute_cluster_eigenbasis(ints, clusters;
+        verbose=0, max_roots=4, init_fspace=init_fspace, rdm1a=d1.a, rdm1b=d1.b)
+    clustered_ham = TPSChem.extract_ClusteredTerms(ints, clusters)
+    cluster_ops = TPSChem.compute_cluster_ops(cluster_bases, ints)
+    TPSChem.add_cmf_operators!(cluster_ops, cluster_bases, ints, d1.a, d1.b)
+
+    nroots = 2
+    ci = TPSChem.TPSCIstate(clusters, ref_fock, R=nroots, T=Float64)
+    ci[ref_fock][ClusterConfig([1, 1])] = [1.0, 0.0]
+    ci[ref_fock][ClusterConfig([2, 1])] = [0.0, 1.0]
+
+    common = (thresh_cipsi=1e-4, thresh_foi=1e-9, conv_thresh=1e-7,
+              max_iter=8, nbody=4)
+
+    e_ref, v_ref = TPSChem.tpsci_ci(deepcopy(ci), cluster_ops, clustered_ham;
+        common..., incremental=false, davidson=false)
+
+    e_sh, dv = TPSChem.tpsci_ci_sharded(deepcopy(ci), cluster_ops, clustered_ham;
+        common..., ci_conv=1e-10, compute_s2=true, workers=workers(), verbose=0)
+
+    # Same converged energies and the same selected variational space.
+    @test maximum(abs.(e_sh .- e_ref)) < 1e-6
+    @test length(dv) == length(v_ref)
+
+    # Final sharded roots are orthonormal (checked without gathering).
+    S = TPSChem.overlap(dv, dv)
+    @test isapprox(S, Matrix{Float64}(LinearAlgebra.I, nroots, nroots), atol=1e-8)
+
+    TPSChem.destroy!(dv)
+end
+
 if !isempty(_multinode_added_procs)
     rmprocs(_multinode_added_procs)
 end

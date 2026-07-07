@@ -184,6 +184,7 @@ export tps_ci_matvec_distributed
 export tps_ci_davidson_distributed
 export compute_pt1_wavefunction_distributed
 export tpsci_ci_multinode
+export tpsci_ci_sharded
 export tps_ci_davidson_sharded
 export build_block_h_sharded
 export estimate_sharded_H_nnz

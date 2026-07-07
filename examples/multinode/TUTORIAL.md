@@ -1,533 +1,364 @@
-# TPSCI Multinode: How It Works
+# How TPSCI, TPS-CEPA, and SPT Are Computed Across Nodes — Step by Step
 
-A complete tour of the distributed backend in TPSChem.jl: how workers are
-defined, how a calculation is divided across nodes, how partial results are
-accumulated, what packages and algorithms are used, and how the multinode path
-differs from the single-node path. Written against the code as reviewed and
-tested on 2026-07-07 (all multinode testsets passing: 17/17 properties/RDMs/
-variance, 18/18 sharded Davidson, 6/6 stored-H CEPA).
+This document follows the three production workflows through the multinode
+code, step by step: for each stage it says **where it runs** (master or
+workers), **what is sent over the network**, **what each worker computes**,
+and **how the pieces are combined**. Read §1 once for the small amount of
+shared machinery; then each walkthrough (§2 TPSCI, §3 TPS-CEPA, §4 SPT) is
+self-contained.
 
-Source files (≈5100 lines):
+Notation used throughout:
 
-| File | Contents |
+- `M` = the master Julia process (`myid()==1`); `W1, W2, …` = worker
+  processes, one per node.
+- "ship X → Wk" means X is serialized and sent with `remotecall_fetch`.
+- All worker fan-outs run **concurrently** (`@sync for pid … @async
+  remotecall_fetch`), so a stage's wall time is the slowest worker, not the
+  sum.
+
+---
+
+## 1. The shared machinery (read once)
+
+### 1.1 Workers
+
+One Julia process per node (`Distributed` stdlib; no MPI), threads inside each
+worker for on-node parallelism. Locally: `addprocs(2;
+exeflags="--project=$(Base.active_project())")`. On SLURM:
+`init_multinode_workers!()` (`common.jl`) starts one worker per hostname in
+`TPSCHEM_MACHINE_FILE`. Every entry point first calls
+`ensure_tpsci_multinode_workers!`, which on each worker restores the default
+`LOAD_PATH`, activates + instantiates the project, and loads TPSChem.
+
+### 1.2 The two distributed containers
+
+**`DistributedTPSCIstate`** — a TPSCI vector split by **Fock sector**. Master
+keeps only metadata (`owners: FockConfig→pid`, per-sector lengths/offsets);
+each worker holds an ordinary local `TPSCIstate` with exactly its owned
+sectors, stored in a worker-global registry `_TPSCI_SHARDED_STATES[id]` under
+the handle's `gensym` id. Coefficients never live on the master.
+`destroy!(state)` deletes the payload on every worker — **mandatory** when
+done, or it leaks there.
+
+**`DistributedClusterOps`** — cluster operator tables split by **cluster
+index**; each cluster's tables are built and stored only on its owner. A
+worker needing tables for clusters it does not own fetches just those
+(`_materialize_cluster_ops_for_indices`).
+
+Ownership assignment (`strategy=`): `:balanced` = greedy least-loaded
+(weighted by config counts), **preserving existing owners** when a space
+grows; `:hash` = deterministic `hash(key) mod nworkers`.
+
+### 1.3 The five communication shapes
+
+Everything below reduces to five moves:
+
+| # | Move | Cost on the wire |
+|---|------|------------------|
+| 1 | ship a small local object (reference state, thresholds) to all workers | once per call |
+| 2 | worker fetches a ket Fock block from its owner | the only bulk transfer in sharded matvecs |
+| 3 | worker returns per-root scalars / small matrices (energies, overlaps, RDM partials); master **sums** | k×k numbers |
+| 4 | worker returns `{fock: length}` only; master rebuilds a metadata handle | tiny; coefficients stay put |
+| 5 | debug-only full gather (`collect_tpsci_state`) | avoid in production |
+
+---
+
+## 2. TPSCI multinode, step by step
+
+The selected-CI loop is: *diagonalize in the current space → build the PT1
+vector in the first-order interacting space (FOIS) → keep PT configs with
+|c⁽¹⁾| > thresh_cipsi → add them to the space → repeat*. There are two
+multinode versions; the steps below cover both, flagging where they differ.
+
+- `tpsci_ci_multinode` — **replicated**: every worker caches the full CI
+  vector; the job loops are split. Memory win: no dense H, split scratch.
+- `tpsci_ci_sharded` — **never-gather**: the CI vector is a
+  `DistributedTPSCIstate` for the whole loop; no process ever holds all of it.
+
+### Step 0 — setup (both, once)
+
+1. M: `ensure_tpsci_multinode_workers!` (§1.1).
+2. M: orthonormalize the small starting reference.
+3. Sharded only: `distribute_tpsci_state` — M assigns each Fock sector of the
+   reference to a worker (`:balanced`) and ships each worker *its sectors
+   only* (move 1, but partitioned). From here on the vector never returns to
+   M.
+
+### Step 1 — diagonalize H in the current space
+
+**Replicated path** (`tps_ci_davidson_distributed`): M keeps the dense
+coefficient vector `v` (dim × R). Each Davidson iteration:
+
+1. M splits the *rows* of σ = H·v (one job per bra configuration) round-robin
+   over workers. The full `v`, cluster ops, and Hamiltonian were cached on
+   every worker once at call start (move 1).
+2. Wk, for each assigned bra config: loops connected Fock transfers, and for
+   every ket config in its cached copy evaluates
+   `check_term → contract_matrix_element(term, …, bra, ket) · v[ket]`,
+   accumulating its rows of σ.
+3. Wk → M: `(rows, values)`; M assembles the full σ (move 3/4 hybrid) and
+   runs the standard dense Davidson update on it.
+
+**Sharded path** (`tps_ci_davidson_sharded`): subspace vectors `V` and sigmas
+`HV` are lists of R=1 sharded states. Per iteration:
+
+1. σ = H·v via `tps_ci_matvec_sharded`:
+   - M sends each worker the list of *its own* output sectors (move 1, tiny).
+   - Wk **prefetches** every connected ket Fock block it does not own from
+     that block's owner (move 2) — this is the only bulk traffic — then
+     threads over its owned (fock_bra, config_bra) pairs computing
+     `Σ_ket Σ_terms contract_matrix_element·v[ket]` into its local σ block.
+   - Wk → M: `{fock: length}` (move 4). σ stays distributed.
+   With `h_storage=:blocks` (Tier A) the contraction is replaced by dense
+   block-GEMV against Hamiltonian sub-blocks built **once** before the loop
+   (see §3 Step 3, same machinery).
+2. Small projected matrix: `Hss[i,j] = overlap(V[i], HV[j])` — each worker
+   returns one number per pair (move 3); M holds only the k×k `Hss`.
+3. M: `eigen(Symmetric(Hss))` → Ritz values θ and coefficients y (tiny).
+4. Ritz vectors/residuals: `x = Σ y[i]·V[i]`, `r = HV·y − θx` — pure
+   worker-local `add_scaled!` passes; only the residual norms (numbers) reach
+   M.
+5. Preconditioning `t = r/(θ − Hdiag)` — worker-local, using the sharded
+   diagonal computed once at call start (each worker builds the
+   `zero-transfer` diagonal for its own configs; nothing shipped).
+6. Restart when the subspace hits `max_ss_vecs·nroots`: collapse to the Ritz
+   vectors, **re-orthonormalize them (2-pass MGS) and rebuild `Hss` from real
+   ⟨V|H|V⟩ elements** — this re-orthonormalization is what keeps repeated
+   restarts numerically stable (skipping it caused ghost eigenvalues below
+   the true ground state on near-degenerate roots; fixed 2026-07-07).
+7. Every transient sharded vector is `destroy!`ed each iteration.
+
+### Step 2 — zeroth-order energies for the PT denominators
+
+`Efock[r] = ⟨r|Hcmf|r⟩`. Hcmf is diagonal in the cluster eigenbasis, so each
+worker sums `c²·⟨config|Hcmf|config⟩` over its own configs and returns R
+numbers; M adds them (move 3). (`compute_expectation_value_sharded_h0`;
+replicated path computes the same thing from its cached copy.)
+
+### Step 3 — PT1 vector in the FOIS
+
+(`compute_pt1_wavefunction_distributed` / `compute_pt1_wavefunction_sharded`)
+
+1. M enumerates the FOIS **output sectors**: every `fock_ket + ftrans` for
+   Hamiltonian transfers `ftrans`, filtered to valid electron counts and
+   available cluster bases (metadata only, no coefficients touched).
+2. M assigns each output sector to a worker. **Sharded:** sectors already in
+   the variational state keep their owner; new sectors go to the least-loaded
+   worker (`_tpsci_sharded_output_chunks`). This owner-preservation is what
+   makes Step 5's merge safe. **Replicated:** plain round-robin.
+3. Wk, per assigned output sector: builds the σ block
+   `⟨FOIS-config|H|0⟩` with the screened open-ended contraction
+   (`_open_matvec_thread_job`, threads inside the worker; terms screened by
+   `thresh_foi`). Sharded: ket blocks fetched as in the matvec (move 2).
+4. `project_out!`: remove configs already in the variational space —
+   worker-local deletions (each worker owns both the σ sector and the
+   matching variational sector, by construction of step 2).
+5. Denominators + PT2 energy: worker-local
+   `c¹ = ⟨X|H|0⟩ / (E0 − ⟨X|Hcmf|X⟩)`; each worker returns its contribution
+   to `e2[r] = Σ ⟨X|H|0⟩·c¹` (move 3). The PT1 vector stays distributed
+   (sharded) or is assembled on M (replicated).
+
+### Step 4 — selection
+
+`clip!(vec_pt, thresh=thresh_cipsi)`: drop PT configs with small |c⁽¹⁾|.
+Worker-local deletions; M refreshes sector lengths (move 4).
+
+### Step 5 — grow the variational space
+
+`zero!(vec_pt); add!(vec_var, vec_pt)` — the selected configurations enter
+the space **with zero coefficients** (the next diagonalization determines
+them). Sharded: each worker merges the PT sectors it owns into its
+variational chunk; a sector new to the space simply appears on the worker
+that produced it — the **ownership-reconciling merge**. The `add!` guard
+verifies shared sectors have identical owners (guaranteed by step 3.2) and
+errors loudly otherwise.
+
+### Step 6 — converged?
+
+M compares `e0` with the previous iteration (numbers only). If not converged,
+go to Step 1 — the sharded path re-enters it **without any gather**; the
+replicated `use_sharded=true` path of `tpsci_ci_multinode` instead calls
+`collect_tpsci_state` here, which is exactly the limitation
+`tpsci_ci_sharded` removes.
+
+**Verification**: `tpsci_ci_sharded` reproduces single-node `tpsci_ci`
+energies and the same selected space on h8 (test
+`never-gather tpsci_ci_sharded vs single-node tpsci_ci`).
+
+---
+
+## 3. TPS-CEPA multinode, step by step
+
+(`do_tps_sharded_cepa`, `tps_cepa_sharded.jl`.) CEPA solves the linear system
+`(H_QQ − E0 − shift)·x = −h` in the Q space (the FOIS of the reference), with
+a self-consistent shift (cepa/acpf/aqcc/cisd), per root. The expensive object
+is `H_QQ`; the design decision is to **build it once and reuse it across all
+roots × shift-iterations × solver steps**.
+
+### Step 1 — reference solve
+
+Get `(e0, ref)`: either passed in, or solved by the sharded Davidson (§2 Step
+1), `tps_ci_direct` (single-node dense), or the replicated distributed
+Davidson.
+
+### Step 2 — build the sharded Q space
+
+1. M distributes the (small) reference (move 1, partitioned).
+2. `open_matvec_sharded(ref)` — exactly §2 Step 3.1–3.3: each worker builds
+   its assigned FOIS sectors of H·ref, screened by `thresh_foi`. Result: the
+   Q basis as a `DistributedTPSCIstate`.
+3. `project_out!(Q, ref)` — worker-local removal of reference configs.
+   Optional `clip!`.
+
+### Step 3 — build H_QQ once, distributed (`h_storage=:blocks`)
+
+(`build_block_h_sharded`; `:auto` first estimates
+`nnz = Σ n_bra·n_ket` over connected sector pairs from metadata alone and
+falls back to matrix-free if it exceeds `max_mem_H`.)
+
+1. M sends each worker the list of Q sectors it owns (row ownership).
+2. Wk, for each owned `fock_bra` and each connected `fock_ket`: fetches the
+   ket sector's config list (move 2, cached), then fills the dense block
+   `H[bra_configs × ket_configs]` element-by-element with
+   `contract_matrix_element`. Blocks are stored worker-locally
+   (`_TPSCI_SHARDED_BLOCK_H`), never shipped.
+3. Wk → M: byte counts only. H_QQ now exists as distributed block-sparse
+   rows, owned by the same workers that own the Q vector's rows.
+
+### Step 4 — per root r: coupling vector
+
+`h = ⟨Q|H|ref_r⟩`: one matrix-free `open_matvec_sharded` of the single-root
+reference (cheap, rectangular, once per root), then
+`restrict_to_basis_sharded` maps it onto the Q layout (zero-filling configs
+the screened build missed; ownership follows Q).
+
+### Step 5 — shift macro-iterations
+
+For each shift update (`shift = f(E_corr)` per the CEPA variant):
+
+Solve `(H_QQ − (e0+shift))x = −h` with **sharded MINRES** (default; CG
+available). Each MINRES iteration costs exactly:
+
+1. one operator apply `H_QQ·v`: worker-local block-GEMV over the stored
+   blocks (`mul!`), ket blocks fetched/cached (move 2) — with Tier A **no
+   contraction is recomputed, ever**;
+2. one `add_scaled!` for the shift (worker-local);
+3. two to three `overlap`/`norm` reductions → scalars to M (move 3);
+4. Givens rotations on 4 numbers, on M;
+5. worker-local axpys to update the iterates; all scratch `destroy!`ed.
+
+Then `E_corr = ⟨x|h⟩` (one reduction), update the shift, repeat until
+`|ΔE_corr| < tol`. The matrix-free names (`do_fois_cepa_sharded`,
+`tpsci_cepa_solve_sharded`) run the same solver with the apply replaced by a
+full re-contraction — same answers (tested to 1e-7), many times the work.
+
+### Step 6 — cleanup
+
+`destroy!` the block H (`finally`-guarded) and all per-root temporaries.
+Returns `(E_corr per root, e0 .+ E_corr)` and the sharded Q vector.
+
+---
+
+## 4. SPT (`subspace_product_tucker`) multinode, step by step
+
+(`subspace_product_tucker_multinode`, `spt_multinode.jl`.) SPT states are
+Tucker-compressed; the philosophy here differs from §2–3: **the state itself
+stays on the master** (it is compressed, hence small); what gets distributed
+are the expensive *job loops* — FOIS construction, sigma builds, expectation
+values, PT2 sums. The Tucker compression and the variational CI solve remain
+master-local.
+
+Per SPT iteration:
+
+### Step 1 — compress + reference energy
+
+1. M: `compress(ref, thresh_var)`, `orthonormalize!` — local (Tucker SVDs on
+   the compressed cores).
+2. `e0 = ⟨0|H|0⟩` via `compute_expectation_value_distributed`:
+   - M splits the destination Fock sectors of σ = H|0⟩ across workers by
+     block size (`_spt_fock_chunks_by_length`).
+   - M ships each worker *its slice* of the σ basis plus the full (small,
+     compressed) ket state (move 1).
+   - Wk: materializes only the cluster-op tables its terms need, runs the
+     standard local `build_sigma!` on its slice (Tucker-blockwise
+     contractions).
+   - Wk → M: its σ slice; M merges the disjoint Fock blocks and takes
+     `orth_dot(σ, ψ)` locally.
+3. Same machinery for `⟨S²⟩`.
+
+### Step 2 — FOIS construction (the big one)
+
+`build_compressed_1st_order_state_distributed`:
+
+1. M enumerates jobs: one per FOIS output sector, each carrying the list of
+   (terms, ket sector, ket Tucker blocks) that feed it
+   (`_spt_make_fock_jobs`), and splits them across workers **weighted by
+   estimated cost** `Σ n_terms·n_ket_blocks` (`_spt_job_chunks`).
+2. Wk: threads over its jobs; each job runs the unchanged single-node kernel
+   `_build_compressed_1st_order_state_job` (screened Tucker contractions,
+   compression at `thresh_foi`).
+3. Wk → M: its output sectors; M merges (each sector produced exactly once —
+   duplicates are an error, and checked).
+
+### Step 3 — PT1 / PT2
+
+`compute_pt1_wavefunction_distributed` (SPT flavor):
+
+1. M: builds the H0 diagonal on the FOIS basis (local), and the overlap
+   projection `Sx` (local).
+2. `⟨X|H|0⟩` and `⟨X|Hcmf|0⟩`: two distributed sigma builds into the fixed
+   FOIS basis (`build_sigma_distributed`, same scatter/merge as Step 1.2).
+3. M: assembles `σ − XF0 − Sx(E0−F0)`, applies denominators, takes
+   `ecorr = orth_dot(σ, ψ₁)` — all local on the compressed objects.
+
+(For a PT2 *energy only*, `compute_pt2_energy_distributed` skips storing any
+global σ: workers run `_pt2_job`/`_pt2_job_blockwise` per FOIS sector and
+return only per-root energy partials, which M sums — move 3. The σ·σ variance
+`compute_spt_sigma_norm_blockwise_distributed` is the same shape, returning
+`⟨σ|σ⟩` partials; note `σ² = ⟨0|H²|0⟩`, so `variance = σ² − E0²` exactly.)
+
+### Step 4 — grow and solve variationally (master-local)
+
+M: `nonorth_add!(var_vec, pt1_vec)` → `compress` → `orthonormalize!` →
+`ci_solve` (the local Tucker CI). This is deliberate: the compressed SPT
+variational state is small enough for one node, and the Tucker solver is not
+distributed. If cluster ops were sharded (`DistributedClusterOps`), they are
+gathered for this one step (with a warning).
+
+### Step 5 — converged?
+
+Compare `e_var` with the previous iteration; loop to Step 1.
+
+**So the SPT division of labor is:** distributed = FOIS jobs, sigma builds,
+expectation values, PT2/σ² sums (all "scatter jobs, sum/merge results");
+local = compression, basis projection, variational Tucker CI.
+
+---
+
+## 5. What is identical to single-node, and what to check when things break
+
+The physics kernels — `contract_matrix_element`, `_open_matvec_thread_job`,
+`_build_compressed_1st_order_state_job`, `_pt2_job*`, denominators — are
+**the same functions** the single-node code calls. The multinode layer only
+decides *who* runs them and combines partials over disjoint work. That is why
+every distributed routine is tested against its single-node sibling
+(RDMs/σ²/expectations to ~1e-12; solver energies to ~1e-7–1e-14), and why
+multinode failures are almost always harness issues:
+
+| Symptom | Likely cause |
 |---|---|
-| `src/core/tpsci_multinode.jl` | distributed data structures, sharded vector algebra, matvecs, replicated backend, worker setup |
-| `src/core/tpsci_sharded_davidson.jl` | across-node block Davidson, stored block-sparse H |
-| `src/core/tps_cepa_sharded.jl` | stored-H TPS-CEPA, sharded MINRES/CG |
-| `src/core/spt_multinode.jl` | distributed SPT: FOIS, sigma, expectation values, PT2 |
-| `src/core/spt_variance_multinode.jl` | distributed SPT σ·σ (variance) |
-| `src/core/tpsci_property_multinode.jl` | distributed 1-/2-RDMs and one-electron properties |
-
----
-
-## 1. Execution model: one worker per node, threads inside
-
-TPSChem uses **two nested levels of parallelism**, and no MPI:
-
-```text
-┌─────────── master process (myid()=1) ───────────┐
-│  metadata, small k×k matrices, orchestration     │
-└────┬──────────────────┬──────────────────┬───────┘
-     │ Distributed       │                  │   (TCP; remotecall_fetch)
-┌────▼─────┐       ┌─────▼────┐       ┌─────▼────┐
-│ worker 2 │       │ worker 3 │       │ worker 4 │   ← one per NODE
-│ (node A) │       │ (node B) │       │ (node C) │     owns a memory slice
-│ ┌──────┐ │       │ ┌──────┐ │       │ ┌──────┐ │
-│ │thread│…│       │ │thread│…│       │ │thread│…│   ← Threads.@threads
-│ └──────┘ │       │ └──────┘ │       │ └──────┘ │     + threaded BLAS
-└──────────┘       └──────────┘       └──────────┘
-```
-
-- **Across nodes**: Julia's `Distributed` stdlib. Each worker is a full Julia
-  process, typically one per node, owning a disjoint slice of the data.
-  Communication is explicit message passing (`remotecall_fetch`).
-- **Within a node**: Julia threads (`Threads.@threads :static`) over the
-  worker's job slice, plus multithreaded BLAS (`BLAS.set_num_threads`).
-
-This is why every distributed entry point takes `workers=` (which processes)
-plus `threaded_worker=` and `blas_threads=` (on-node parallelism). The design
-rule: *one memory-owning worker per node; never many single-threaded workers
-per node* — that would replicate the large read-only objects once per process.
-
-### Packages used, and why
-
-| Package | Role |
-|---|---|
-| `Distributed` (stdlib) | worker processes, `remotecall_fetch`, `@sync`/`@async` fan-out, serialization of arguments/results |
-| `Base.Threads` | on-node loop parallelism inside worker kernels |
-| `LinearAlgebra`/BLAS | dense block GEMV/GEMM in stored-H paths; `BLAS.set_num_threads` per worker |
-| `Pkg` (stdlib) | activating/instantiating the project on each worker at setup |
-| `OrderedCollections` | deterministic ownership and length maps in the distributed handles |
-| `JLD2` | problem input / result output in the cluster drivers |
-
-No MPI, no `SharedArrays`, no GPU.
-
----
-
-## 2. Defining workers
-
-### Locally (tests, laptop)
-
-```julia
-using Distributed
-addprocs(2; exeflags="--project=$(Base.active_project())")
-```
-
-The `exeflags` matter: under `Pkg.test()`, bare `addprocs` workers inherit a
-restricted load path in which even `import Pkg` fails (see §10).
-
-### On a cluster (SLURM)
-
-`examples/multinode/common.jl :: init_multinode_workers!()` reads
-`TPSCHEM_MACHINE_FILE` (one hostname per line) and starts one worker per host:
-
-```julia
-addprocs(hosts; exeflags="--project=$(project_root) --threads=$(threads)",
-         env=worker_env)   # forwards JULIA_DEPOT_PATH, OMP/MKL/OPENBLAS threads
-```
-
-### Making workers ready
-
-Every distributed routine funnels through
-`ensure_tpsci_multinode_workers!(workers=…)`, which idempotently prepares each
-worker:
-
-```julia
-copy!(LOAD_PATH, ["@", "@v#.#", "@stdlib"])  # restore default load path (Pkg.test sandbox omits @stdlib)
-import Pkg
-Pkg.activate(project_root; io=devnull)
-Pkg.instantiate(; io=devnull)                # ensure dependencies are resolved on this node
-using TPSChem
-```
-
-After this, any worker can execute any TPSChem function shipped to it.
-
----
-
-## 3. Two multinode backends — know which one you are using
-
-This is the most important thing to understand about the code. There are two
-distinct distributed backends with different memory behavior:
-
-### Backend A: replicated (job-distributed)
-
-The full `TPSCIstate`/`SPTstate` and cluster ops are **serialized to every
-worker** (or cached there once per call); only the *work loop* is split.
-Memory win: no dense Hamiltonian, and FOIS/matvec *scratch* is split. The CI
-vector itself still must fit on every node.
-
-Entry points: `open_matvec_distributed`, `tps_ci_matvec_distributed`,
-`tps_ci_davidson_distributed`, `compute_pt1_wavefunction_distributed`,
-`tpsci_ci_multinode`, all the property/RDM `compute_*_distributed` routines,
-and the SPT routines in `spt_multinode.jl` / `spt_variance_multinode.jl`.
-
-Worker-side cache: the per-call `Ref`s `_TPSCI_MULTINODE_CI`,
-`_TPSCI_MULTINODE_CLUSTER_OPS`, `_TPSCI_MULTINODE_CLUSTERED_HAM` (populated by
-`_tpsci_multinode_cache_problem!` so the big read-only objects ship **once**
-per call, not once per job).
-
-### Backend B: sharded (data-distributed)
-
-The vector itself is split: no process ever holds all of it. This is the path
-for CI vectors larger than one node's RAM.
-
-Entry points: everything taking/returning a `DistributedTPSCIstate` —
-`distribute_tpsci_state`, `open_matvec_sharded`, `tps_ci_matvec_sharded`,
-`tps_ci_davidson_sharded`, `compute_pt1_wavefunction_sharded`,
-`do_tps_sharded_cepa`, plus the sharded vector algebra (§5).
-
-The SPT results and the property/RDM outputs are *gathered* on the master
-(they are small: RDMs are `norb⁴`-ish, energies are scalars) — only the CI/Q
-vectors ever need sharding.
-
----
-
-## 4. The distributed data structures
-
-### `DistributedTPSCIstate{T,N,R}` — CI vector sharded by Fock sector
-
-A TPSCI vector is a dict `FockConfig → (ClusterConfig → coefficients)`. Each
-**Fock sector** is assigned to exactly one owning worker:
-
-```julia
-mutable struct DistributedTPSCIstate{T,N,R}
-    id            :: Symbol                        # handle; payload key on workers
-    clusters      :: Vector{MOCluster}
-    workers       :: Vector{Int}
-    owners        :: OrderedDict{FockConfig,Int}   # fock sector → owning pid
-    lengths       :: OrderedDict{FockConfig,Int}   # #configs per sector
-    offsets       :: OrderedDict{FockConfig,Int}   # global offsets (deterministic)
-    local_lengths :: OrderedDict{Int,Int}          # #configs owned per pid
-    total_length  :: Int
-end
-```
-
-**The master holds only this metadata — never coefficients.** Each worker
-keeps an ordinary local `TPSCIstate` containing exactly its owned sectors, in
-a worker-global registry:
-
-```julia
-const _TPSCI_SHARDED_STATES = Dict{Symbol,Any}()   # id → local TPSCIstate (on each worker)
-```
-
-Every sharded operation creates result states under a fresh `gensym` id and
-returns a new metadata handle; `destroy!(state)` deletes the payload on every
-worker. **You must call `destroy!` on every sharded state you are done with**
-— worker-side payloads are not garbage-collected when the master handle goes
-out of scope (§9).
-
-### `DistributedClusterOps{T}` — operator tables sharded by cluster
-
-Cluster operator tables (local TDMs, `H`, `Hcmf`, optionally 2-RDM `Ppqsr`)
-are sharded by **cluster index**, matching the natural independence of
-`compute_cluster_ops`: each cluster's tables are built *only on its owner*
-(`compute_cluster_ops_distributed`, `add_cmf_operators_distributed!`,
-`add_spinfree_2rdm_ops_distributed!`, `compute_cluster_ops_2rdm_distributed`).
-
-When a worker needs tables for clusters it does not own,
-`_materialize_cluster_ops_for_indices(ops, needed)` fetches **only the needed
-clusters** from their owners (kernels first compute `needed` from the actual
-terms they will touch — see `_tpsci_needed_cluster_indices`). A small
-per-worker cache (`_TPSCI_SHARDED_CLUSTER_H0_DIAGS`) additionally memoizes the
-`Hcmf` diagonals used by preconditioners and PT denominators, so those are
-fetched once, not per call.
-
-### Ownership assignment (`strategy=`)
-
-- `:balanced` (default) — greedy: each sector/cluster goes to the currently
-  least-loaded worker, weighted by configuration count (vectors) or basis-size
-  work estimate (cluster ops). For output spaces that extend an input space
-  (`_tpsci_sharded_output_chunks`), **sectors already owned keep their owner**
-  and only new sectors are placed — so selected-CI growth never reshuffles the
-  existing layout.
-- `:hash` — `owner = pids[hash(key) mod nworkers + 1]`: deterministic and
-  reproducible across runs/objects, at the cost of balance.
-
----
-
-## 5. Communication patterns: scatter, gather, and sharded algebra
-
-### The universal scatter idiom
-
-Everything uses explicit fan-out — no `pmap`, no `@distributed`:
-
-```julia
-results = Dict{Int,Any}()
-@sync for pid in pids
-    @async begin
-        results[pid] = Distributed.remotecall_fetch(worker_kernel, pid,
-                                                    chunks[pid], args...)
-    end
-end
-```
-
-All workers run their chunk **concurrently**; the master blocks until all
-return. (The `@async` tasks are cooperatively scheduled on the master's
-thread, so the `results[pid] = …` writes cannot race.)
-
-### Three gather shapes
-
-1. **Sum of partials** — energies, RDMs, σ², overlaps. Work units are
-   disjoint, so summing per-worker partials reconstructs the serial answer
-   exactly (verified to ~1e-12 in the tests):
-   `gamma_aa .+= results[pid].gamma_1`.
-2. **Block assembly** — each worker returns whole blocks it owns; the master
-   writes them into slots (2-RDM root-pair blocks) or, for sharded outputs,
-   collects only **per-sector lengths** and rebuilds a metadata handle
-   (`_tpsci_sharded_metadata_from_lengths`); coefficients never move.
-3. **Never gathered** — the sharded solvers. Only `R×R` `overlap` matrices
-   (typically `1×1` scalars) cross the wire; all vector arithmetic is
-   worker-local.
-
-### The sharded vector algebra
-
-These make a `DistributedTPSCIstate` behave like a vector without gathering.
-Each is a one-remote-call-per-worker operation on owned blocks:
-
-| Operation | Returns to master | Notes |
-|---|---|---|
-| `overlap(s1,s2)`, `norm(s)` | `R×R` / `R` numbers | reduction |
-| `scale!`, `zero!`, `mult!` (root rotation), `add_scaled!(d,α,s)`, `linear_combination!(d,α,s,β)` | nothing | in-place on owned blocks; ownership must match (guarded by loud errors) |
-| `add!`, `project_out!`, `clip!` | refreshed metadata | may change sector lengths → `_tpsci_sharded_refresh_metadata!` |
-| `orthonormalize!` | — | Löwdin: one `overlap` + one broadcast `mult!` |
-| `copy_sharded_state`, `similar_sharded_state` | new handle | worker-local copy/zero-like |
-| `extract_root_sharded`, `combine_roots_sharded` | new handle | R↔1 conversions, ownership-preserving |
-| `restrict_to_basis_sharded(src, basis)` | new handle | project onto `basis`' layout, zero-fill; used for Q-space |
-| `collect_tpsci_state`, `collect_cluster_ops` | full object | **debug/small cases only** |
-
----
-
-## 6. Walk-through 1: a distributed property (replicated backend)
-
-`compute_1rdm_distributed(bra, ket, cluster_ops)`:
-
-1. `ensure_tpsci_multinode_workers!()` → workers ready.
-2. Split the `R1×R2` **transition root pairs** across workers
-   (`_tpsci_property_root_pair_chunks`; balanced or hash).
-3. Scatter: each worker materializes only the cluster ops it needs, then runs
-   the **unchanged single-node kernel** (`compute_1rdm` /
-   `compute_1rdm_threaded`) per root pair.
-4. Gather: master sums `norb×norb×R1×R2` partials.
-
-The 2-RDM, spin-flip 1-RDM, one-electron property, SPT PT2/σ² routines follow
-the same recipe with different work units (root pairs vs. FOIS Fock-sector
-jobs) and kernels. **The physics kernels are identical to single-node** —
-`contract_matrix_element`, `form_sigma_block_expand`, `_pt2_job*` — the
-distributed layer only decides *who* runs them and adds the partials.
-
-### Aside: SPT σ² and the variance
-
-`compute_spt_sigma_norm_blockwise[_distributed]` builds `σ = H|0⟩`
-block-by-block over **all** reachable destinations — including the reference's
-own Fock sector and p-space blocks (the FOIS jobs are built with
-`require_cluster_space=false` and destination spaces include both p and q).
-So `σ² = ⟨0|H²|0⟩` (within nbody/thresh truncation), and the driver's
-
-```julia
-variance = sigma2 .- E0.^2      # spt_variance_driver.jl
-```
-
-is the textbook `⟨H²⟩−⟨H⟩²`. (Verified numerically: for the he4 CMF reference,
-`sigma2 − E0² ≥ 0` and small, as a near-eigenstate's variance should be.)
-
----
-
-## 7. Walk-through 2: the sharded matvec (data-distributed backend)
-
-`tps_ci_matvec_sharded(v, cluster_ops, clustered_ham)` computes `σ = H v`
-inside the current variational space, with `v` and `σ` both sharded:
-
-```text
-master:  chunks[pid] = Fock sectors owned by pid          (row ownership)
-         @sync remotecall_fetch(matvec_chunk!, pid, …)    (scatter)
-
-worker pid, for each owned output sector fock_bra:
-  1. prefetch ket cache: for every fock_ket connected to fock_bra by some
-     Hamiltonian transfer, fetch that sector's configs
-        - from local storage if pid owns it,
-        - else remotecall_fetch from its owner    ← the ONLY bulk communication
-  2. (DistributedClusterOps) materialize only the cluster ops the touched
-     terms need
-  3. Threads.@threads over owned (fock_bra, config_bra):
-        σ[bra] = Σ_ket Σ_terms check_term ? contract_matrix_element(...)·v[ket]
-     (the ket cache is fully prefetched BEFORE threading → read-only during
-      the parallel loop → no locks needed)
-  4. store σ chunk under the output id; return {fock: length} only
-
-master:  rebuild metadata handle from lengths              (gather shape 2)
-```
-
-`open_matvec_sharded` is the same pattern for the *rectangular* map into the
-FOIS (output sectors = all Hamiltonian-reachable sectors, assigned by
-`_tpsci_sharded_output_chunks` with owner-preservation), used for PT1
-(`compute_pt1_wavefunction_sharded`) and CEPA coupling vectors.
-
-Key property: network traffic per matvec = (connected ket sectors fetched
-cross-worker) + (a lengths dict). Coefficients of the *output* never move.
-
----
-
-## 8. Walk-through 3: the across-node solvers
-
-### Sharded Davidson (`tps_ci_davidson_sharded`)
-
-Diagonalizes H in the space of a sharded vector; **no full vector ever exists
-anywhere**. Subspace basis `V` and sigma `HV` are lists of R=1 sharded states.
-
-```text
-Hdiag = compute_diagonal_sharded(...)          # worker-local zero-transfer diagonal
-Hop   = :blocks ? stored block-sparse H : matrix-free (tps_ci_matvec_sharded)
-seeds = extract_root_sharded.(guess, 1:nroots), MGS-orthonormalized
-
-iterate:
-  Hss[i,j] = overlap(V[i], HV[j])              # k×k on master  ← only wire traffic
-  eigen(Symmetric(Hss)) → (θ, y)               # tiny, on master
-  Ritz x_s = Σ_i y[i,s]·V[i]                   # sharded add_scaled!
-  residual r_s = HV·y_s − θ_s x_s;  |r_s| ≤ tol ∀s → done
-  precondition: t = r/(θ − Hdiag)              # worker-local, scaled sign-preserving floor
-  if subspace would exceed max_ss_vecs·nroots (default 4·nroots):
-      collapse to Ritz vectors, RE-ORTHONORMALIZE them (2-pass MGS), and
-      REBUILD Hss from actual ⟨x|H|x⟩          # ← stability-critical
-  MGS new directions against V; drop if norm ≤ lindep_thresh; append
-  destroy! every transient sharded vector each iteration
-```
-
-Two Hamiltonian tiers, chosen by `h_storage`:
-
-- **Tier A `:blocks`** — `build_block_h_sharded` computes each connected
-  `(fock_bra, fock_ket)` pair as a dense sub-block via
-  `contract_matrix_element`, stored on the **row-owner** worker
-  (`_TPSCI_SHARDED_BLOCK_H`). Every matvec is then worker-local block-GEMV
-  (`mul!`) over cached ket blocks — `tps_ci_direct`-like per-iteration speed,
-  paid once. Requires the Davidson subspace vectors to share the space's
-  config layout (they do: all are built by `similar/copy/extract` from it).
-- **Tier B `:matrixfree`** — every matvec re-contracts cluster operators.
-  Minimal memory, slower per iteration.
-- `:auto` — `sharded_H_memory_report` estimates `nnz(H) = Σ n_bra·n_ket` over
-  connected sector pairs (metadata-only, O(nfocks²)) and picks Tier A iff the
-  estimate fits `max_mem_H` GB.
-
-**Numerical stability (fixed 2026-07-07):** the restart originally reused the
-Ritz vectors as-is with `Hss = diag(θ)`. Round-off accumulated across
-restarts; near-degenerate roots then fed in-span corrections whose normalized
-round-off corrupted `Hss`, producing ghost eigenvalues collapsing *below* the
-true ground state. The fix re-orthonormalizes at restart and rebuilds `Hss`
-from real matrix elements, plus a scaled floor in the preconditioner
-(`√eps·max(|θ|,|Hdiag|,1)`, sign-preserving) instead of a fixed `+1e-12`.
-Verified: 20/20 random-guess seeds converge to ~1e-14 of `tps_ci_direct` in
-both tiers (previously ~40% diverged).
-
-### Stored-H TPS-CEPA (`do_tps_sharded_cepa`)
-
-Solves `(H_QQ − eshift)·x = −h` over the sharded Q space (FOIS of the
-reference), per root, with macro-iterations updating the shift
-(cepa/acpf/aqcc/cisd):
-
-1. Reference solve (or take `e0`): `:sharded_davidson` (default), `:direct`,
-   or `:distributed_davidson`.
-2. Q space: `open_matvec_sharded(ref)` → `project_out!(ref)` → optional clip.
-3. **`H_QQ` built once** (`h_storage=:blocks|:auto`) and reused across *all*
-   roots × macro-iterations × solver steps — this is the entire point; the
-   matrix-free path re-contracts every MINRES/CG iteration. (Measured ~4×
-   faster already on a 79-config toy Q space.)
-4. Coupling vector `h = ⟨Q|H|ref⟩`: matrix-free `open_matvec_sharded` once per
-   root, then `restrict_to_basis_sharded` onto the Q layout.
-5. Linear solver: hand-rolled **sharded MINRES** (default; symmetric
-   indefinite, Givens rotations) or **CG**, both operating purely on the
-   sharded algebra of §5 with careful `destroy!` of all scratch.
-6. `E_corr = ⟨x|h⟩`; iterate shift to self-consistency.
-
-The old names `do_fois_cepa_sharded` / `tpsci_cepa_solve_sharded` still work —
-they are thin wrappers calling the same code with `h_storage=:matrixfree`.
-
-### The outer selected-CI loop (`tpsci_ci_multinode`)
-
-Replicated-backend selected CI: matrix-free distributed Davidson (or, with
-`use_sharded=true`, the sharded Davidson for the diagonalization step),
-distributed PT1, clip, add, repeat. **Honest caveat (documented in the code):**
-with `use_sharded=true` the PT/selection steps still run on the replicated
-backend, so `vec_var` is re-gathered on the master between iterations
-(`collect_tpsci_state`). This distributes the diagonalization working set —
-the dominant memory cost — but a fully never-gather selected-CI loop still
-needs sharded selection + an ownership-reconciling merge (future work).
-
----
-
-## 9. Memory management rules
-
-1. **`destroy!` every sharded state and `ShardedBlockH` you create.** Worker
-   payloads live in global registries keyed by `gensym` ids; dropping the
-   master handle leaks the payload on every worker. The solvers model the
-   discipline (explicit `destroy!` per iteration; `finally` blocks around
-   stored H). At production scale one leaked subspace vector can be hundreds
-   of GB.
-2. Cluster ops and the clustered Hamiltonian are cached per call on workers
-   (`_tpsci_sharded_cache_operator_problem!`) — repeated matvecs in one solve
-   do not re-ship them.
-3. `collect_tpsci_state` / `collect_cluster_ops` are debug helpers; anything
-   using them (including `tpsci_ci_multinode`'s inter-iteration gather) caps
-   the problem size at one node's memory for that step.
-4. Diagnostics: `sharded_state_summary(state)` and `cluster_ops_summary(ops)`
-   report per-worker sizes.
-
----
-
-## 10. Single-node vs. multinode
-
-| | Single node | Multinode replicated (A) | Multinode sharded (B) |
-|---|---|---|---|
-| CI vector | one `TPSCIstate` in RAM | full copy cached per worker | Fock sectors split; nobody holds it all |
-| Cluster ops | one `Vector{ClusterOps}` | shipped/cached per call | sharded by cluster, fetched on demand |
-| Hamiltonian | dense H (`tps_ci_direct`) or matrix-free (`tps_ci_davidson`) | matrix-free only | block-sparse distributed (Tier A) or matrix-free (Tier B) |
-| Parallelism | threads + BLAS | workers × threads | workers × threads |
-| Communication | none | args out, partials back | ket-block fetches + k×k reductions |
-| Peak memory bound | one node (vector + maybe dense H) | one node (vector), but no dense H and split scratch | **aggregate cluster memory** |
-| Same physics kernels? | — | yes, byte-identical | yes, byte-identical |
-
-The per-block kernels (`contract_matrix_element`, `form_sigma_block_expand`,
-`compute_1rdm`, denominators, DIIS) are the same code in all three columns —
-which is why every distributed routine is testable against its single-node
-sibling to ~1e-12, and why multinode bugs live almost exclusively in the
-*harness*: ownership, load paths, restart orthogonality, memory lifetime. Both
-bugs found in this code's history were exactly that (the Davidson restart, and
-the `Pkg.test` worker load path).
-
-**When to use which:** single node whenever the vector (and, for
-`tps_ci_direct`, dense H) fits and one node's cores suffice — it is simpler
-and faster (zero serialization). Replicated multinode when dense H is the
-blocker or you need more cores. Sharded multinode when the *vector* no longer
-fits on a node. Below those thresholds, multinode is strictly slower.
-
-### Known limitations (by design, current state)
-
-- SPT results and RDMs are gathered on the master (they are small; the local
-  Tucker CI solver is single-node).
-- `tpsci_ci_multinode(use_sharded=true)` gathers between iterations (§8). A
-  fully never-gather selected-CI loop is feasible with the existing sharded
-  primitives (`compute_pt1_wavefunction_sharded`, `clip!`, `add!`,
-  `orthonormalize!`, `tps_ci_davidson_sharded`) for the default path
-  (`incremental=false`, `thresh_spin=nothing`); the open pieces are verifying
-  the ownership-reconciling `add!` merge for newly appearing sectors and
-  feature parity for the optional S²-extension/incremental paths.
-- Diagnostic summaries (`sharded_state_summary`, `cluster_ops_summary`) and
-  the debug gathers still loop over workers serially (rare calls; the hot
-  reductions — `overlap`, `norm`, H0 expectations, PT1 denominators — fan out
-  concurrently as of 2026-07-07).
-
----
-
-## 11. Troubleshooting
-
-| Symptom | Cause / fix |
-|---|---|
-| `Package Pkg not found in current path` on a worker | Workers spawned under `Pkg.test` inherit a sandbox `JULIA_LOAD_PATH` without `@stdlib`. Fixed inside `ensure_tpsci_multinode_workers!` (restores the default `LOAD_PATH` first); also spawn test workers with `exeflags="--project=$(Base.active_project())"`. |
-| `No sharded TPSCI state cached with id …` | Using a handle after `destroy!`, or on a worker list it was never distributed to. |
-| `… requires identical worker lists` / `requires matching Fock ownership` | Mixing sharded states created with different `workers=` or strategies. Create related states from each other (`similar/copy/extract/restrict`) so ownership is inherited. |
-| Davidson “did not converge” with energies diving far below the reference | You are on a pre-2026-07-07 build without the restart re-orthonormalization fix. |
-| Worker memory grows across a script | Leaked sharded states — audit your `destroy!` calls (§9). |
-| First distributed call is slow | One-time per-worker `Pkg.activate` + `using TPSChem` + JIT; subsequent calls reuse it. |
-
----
-
-## 12. Minimal recipes
-
-Local, end to end:
-
-```julia
-using Distributed
-addprocs(2; exeflags="--project=$(Base.active_project())")
-using TPSChem
-# … build ints, clusters, cluster_bases, clustered_ham, d1 as usual …
-
-# distributed cluster ops (sharded by cluster)
-dops = TPSChem.compute_cluster_ops_distributed(cluster_bases, ints; workers=workers())
-TPSChem.add_cmf_operators_distributed!(dops, cluster_bases, ints, d1.a, d1.b)
-
-# properties on a solved reference psi (replicated backend)
-γaa, γbb = TPSChem.compute_1rdm_distributed(psi, dops; workers=workers())
-
-# across-node diagonalization (sharded backend)
-dv = TPSChem.distribute_tpsci_state(guess; workers=workers(), strategy=:balanced)
-e, dv_out = TPSChem.tps_ci_davidson_sharded(dv, dops, clustered_ham;
-                                            nroots=3, h_storage=:auto)
-TPSChem.destroy!(dv_out); TPSChem.destroy!(dv); TPSChem.destroy!(dops)
-```
-
-On a cluster: set `TPSCHEM_INPUT_JLD2` (+ machine file) and `sbatch` a script
-from this directory; every driver funnels through `common.jl` →
-`init_multinode_workers!` → the scatter/gather machinery above. See
-`README.md` here for the per-driver environment variables.
-
----
-
-## 13. One-paragraph mental model
-
-Start one Julia worker per node. Shard the CI vector by Fock sector and the
-cluster operators by cluster index — metadata on the master, payloads in
-worker-global registries keyed by handle ids. Every operation scatters one
-`remotecall_fetch` per worker over its owned slice, threads within the worker,
-and gathers either a small summed partial (energies, RDMs, σ²), a set of owned
-blocks/lengths (matvec outputs), or — in the sharded Davidson/CEPA solvers —
-nothing but `k×k` overlap matrices, so no full vector ever exists on any
-single machine. The physics kernels are byte-identical to the single-node
-code; the multinode layer is ownership, message passing, and memory lifetime.
+| `Package Pkg not found` on worker | spawned under `Pkg.test` sandbox; fixed in `ensure_tpsci_multinode_workers!` (restores `LOAD_PATH`); spawn test workers with `--project` |
+| `requires matching Fock ownership` | mixing sharded states from independent `distribute_tpsci_state` calls; derive related states from each other instead |
+| `No sharded TPSCI state cached with id` | use-after-`destroy!`, or wrong worker list |
+| worker memory grows | leaked sharded states — audit `destroy!` |
+| Davidson energies dive below the ground state | pre-2026-07-07 build without the restart re-orthonormalization |
+
+Memory rules: `destroy!` every sharded state and block-H you create; the
+solvers model this (per-iteration frees, `finally` blocks). Use
+`sharded_state_summary` / `cluster_ops_summary` to audit per-worker sizes.
+`collect_tpsci_state` is debug-only.
+
+When to use what: single node while everything fits (fastest, zero
+serialization); replicated multinode when dense H or core count is the
+blocker; sharded (`tpsci_ci_sharded`, `do_tps_sharded_cepa`) when the CI/Q
+vector itself outgrows a node.

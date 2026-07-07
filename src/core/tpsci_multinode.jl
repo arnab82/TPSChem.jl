@@ -2459,3 +2459,197 @@ function tpsci_ci_multinode(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
     flush(stdout)
     return e0, vec_var
 end
+
+"""
+    tpsci_ci_sharded(ci_vector, cluster_ops, clustered_ham; ...)
+
+Never-gather selected TPSCI. The variational vector lives across workers as a
+`DistributedTPSCIstate` for the ENTIRE selected-CI loop: the diagonalization
+(sharded Davidson), the PT1 selection, clipping, and the variational-space
+growth all operate on sharded states, so no full CI vector is ever
+materialized on the master or on any single node. This removes the
+inter-iteration `collect_tpsci_state` gather that `tpsci_ci_multinode`
+(`use_sharded=true`) still performs.
+
+The input `ci_vector` is the (small) starting reference and is local; it is
+distributed once and never gathered again. Returns `(e0, vec_var)` where
+`vec_var` is a `DistributedTPSCIstate`: call `collect_tpsci_state(vec_var)`
+only if the final vector fits on one node, and `destroy!(vec_var)` when done.
+
+The variational space grows by an ownership-reconciling merge: the PT vector's
+Fock sectors that already exist in the variational state keep their owners
+(guaranteed by `_tpsci_sharded_output_chunks`), and genuinely new sectors are
+merged onto the worker that produced them via the sharded `add!`.
+
+Not supported here (use `tpsci_ci_multinode` if you need them): `incremental`
+sigma updates and the `thresh_spin` S² space extension. Note that aggressive
+`thresh_asci`/`thresh_var` clipping that removes an *entire* Fock sector from
+the search vector while it remains in the variational state can lead to that
+sector being regenerated under a different owner, which the sharded `add!`
+rejects with a loud ownership error; config-level clipping (the common case)
+is safe.
+"""
+function tpsci_ci_sharded(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
+                          clustered_ham::ClusteredOperator;
+                          thresh_cipsi=1e-2,
+                          thresh_foi=1e-6,
+                          thresh_asci=nothing,
+                          thresh_var=nothing,
+                          max_iter=10,
+                          conv_thresh=1e-4,
+                          nbody=4,
+                          ci_conv=1e-8,
+                          ci_max_iter=100,
+                          ci_max_ss_vecs=4,
+                          ci_lindep_thresh=1e-12,
+                          prescreen=false,
+                          h_storage::Symbol=:auto,
+                          max_mem_H=50.0,
+                          compute_s2=true,
+                          workers=Distributed.workers(),
+                          threaded_worker=true,
+                          blas_threads=1,
+                          strategy::Symbol=:balanced,
+                          verbose=1) where {T,N,R}
+    worker_ids = ensure_tpsci_multinode_workers!(workers=workers)
+    length(ci_vector) > 0 || error(" input vector has zero length")
+
+    println()
+    println(" |== Never-gather Sharded Selected TPSCI ===========================")
+    println(" thresh_cipsi     : ", thresh_cipsi)
+    println(" thresh_foi       : ", thresh_foi)
+    println(" thresh_asci      : ", thresh_asci)
+    println(" thresh_var       : ", thresh_var)
+    println(" max_iter         : ", max_iter)
+    println(" conv_thresh      : ", conv_thresh)
+    println(" nbody            : ", nbody)
+    println(" ci_conv          : ", ci_conv)
+    println(" h_storage        : ", h_storage)
+    println(" workers          : ", worker_ids)
+    println(" threaded_worker  : ", threaded_worker)
+    flush(stdout)
+
+    clustered_S2 = extract_S2(ci_vector.clusters)
+
+    guess = deepcopy(ci_vector)
+    orthonormalize!(guess)
+    vec_var = distribute_tpsci_state(guess; workers=worker_ids,
+                                     strategy=strategy,
+                                     blas_threads=blas_threads)
+    vec_pt = nothing
+    e0 = zeros(T, R)
+    e2 = zeros(T, R)
+    e0_last = zeros(T, R)
+    converged = false
+
+    for it in 1:max_iter
+        println()
+        println(" ===================================================================")
+        @printf("     Sharded Selected CI Iteration: %4i epsilon: %12.8f\n",
+                it, thresh_cipsi)
+        println(" ===================================================================")
+
+        if it > 1
+            if thresh_var !== nothing
+                l1 = length(vec_var)
+                clip!(vec_var, thresh=thresh_var)
+                l2 = length(vec_var)
+                @printf(" Clip values < %8.1e         %6i -> %6i\n", thresh_var, l1, l2)
+            end
+
+            # Ownership-reconciling structure merge: zero the PT coefficients and
+            # add so the variational space gains the selected configurations. The
+            # subsequent diagonalization determines their coefficients.
+            l1 = length(vec_var)
+            zero!(vec_pt)
+            add!(vec_var, vec_pt)
+            destroy!(vec_pt)
+            vec_pt = nothing
+            l2 = length(vec_var)
+            @printf("%-50s%6i -> %6i\n", " Add pt vector to current space", l1, l2)
+        end
+
+        orthonormalize!(vec_var)
+        e0_it, vec_new = tps_ci_davidson_sharded(vec_var, cluster_ops, clustered_ham;
+                                                 nroots=R,
+                                                 conv_thresh=ci_conv,
+                                                 max_iter=ci_max_iter,
+                                                 max_ss_vecs=ci_max_ss_vecs,
+                                                 lindep_thresh=ci_lindep_thresh,
+                                                 h_storage=h_storage,
+                                                 max_mem_H=max_mem_H,
+                                                 workers=worker_ids,
+                                                 threaded_worker=threaded_worker,
+                                                 blas_threads=blas_threads,
+                                                 verbose=verbose)
+        e0 = Vector{T}(e0_it)
+        destroy!(vec_var)
+        vec_var = vec_new
+
+        if compute_s2
+            sig_s2 = tps_ci_matvec_sharded(vec_var, cluster_ops, clustered_S2;
+                                           workers=worker_ids,
+                                           threaded_worker=threaded_worker,
+                                           blas_threads=blas_threads,
+                                           verbose=0)
+            s2 = LinearAlgebra.diag(overlap(vec_var, sig_s2))
+            destroy!(sig_s2)
+            @printf(" %5s %16s %12s\n", "Root", "Energy", "S2")
+            for r in 1:R
+                @printf(" %5i %16.8f %12.8f\n", r, e0[r], abs(s2[r]))
+            end
+            flush(stdout)
+        end
+
+        Efock = compute_expectation_value_sharded_h0(vec_var, cluster_ops;
+                                                     opstring="Hcmf",
+                                                     workers=worker_ids,
+                                                     blas_threads=blas_threads)
+
+        vec_asci = copy_sharded_state(vec_var)
+        if thresh_asci !== nothing
+            l1 = length(vec_asci)
+            clip!(vec_asci, thresh=thresh_asci)
+            l2 = length(vec_asci)
+            @printf("%-50s%6i -> %6i\n", " Length of ASCI vector", l1, l2)
+        end
+
+        e2, vec_pt = compute_pt1_wavefunction_sharded(vec_asci, cluster_ops,
+                                                      clustered_ham;
+                                                      nbody=nbody,
+                                                      H0="Hcmf",
+                                                      E0=Efock,
+                                                      thresh_foi=thresh_foi,
+                                                      prescreen=prescreen,
+                                                      workers=worker_ids,
+                                                      threaded_worker=threaded_worker,
+                                                      blas_threads=blas_threads)
+        destroy!(vec_asci)
+
+        l1 = length(vec_pt)
+        clip!(vec_pt, thresh=thresh_cipsi)
+        l2 = length(vec_pt)
+        @printf("%-50s%6i -> %6i\n", " Length of PT1  vector", l1, l2)
+
+        @printf(" Sharded TPSCI Iter %3i  dim=%9i  E:", it, length(vec_var))
+        for r in 1:R
+            @printf(" %14.8f", e0[r])
+        end
+        if maximum(abs.(e0_last .- e0)) < conv_thresh
+            println("   *converged*")
+            converged = true
+            flush(stdout)
+            break
+        end
+        println()
+        e0_last .= e0
+        flush(stdout)
+    end
+
+    vec_pt === nothing || destroy!(vec_pt)
+    converged ||
+        @printf(" tpsci_ci_sharded did not converge in %i iterations\n", max_iter)
+    @printf(" ==================================================================|\n")
+    flush(stdout)
+    return e0, vec_var
+end
