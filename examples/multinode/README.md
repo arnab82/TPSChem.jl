@@ -39,6 +39,57 @@ sbatch examples/multinode/run_tpsci_sharded_pt1_4nodes.slurm
 The CEPA driver builds the Q space once as a `DistributedTPSCIstate`, then runs
 MINRES root by root over that same sharded Q basis.
 
+## TPSCI Property/RDM Post-Analysis
+
+Use `tpsci_property_rdm_driver.jl` after you have a stored TPSCI reference
+wavefunction (`ref_vec`, `ci_vector`, or the key named by `TPSCHEM_REF_KEY`).
+It computes the alpha/beta 1-RDM, optional spin-flip 1-RDM, a direct
+one-electron property matrix, and optionally the full spin-free 2-RDM.
+
+```bash
+export TPSCHEM_OUTPUT_JLD2=post_analysis_rdms.jld2
+export TPSCHEM_REF_KEY=ref_vec
+export TPSCHEM_BUILD_SPIN_FLIP_1RDM=1
+export TPSCHEM_BUILD_2RDM=0        # set to 1 only when you need the full 2-RDM
+sbatch examples/multinode/run_multinode.sh \
+    examples/multinode/tpsci_property_rdm_driver.jl \
+    /path/to/problem_with_ref_vec.jld2
+```
+
+For a non-Hamiltonian one-electron property, store the integral matrix in the
+input JLD2 and set `TPSCHEM_PROPERTY_KEY`, for example
+`TPSCHEM_PROPERTY_KEY=mu_z`. If unset, the driver uses `ints.h1`.
+
+Entry points:
+
+- `compute_1rdm_distributed`
+- `compute_1rdm_sf_distributed`
+- `compute_1e_property_direct_distributed`
+- `compute_2rdm_distributed`
+- `add_spinfree_2rdm_ops_distributed!`
+- `compute_cluster_ops_2rdm_distributed`
+
+## SPT Variance / Sigma Norm
+
+Use `spt_variance_driver.jl` for the SPT variance-style sigma norm
+`<sigma|sigma>`. The driver reads an SPT state from `TPSCHEM_SPT_REF_KEY`, or
+falls back to `v_var`, `spt_ref`, `vbst`, `ref_spt`, then finally a CMF-like
+SPT reference built from `init_fspace`.
+
+```bash
+export TPSCHEM_OUTPUT_JLD2=spt_variance.jld2
+export TPSCHEM_SPT_REF_KEY=v_var
+export TPSCHEM_THRESH_FOI=1e-6
+export TPSCHEM_NBODY=4
+export TPSCHEM_OPT_REF=0
+sbatch examples/multinode/run_multinode.sh \
+    examples/multinode/spt_variance_driver.jl \
+    /path/to/problem_with_spt_state.jld2
+```
+
+Entry point: `compute_spt_sigma_norm_blockwise_distributed`
+(`spt_variance_multinode` is an alias).
+
 ### Stored-H TPS-CEPA (faster)
 
 `cepa_sharded_minres_driver.jl` is matrix-free: it re-contracts the Q-space

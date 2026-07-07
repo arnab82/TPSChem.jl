@@ -251,7 +251,10 @@ function _tpsci_sharded_local_precondition_typed!(dest_id::Symbol,
     for (fock, configs) in res.data
         add_fockconfig!(out, fock)
         for (config, coeffs) in configs
-            d = thetaT - diag.data[fock][config][1] + T(1e-12)
+            d0 = thetaT - diag.data[fock][config][1]
+            scale = max(abs(thetaT), abs(diag.data[fock][config][1]), one(T))
+            floor = sqrt(eps(T)) * scale
+            d = abs(d0) < floor ? copysign(floor, iszero(d0) ? one(T) : d0) : d0
             out[fock][config] = MVector{1,T}(coeffs[1] / d)
         end
     end
@@ -296,10 +299,13 @@ struct MatrixFreeShardedH{H}
 end
 
 function apply_sharded_H(op::MatrixFreeShardedH, v::DistributedTPSCIstate)
+    # verbose=0: this is called once per Davidson direction / MINRES iteration;
+    # per-call banners would swamp the solver log.
     return tps_ci_matvec_sharded(v, op.cluster_ops, op.clustered_ham;
                                  workers=op.workers,
                                  threaded_worker=op.threaded_worker,
-                                 blas_threads=op.blas_threads)
+                                 blas_threads=op.blas_threads,
+                                 verbose=0)
 end
 
 # ---------------------------------------------------------------------------
@@ -504,12 +510,31 @@ end
 # Modified Gram-Schmidt: orthogonalize `t` (a sharded R=1 vector) against every
 # vector in `basis`, in place. Returns the norm of the surviving component.
 function _mgs_against!(t::DistributedTPSCIstate{T,N,1}, basis) where {T,N}
-    for v in basis
-        c = overlap(t, v)[1, 1]
-        c == zero(T) && continue
-        add_scaled!(t, -c, v)
+    for _ in 1:2
+        for v in basis
+            c = overlap(t, v)[1, 1]
+            c == zero(T) && continue
+            add_scaled!(t, -c, v)
+        end
     end
     return norm(t)[1]
+end
+
+function _restart_from_ritz_basis!(ritz_x::Vector{<:DistributedTPSCIstate{T,N,1}},
+                                   apply_H, lindep_thresh) where {T,N}
+    V = DistributedTPSCIstate{T,N,1}[]
+    HV = DistributedTPSCIstate{T,N,1}[]
+    Hss = zeros(T, 0, 0)
+    for x in ritz_x
+        nrm = _mgs_against!(x, V)
+        if nrm <= lindep_thresh
+            destroy!(x)
+            continue
+        end
+        scale!(x, one(T) / nrm)
+        Hss = _append_direction!(V, HV, Hss, x, apply_H)
+    end
+    return V, HV, Hss
 end
 
 # Append an orthonormal direction `t` to the subspace: apply H, grow the small
@@ -634,15 +659,19 @@ function _tps_ci_davidson_sharded_core(seeds::Vector{<:DistributedTPSCIstate{T,N
             for v in HV
                 destroy!(v)
             end
-            V = ritz_x
-            HV = ritz_Hx
-            Hss = zeros(T, nroots, nroots)
-            for s in 1:nroots
-                Hss[s, s] = theta[s]
+            for hx in ritz_Hx
+                destroy!(hx)
+            end
+            V, HV, Hss = _restart_from_ritz_basis!(ritz_x, apply_H, lindep_thresh)
+            length(V) >= nroots ||
+                error("Sharded Davidson restart lost Ritz vectors to linear dependence")
+            if length(V) > nroots
+                error("Internal Sharded Davidson restart error: kept too many Ritz vectors")
             end
             # Ritz vectors are now the basis; do not free them here. Mark ritz_x
             # empty so the next iteration's cleanup does not double-free.
             ritz_x = DistributedTPSCIstate{T,N,1}[]
+            ritz_Hx = DistributedTPSCIstate{T,N,1}[]
         else
             for hx in ritz_Hx
                 destroy!(hx)

@@ -90,6 +90,7 @@ include("core/tpsci_pt1_wavefunction.jl")
 include("core/tpsci_pt2_energy.jl")
 include("core/tpsci_outer.jl")
 include("core/tpsci_multinode.jl")
+include("core/spt_multinode.jl")
 include("core/tpsci_sharded_davidson.jl")
 include("core/tps_cepa_sharded.jl")
 include("core/tpsci_helpers.jl")
@@ -98,8 +99,10 @@ include("core/tpsci.jl")
 include("core/dense_inner.jl")
 include("core/dense_outer.jl")
 include("core/spt_variance.jl")
+include("core/spt_variance_multinode.jl")
 
 include("core/tpsci_property.jl")
+include("core/tpsci_property_multinode.jl")
 include("core/absorption_spectrum.jl")
 
 #
@@ -124,15 +127,30 @@ export add_subspace!
 export add_fockconfig!
 export expand_each_fock_space!
 export compute_cluster_ops_2rdm
+export compute_cluster_ops_2rdm_distributed
 export add_spinfree_2rdm_ops!
+export add_spinfree_2rdm_ops_distributed!
 export subspace_product_tucker
+export subspace_product_tucker_multinode
+export spt_multinode
+export compute_spt_sigma_norm_blockwise_distributed
+export spt_variance_multinode
+export build_compressed_1st_order_state_distributed
+export build_sigma_distributed
+export compute_expectation_value_distributed
+export compute_pt2_energy_distributed
+export compute_pt2_energy_blockwise_distributed
+export spt_pt2_multinode
 export correlation_functions
 export compute_1rdm
 export compute_1rdm_sf
 export compute_1rdm_threaded
 export compute_1rdm_sf_threaded
+export compute_1rdm_distributed
+export compute_1rdm_sf_distributed
 export contract_1rdm_property
 export compute_1e_property_direct
+export compute_1e_property_direct_distributed
 export compute_transition_dipoles
 export compute_oscillator_strengths
 export absorption_spectrum
@@ -140,6 +158,7 @@ export print_stick_spectrum
 export compute_2rdm
 export compute_2rdm_threaded
 export compute_2rdm_blas
+export compute_2rdm_distributed
 export DistributedTPSCIstate
 export DistributedClusterOps
 export distribute_tpsci_state

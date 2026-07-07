@@ -6,6 +6,10 @@ using TPSChem
 
 const PROJECT_ROOT = dirname(dirname(@__DIR__))
 
+function project_root()
+    return get(ENV, "JULIAENV", PROJECT_ROOT)
+end
+
 function env_bool(name::AbstractString, default::Bool)
     value = lowercase(strip(get(ENV, name, string(default))))
     return value in ("1", "true", "yes", "y", "on")
@@ -24,19 +28,42 @@ function env_vector(name::AbstractString)
     return parse.(Float64, split(ENV[name], ","))
 end
 
+function input_data_path()
+    if haskey(ENV, "TPSCHEM_INPUT_JLD2")
+        return ENV["TPSCHEM_INPUT_JLD2"]
+    elseif length(ARGS) >= 1
+        ENV["TPSCHEM_INPUT_JLD2"] = ARGS[1]
+        return ARGS[1]
+    else
+        error("Set TPSCHEM_INPUT_JLD2 or pass the input JLD2 as ARGS[1]")
+    end
+end
+
 function init_multinode_workers!()
     if nworkers() == 1 && haskey(ENV, "TPSCHEM_MACHINE_FILE")
         hosts = strip.(readlines(ENV["TPSCHEM_MACHINE_FILE"]))
         filter!(!isempty, hosts)
         isempty(hosts) && error("TPSCHEM_MACHINE_FILE is empty")
+        if env_bool("TPSCHEM_SKIP_MASTER_NODE", false) && length(hosts) > 1
+            hosts = hosts[2:end]
+        end
         threads = get(ENV, "JULIA_NUM_THREADS", string(Threads.nthreads()))
         worker_env = Pair{String,String}[]
         for name in ("JULIA_DEPOT_PATH", "PATH", "OPENBLAS_NUM_THREADS",
                      "OMP_NUM_THREADS", "MKL_NUM_THREADS")
             haskey(ENV, name) && push!(worker_env, name => ENV[name])
         end
-        addprocs(hosts; exeflags="--project=$(PROJECT_ROOT) --threads=$(threads)",
+        addprocs(hosts; exeflags="--project=$(project_root()) --threads=$(threads)",
                  env=worker_env)
+    end
+    @sync for pid in workers()
+        pid == myid() && continue
+        @async remotecall_fetch(Core.eval, pid, Main,
+            :(begin
+                  import Pkg
+                  Pkg.activate($(project_root()); io=devnull)
+                  using TPSChem
+              end))
     end
     pids = TPSChem.ensure_tpsci_multinode_workers!(workers=workers())
     @printf("Master process: %i\n", myid())
@@ -49,9 +76,7 @@ function init_multinode_workers!()
 end
 
 function load_problem_data()
-    haskey(ENV, "TPSCHEM_INPUT_JLD2") ||
-        error("Set TPSCHEM_INPUT_JLD2 to a JLD2 file containing ints, clusters, d1, init_fspace, and cluster_bases")
-    data = JLD2.load(ENV["TPSCHEM_INPUT_JLD2"])
+    data = JLD2.load(input_data_path())
     for key in ("ints", "clusters", "d1", "init_fspace", "cluster_bases")
         haskey(data, key) || error("Input file is missing key '$key'")
     end

@@ -1,10 +1,13 @@
 using Distributed
 
 # Ensure at least 2 distributed workers for the sharded solver. Track whether we
-# added them so we can clean up and not disturb the rest of the suite.
+# added them so we can clean up and not disturb the rest of the suite. Spawn the
+# workers with the current active project so the stdlib `Pkg` is on their load
+# path (under `Pkg.test`, bare `addprocs` workers inherit a restricted load path
+# where `import Pkg` fails inside `ensure_tpsci_multinode_workers!`).
 _multinode_added_procs = Int[]
 if nprocs() == 1
-    _multinode_added_procs = addprocs(2)
+    _multinode_added_procs = addprocs(2; exeflags="--project=$(Base.active_project())")
 end
 
 using TPSChem
@@ -14,6 +17,7 @@ using Test
 using JLD2
 using LinearAlgebra
 using Printf
+using Random
 
 @testset "tpsci multinode sharded davidson" begin
     @load "_testdata_cmf_h8.jld2"
@@ -42,6 +46,7 @@ using Printf
         threaded=false, compress=true, pt=false, verbose=false)
 
     guess = deepcopy(v_ci)
+    Random.seed!(1234567)
     TPSChem.randomize!(guess)
     TPSChem.orthonormalize!(guess)
 

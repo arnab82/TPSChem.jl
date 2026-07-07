@@ -609,10 +609,18 @@ function _tpsci_sharded_local_normsq_typed(state::TPSCIstate{T,N,R}) where {T,N,
 end
 
 function LinearAlgebra.norm(state::DistributedTPSCIstate{T,N,R}) where {T,N,R}
+    # Fan out concurrently: a serial remotecall_fetch loop would pay
+    # (compute + latency) once per worker instead of once total.
+    partials = Dict{Int,Vector{T}}()
+    @sync for pid in state.workers
+        @async begin
+            partials[pid] = Distributed.remotecall_fetch(_tpsci_sharded_local_normsq,
+                                                         pid, state.id)
+        end
+    end
     norms = zeros(T, R)
     for pid in state.workers
-        norms .+= Distributed.remotecall_fetch(_tpsci_sharded_local_normsq,
-                                               pid, state.id)
+        norms .+= partials[pid]
     end
     return sqrt.(norms)
 end
@@ -625,10 +633,16 @@ end
 
 function overlap(s1::DistributedTPSCIstate{T,N,R}, s2::DistributedTPSCIstate{T,N,R}) where {T,N,R}
     s1.workers == s2.workers || error("DistributedTPSCIstate overlap currently requires identical worker lists")
+    partials = Dict{Int,Matrix{T}}()
+    @sync for pid in s1.workers
+        @async begin
+            partials[pid] = Distributed.remotecall_fetch(_tpsci_sharded_local_overlap,
+                                                         pid, s1.id, s2.id)
+        end
+    end
     out = zeros(T, R, R)
     for pid in s1.workers
-        out .+= Distributed.remotecall_fetch(_tpsci_sharded_local_overlap,
-                                             pid, s1.id, s2.id)
+        out .+= partials[pid]
     end
     return out
 end
@@ -976,7 +990,8 @@ function open_matvec_sharded(ci_vector::DistributedTPSCIstate{T,N,R}, cluster_op
                              threaded_worker=true,
                              blas_threads=1,
                              id=nothing,
-                             strategy::Symbol=:balanced) where {T,N,R}
+                             strategy::Symbol=:balanced,
+                             verbose=1) where {T,N,R}
     pids = _tpsci_sharded_cache_operator_problem!(cluster_ops, clustered_ham;
                                                   workers=workers,
                                                   blas_threads=blas_threads)
@@ -985,11 +1000,13 @@ function open_matvec_sharded(ci_vector::DistributedTPSCIstate{T,N,R}, cluster_op
     fock_bras = _tpsci_fois_fock_configs(ci_vector, cluster_ops, clustered_ham)
     chunks, _ = _tpsci_sharded_output_chunks(ci_vector, fock_bras, pids, strategy)
 
-    println(" In open_matvec_sharded")
-    println(" Number of output Fock jobs: ", length(fock_bras))
-    println(" Number of workers:          ", length(pids))
-    println(" Threads per worker enabled: ", threaded_worker)
-    flush(stdout)
+    if verbose > 0
+        println(" In open_matvec_sharded")
+        println(" Number of output Fock jobs: ", length(fock_bras))
+        println(" Number of workers:          ", length(pids))
+        println(" Threads per worker enabled: ", threaded_worker)
+        flush(stdout)
+    end
 
     length_maps = Dict{Int,Any}()
     @sync for pid in pids
@@ -1015,7 +1032,8 @@ function open_matvec_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
                              threaded_worker=true,
                              blas_threads=1,
                              id=nothing,
-                             strategy::Symbol=:balanced) where {T,N,R}
+                             strategy::Symbol=:balanced,
+                             verbose=1) where {T,N,R}
     pids = ensure_tpsci_multinode_workers!(workers=workers)
     pids == ci_vector.workers || error("open_matvec_sharded currently requires the same worker list as the input state")
     pids == cluster_ops.workers || error("open_matvec_sharded currently requires DistributedClusterOps on the same worker list")
@@ -1023,11 +1041,13 @@ function open_matvec_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
     fock_bras = _tpsci_fois_fock_configs(ci_vector, cluster_ops, clustered_ham)
     chunks, _ = _tpsci_sharded_output_chunks(ci_vector, fock_bras, pids, strategy)
 
-    println(" In open_matvec_sharded with DistributedClusterOps")
-    println(" Number of output Fock jobs: ", length(fock_bras))
-    println(" Number of workers:          ", length(pids))
-    println(" Threads per worker enabled: ", threaded_worker)
-    flush(stdout)
+    if verbose > 0
+        println(" In open_matvec_sharded with DistributedClusterOps")
+        println(" Number of output Fock jobs: ", length(fock_bras))
+        println(" Number of workers:          ", length(pids))
+        println(" Threads per worker enabled: ", threaded_worker)
+        flush(stdout)
+    end
 
     length_maps = Dict{Int,Any}()
     @sync for pid in pids
@@ -1154,7 +1174,8 @@ function tps_ci_matvec_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
                                workers=ci_vector.workers,
                                threaded_worker=true,
                                blas_threads=1,
-                               id=nothing) where {T,N,R}
+                               id=nothing,
+                               verbose=1) where {T,N,R}
     pids = _tpsci_sharded_cache_operator_problem!(cluster_ops, clustered_ham;
                                                   workers=workers,
                                                   blas_threads=blas_threads)
@@ -1162,11 +1183,13 @@ function tps_ci_matvec_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
     output_id = id === nothing ? gensym(:tpsci_shard_hv) : Symbol(id)
     chunks = _tpsci_owned_fock_chunks(ci_vector, pids)
 
-    println(" In tps_ci_matvec_sharded")
-    println(" Number of input Fock blocks: ", length(ci_vector.owners))
-    println(" Number of workers:           ", length(pids))
-    println(" Threads per worker enabled:  ", threaded_worker)
-    flush(stdout)
+    if verbose > 0
+        println(" In tps_ci_matvec_sharded")
+        println(" Number of input Fock blocks: ", length(ci_vector.owners))
+        println(" Number of workers:           ", length(pids))
+        println(" Threads per worker enabled:  ", threaded_worker)
+        flush(stdout)
+    end
 
     length_maps = Dict{Int,Any}()
     @sync for pid in pids
@@ -1189,7 +1212,8 @@ function tps_ci_matvec_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
                                workers=ci_vector.workers,
                                threaded_worker=true,
                                blas_threads=1,
-                               id=nothing) where {T,N,R}
+                               id=nothing,
+                               verbose=1) where {T,N,R}
     pids = ensure_tpsci_multinode_workers!(workers=workers)
     pids == ci_vector.workers || error("tps_ci_matvec_sharded currently requires the same worker list as the input state")
     pids == cluster_ops.workers || error("tps_ci_matvec_sharded currently requires DistributedClusterOps on the same worker list")
@@ -1202,11 +1226,13 @@ function tps_ci_matvec_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
     output_id = id === nothing ? gensym(:tpsci_shard_hv) : Symbol(id)
     chunks = _tpsci_owned_fock_chunks(ci_vector, pids)
 
-    println(" In tps_ci_matvec_sharded with DistributedClusterOps")
-    println(" Number of input Fock blocks: ", length(ci_vector.owners))
-    println(" Number of workers:           ", length(pids))
-    println(" Threads per worker enabled:  ", threaded_worker)
-    flush(stdout)
+    if verbose > 0
+        println(" In tps_ci_matvec_sharded with DistributedClusterOps")
+        println(" Number of input Fock blocks: ", length(ci_vector.owners))
+        println(" Number of workers:           ", length(pids))
+        println(" Threads per worker enabled:  ", threaded_worker)
+        flush(stdout)
+    end
 
     length_maps = Dict{Int,Any}()
     @sync for pid in pids
@@ -1564,10 +1590,16 @@ function compute_expectation_value_sharded_h0(ci_vector::DistributedTPSCIstate{T
     _tpsci_sharded_cache_operator_problem!(cluster_ops, nothing;
                                            workers=workers,
                                            blas_threads=blas_threads)
+    partials = Dict{Int,Vector{T}}()
+    @sync for pid in ci_vector.workers
+        @async begin
+            partials[pid] = Distributed.remotecall_fetch(_tpsci_sharded_local_h0_expectation,
+                                                         pid, ci_vector.id, opstring)
+        end
+    end
     out = zeros(T, R)
     for pid in ci_vector.workers
-        out .+= Distributed.remotecall_fetch(_tpsci_sharded_local_h0_expectation,
-                                             pid, ci_vector.id, opstring)
+        out .+= partials[pid]
     end
     return out
 end
@@ -1658,9 +1690,16 @@ function compute_pt1_wavefunction_sharded(ci_vector::DistributedTPSCIstate{T,N,R
         _tpsci_sharded_cache_operator_problem!(cluster_ops, clustered_ham;
                                                workers=workers,
                                                blas_threads=blas_threads)
+        e2_partials = Dict{Int,Vector{T}}()
+        @sync for pid in sig.workers
+            @async begin
+                e2_partials[pid] = Distributed.remotecall_fetch(
+                    _tpsci_sharded_local_apply_pt1_denominator!,
+                    pid, sig.id, H0, E0, norms)
+            end
+        end
         for pid in sig.workers
-            e2 .+= Distributed.remotecall_fetch(_tpsci_sharded_local_apply_pt1_denominator!,
-                                                pid, sig.id, H0, E0, norms)
+            e2 .+= e2_partials[pid]
         end
     end
     flush(stdout)
@@ -1694,8 +1733,14 @@ function ensure_tpsci_multinode_workers!(; workers=Distributed.workers())
         @async Distributed.remotecall_fetch(
             Core.eval, pid, Main,
             :(begin
+                  # Restore the default load path first: under `Pkg.test`, workers
+                  # inherit a restricted `JULIA_LOAD_PATH` (sandbox only) that omits
+                  # `@stdlib`, so even `import Pkg` fails. Resetting to the standard
+                  # entries makes the stdlib reachable before we touch Pkg.
+                  copy!(LOAD_PATH, ["@", "@v#.#", "@stdlib"])
                   import Pkg
                   Pkg.activate($project_root; io=devnull)
+                  Pkg.instantiate(; io=devnull)
                   using TPSChem
               end))
     end
