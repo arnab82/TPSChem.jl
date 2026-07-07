@@ -453,6 +453,27 @@ function overlap(v1::TPSCIstate{T,N,R}, v2::TPSCIstate{T,N,R}) where {T,N,R}
     #=}}}=#
 end
 
+"""
+    orth_dot(v1::TPSCIstate{T,N,R}, v2::TPSCIstate{T,N,R}) where {T,N,R}
+
+Root-wise dot product between `v1` and `v2`.
+
+Returns the diagonal of `overlap(v1, v2)`, i.e. one dot product per root.
+"""
+function orth_dot(v1::TPSCIstate{T,N,R}, v2::TPSCIstate{T,N,R}) where {T,N,R}
+    dots = zeros(T,R)
+    for (fock,configs) in v2.data
+        haskey(v1, fock) || continue
+        for (config,coeffs) in configs
+            haskey(v1[fock], config) || continue
+            for r in 1:R
+                dots[r] += v1[fock][config][r] * coeffs[r]
+            end
+        end
+    end
+    return dots
+end
+
 
 """
     orth!(v1::TPSCIstate{T,N,R}) where {T,N,R}
