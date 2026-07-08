@@ -16,6 +16,93 @@ Notation used throughout:
   remotecall_fetch`), so a stage's wall time is the slowest worker, not the
   sum.
 
+If you have never run a distributed or multinode job before, read §0 first —
+it builds the mental model and gets you a working run before the deep dive.
+
+---
+
+## 0. New to distributed / multinode runs? Start here
+
+**Why bother.** Some calculations produce a CI vector (the list of coefficients
+we solve for) that is larger than the RAM of any single computer — hundreds of
+GB or more. You cannot hold it on one machine, so you spread it across several
+machines ("nodes") and have them cooperate. That is all "multinode" means here.
+
+**Process vs. thread (the one distinction to internalize).** Two different
+kinds of parallelism are used together:
+
+- A **thread** shares memory with its siblings inside *one* program. Threads
+  are how each node uses its many CPU cores on the data it already has. No
+  copying needed — they all see the same arrays.
+- A **process** (here a Julia "worker") has its *own separate memory*, even if
+  it happens to run on the same physical machine. Two processes cannot see each
+  other's arrays; to share data one must **send it over a connection**
+  (serialize → socket → deserialize). This is what lets workers live on
+  *different* nodes.
+
+So: **one worker process per node, many threads inside each worker.** Threads
+handle on-node core parallelism for free; processes handle across-node scaling
+at the cost of having to explicitly move any data that must cross between them.
+(No MPI is involved — this uses Julia's built-in `Distributed` standard
+library.)
+
+**Master vs. worker.** One process is the **master** (`M`): it coordinates, holds
+only small *metadata* (who owns what, sizes, energies), and never touches the
+bulk data. The other processes are **workers** (`W1, W2, …`): each holds a
+*slice* of the big data and does the heavy math on its slice.
+
+**The core trick: shard, don't gather.** The CI vector is split into pieces
+("**shards**") by **Fock sector** (a Fock sector is one block of the vector —
+one way of distributing the electrons among the orbital clusters). Each shard
+lives on exactly one worker and *stays there*. Work is organized so that a
+worker mostly needs its own shard; when it briefly needs a piece of someone
+else's, it fetches just that piece. Crucially, the full vector is **never
+reassembled** ("gathered") onto any single process — because it wouldn't fit.
+"Never-gather" is the whole point: metadata and small numbers move freely, but
+the 500-GB object never does.
+
+Everything in §1–§5 is just the careful bookkeeping that makes "keep each shard
+in place, move only small things" actually work for each calculation.
+
+### Run your first one (local, two workers on your laptop)
+
+You don't need a cluster to try it — you can put both "nodes" on one machine as
+two worker processes. Start Julia with two workers and run the across-node
+Davidson driver on a small problem:
+
+```bash
+export TPSCHEM_INPUT_JLD2=/path/to/small_problem.jld2   # needs ints, clusters, d1, init_fspace, cluster_bases
+export TPSCHEM_NROOTS=1
+export TPSCHEM_H_STORAGE=auto
+julia -p 2 --project examples/multinode/tpsci_sharded_davidson_driver.jl
+```
+
+`-p 2` launches two worker processes; the driver's `init_multinode_workers!`
+(in `common.jl`) sets them up. **What success looks like:** it prints the master
+and worker pids and their thread counts, a "Block-sparse H" size line, a few
+Davidson iterations, then `Converged eigenvalues`. On a real cluster you
+instead submit one of the `run_*_4nodes.slurm` scripts (which builds a node
+list and calls the same driver) — see `README.md` for the per-driver env vars.
+
+### Minimum vocabulary
+
+| Term | Meaning here |
+| --- | --- |
+| node | one physical machine in the cluster |
+| process / worker | a Julia program with its own private memory; one per node |
+| master (`M`) | the coordinating process; holds only metadata |
+| thread | a unit of parallelism *inside* one process, sharing its memory |
+| shard | one piece of a distributed object, living on one worker |
+| Fock sector | the block used to split the CI vector across workers |
+| gather | reassemble a full distributed object on one process (avoided in production) |
+| FOIS | first-order interacting space — the configurations one step "outside" the current space, searched for what to add next |
+| PT1 vector | the perturbative estimate of those outside coefficients; large ones get selected |
+| `destroy!` | free a distributed object on *every* worker — required, or memory leaks there |
+
+With that in hand, §1 describes the shared machinery and §2–§4 trace each
+workflow. If a run breaks, jump to §5 — most multinode failures are harness
+issues with known fixes, not physics.
+
 ---
 
 ## 1. The shared machinery (read once)
@@ -261,12 +348,28 @@ Returns `(E_corr per root, e0 .+ E_corr)` and the sharded Q vector.
 
 ## 4. SPT (`subspace_product_tucker`) multinode, step by step
 
-(`subspace_product_tucker_multinode`, `spt_multinode.jl`.) SPT states are
-Tucker-compressed; the philosophy here differs from §2–3: **the state itself
-stays on the master** (it is compressed, hence small); what gets distributed
-are the expensive *job loops* — FOIS construction, sigma builds, expectation
-values, PT2 sums. The Tucker compression and the variational CI solve remain
-master-local.
+SPT states are Tucker-compressed. There are **two** multinode paths; which you
+want depends on whether the *compressed* state fits a single node:
+
+- **Path A — compute-distributed (`subspace_product_tucker_multinode`).** The
+  state stays on the master; only the expensive *job loops* (FOIS, sigma builds,
+  expectation values, PT2 sums) are scattered to workers. Simple and fast, but
+  the master still holds the whole FOIS / PT1 / variational state, and the
+  variational solve is a node-local `ci_solve` — so it only works when that
+  compressed state fits one node. Use it for **speed** when memory is not the
+  bottleneck.
+- **Path B — never-gather (`subspace_product_tucker_sharded`).** The variational
+  vector, the FOIS, and the PT1 all stay `DistributedSPTstate`s across the
+  workers for the whole loop; nothing is ever gathered onto the master. Use it
+  when the **compressed SPT state is itself larger than a node** — the case
+  Path A cannot handle. This mirrors the never-gather TPSCI loop of §2.
+
+> Do not assume "Tucker-compressed ⇒ small". Compressed SPT states can be large;
+> when they overflow a node, Path A's master-side FOIS/PT1 and its node-local
+> `ci_solve` (which holds `~2·max_ss_vecs·R` full vectors) are the ceiling —
+> that is exactly what Path B removes.
+
+### Path A — compute-distributed (state on the master)
 
 Per SPT iteration:
 
@@ -320,45 +423,106 @@ return only per-root energy partials, which M sums — move 3. The σ·σ varian
 ### Step 4 — grow and solve variationally (master-local)
 
 M: `nonorth_add!(var_vec, pt1_vec)` → `compress` → `orthonormalize!` →
-`ci_solve` (the local Tucker CI). This is deliberate: the compressed SPT
-variational state is small enough for one node, and the Tucker solver is not
-distributed. If cluster ops were sharded (`DistributedClusterOps`), they are
-gathered for this one step (with a warning).
+`ci_solve` (the local Tucker CI). This is Path A's key assumption — and its
+limit: the whole compressed variational state must fit one node, and the local
+`ci_solve` Davidson holds `~2·max_ss_vecs·R` full copies of it. When that
+overflows a node, switch to Path B, whose `spt_ci_davidson_sharded` keeps those
+subspace vectors sharded. If cluster ops were sharded (`DistributedClusterOps`),
+Path A gathers them for this one step (with a warning); Path B does not.
 
 ### Step 5 — converged?
 
 Compare `e_var` with the previous iteration; loop to Step 1.
 
-**So the SPT division of labor is:** distributed = FOIS jobs, sigma builds,
+**So the Path A division of labor is:** distributed = FOIS jobs, sigma builds,
 expectation values, PT2/σ² sums (all "scatter jobs, sum/merge results");
 local = compression, basis projection, variational Tucker CI.
+
+### Path B — never-gather sharded SPT
+
+`subspace_product_tucker_sharded` reuses the §2 sharded machinery. The state is a
+`DistributedSPTstate` — the SPT analogue of `DistributedTPSCIstate`: Tucker
+blocks split by Fock sector, the master holding only metadata. Ownership is
+`:hash`, so any two states sharing a Fock sector place it on the **same** worker;
+that makes the per-block ops (compress, `nonorth_add!`, `project_into_new_basis`)
+fully worker-local — only the matvec and FOIS fetch across Fock sectors (move 2).
+
+Each single-node step becomes a sharded one:
+
+1. **compress / orthonormalize** — `compress_sharded` (per block, no comms);
+   `orthonormalize!` (R×R Gram via sharded `overlap`, then a worker-local
+   rotation of the cores).
+2. **e0 = ⟨0|H|0⟩ and ⟨S²⟩** — `spt_expectation_sharded`: apply the operator with
+   the never-gather Tucker matvec (`build_sigma_sharded`), then take the sharded
+   overlap diagonal. Only R numbers reach M (move 3).
+3. **FOIS** — `build_compressed_1st_order_state_sharded`: M assigns each output
+   Fock sector to a worker (reference sectors pinned to their current owner); the
+   worker fetches the reference ket blocks it needs (move 2) and runs the
+   *unchanged* local kernel `_build_compressed_1st_order_state_job`. The FOIS is
+   born sharded — never assembled on the master.
+4. **PT1 / PT2** — `compute_pt1_wavefunction_sharded`: rotate the FOIS to its
+   pseudo-canonical basis (shard-local, giving the diagonal `Fdiag`), form `Sx`,
+   then `⟨X|H|0⟩` and `⟨X|F|0⟩` with the never-gather matvec, and assemble
+   `σ − XF0 − Sx(E0−F0)`, the denominators, and `ecorr` from shard-local core
+   arithmetic + sharded reductions. No full FOIS/PT1 copy on the master.
+5. **grow + solve** — `nonorth_add_sharded!` grows the variational space in place;
+   `compress_sharded` + `orthonormalize!`; `project_into_new_basis_sharded`
+   carries the previous solution as the guess; then the **distributed Tucker CI
+   solver** `spt_ci_davidson_sharded` diagonalizes in the fixed Tucker basis with
+   subspace vectors that are themselves sharded. It shares the *same* block
+   Davidson core as the sharded TPSCI solver, via the `AbstractShardedState`
+   supertype — so the ghost-eigenvalue-safe restart (§2 Step 1.6) is inherited.
+
+Everything crossing the network is a k×k reduction or a single block fetch;
+validated against single-node to machine precision (Davidson 8.9e-15, PT2
+1.8e-15, full loop to 10 digits). Not supported here (use Path A / `spt_multinode`):
+the S² spin extension (`thresh_spin`) — the sharded driver errors on it. A stored
+block-sparse Tucker-H (Tier A) is future work; the sharded matvec is matrix-free.
+
+**Energy-only shortcuts (memory-safe under either path):** if you only need the
+PT2 *energy* or the σ² variance, `compute_pt2_energy_distributed` and
+`compute_spt_sigma_norm_blockwise_distributed` are blockwise — a worker builds one
+FOIS sector, extracts its scalar, frees it, and returns only per-root numbers, so
+no global σ is ever stored anywhere (even under Path A).
+
+Concrete end-to-end script: `run_spt_multinode_cr2_morokuma.jl` (and the TPSCI
+sibling `run_tpsci_multinode_cr2_morokuma.jl`).
 
 ---
 
 ## 5. What is identical to single-node, and what to check when things break
 
 The physics kernels — `contract_matrix_element`, `_open_matvec_thread_job`,
-`_build_compressed_1st_order_state_job`, `_pt2_job*`, denominators — are
-**the same functions** the single-node code calls. The multinode layer only
-decides *who* runs them and combines partials over disjoint work. That is why
-every distributed routine is tested against its single-node sibling
-(RDMs/σ²/expectations to ~1e-12; solver energies to ~1e-7–1e-14), and why
-multinode failures are almost always harness issues:
+`_build_compressed_1st_order_state_job`, `_pt2_job*`, `build_sigma!`,
+denominators — are **the same functions** the single-node code calls. The
+multinode layer only decides *who* runs them and combines partials over disjoint
+work. That is why every distributed routine is tested against its single-node
+sibling (RDMs/σ²/expectations to ~1e-12; solver energies to ~1e-7–1e-14; the
+sharded SPT solver/PT2 to ~1e-15), and why multinode failures are almost always
+harness issues:
 
 | Symptom | Likely cause |
 |---|---|
 | `Package Pkg not found` on worker | spawned under `Pkg.test` sandbox; fixed in `ensure_tpsci_multinode_workers!` (restores `LOAD_PATH`); spawn test workers with `--project` |
-| `requires matching Fock ownership` | mixing sharded states from independent `distribute_tpsci_state` calls; derive related states from each other instead |
-| `No sharded TPSCI state cached with id` | use-after-`destroy!`, or wrong worker list |
+| `requires matching Fock ownership` | mixing sharded states from independent `distribute_tpsci_state` / `distribute_spt_state` calls; derive related states from each other, or use `:hash` so ownership is a stable function of the Fock sector |
+| `No sharded TPSCI state cached` / `No sharded SPT state cached` | use-after-`destroy!`, or wrong worker list |
 | worker memory grows | leaked sharded states — audit `destroy!` |
-| Davidson energies dive below the ground state | pre-2026-07-07 build without the restart re-orthonormalization |
+| Davidson energies dive below the ground state | pre-2026-07-07 build without the restart re-orthonormalization (shared by the TPSCI and SPT sharded solvers via `AbstractShardedState`) |
 
 Memory rules: `destroy!` every sharded state and block-H you create; the
 solvers model this (per-iteration frees, `finally` blocks). Use
-`sharded_state_summary` / `cluster_ops_summary` to audit per-worker sizes.
-`collect_tpsci_state` is debug-only.
+`sharded_state_summary` / `sharded_spt_summary` / `cluster_ops_summary` to audit
+per-worker sizes. `collect_tpsci_state` / `collect_spt_state` are debug-only.
 
-When to use what: single node while everything fits (fastest, zero
-serialization); replicated multinode when dense H or core count is the
-blocker; sharded (`tpsci_ci_sharded`, `do_tps_sharded_cepa`) when the CI/Q
-vector itself outgrows a node.
+When to use what:
+
+- **Single node** while everything fits — fastest, zero serialization.
+- **Replicated / compute-distributed multinode** (`tpsci_ci_multinode`,
+  `subspace_product_tucker_multinode`) — when dense H or core count is the
+  blocker but the vector/state still fits a node.
+- **Sharded / never-gather** (`tpsci_ci_sharded`, `do_tps_sharded_cepa`,
+  `subspace_product_tucker_sharded`) — when the CI / Q / SPT vector itself
+  outgrows a node.
+- **Energy-only** (`compute_pt2_energy_distributed`,
+  `compute_spt_sigma_norm_blockwise_distributed`) — memory-safe at any size when
+  you only need the PT2 energy or σ² variance.

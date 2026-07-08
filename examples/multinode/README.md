@@ -149,6 +149,78 @@ rep = TPSChem.sharded_H_memory_report(dvar, clustered_ham)   # (dim, nfocks, nnz
 The same solver is available inside the selected-CI driver via
 `tpsci_ci_multinode(...; use_sharded=true, h_storage=:auto, max_mem_H=200.0)`.
 Note: in `tpsci_ci_multinode` only the diagonalization is sharded; the
-PT/selection steps still gather `vec_var` on the master. A fully never-gather
-selected-CI loop is future work (needs sharded selection + an ownership-
-reconciling merge).
+PT/selection steps still gather `vec_var` on the master.
+
+## Never-gather selected TPSCI
+
+When even the *variational* CI vector must never be gathered between selected-CI
+iterations, use `tpsci_ci_sharded` (`tpsci_ci_sharded_driver.jl`). The vector
+stays a `DistributedTPSCIstate` for the **entire** selected-CI loop: sharded
+Davidson diagonalization, sharded PT1 selection
+(`compute_pt1_wavefunction_sharded`), sharded `clip!`, and an ownership-
+reconciling `add!` grow the variational space in place. No full CI vector is
+ever materialized on the master or on any single node. The (small) starting
+reference is distributed once and never gathered again; the returned `vec_var`
+stays sharded (`collect_tpsci_state` it only if it fits one node).
+
+```bash
+export TPSCHEM_INPUT_JLD2=/path/to/problem_with_ref_vec.jld2
+export TPSCHEM_NROOTS=3
+export TPSCHEM_THRESH_CIPSI=1e-3     # PT1 selection threshold
+export TPSCHEM_THRESH_FOI=1e-5       # FOIS screening threshold
+export TPSCHEM_MAX_ITER=10           # outer selected-CI iterations
+export TPSCHEM_MAX_SS_VECS=4         # keep small: each subspace vector is another full vector
+export TPSCHEM_H_STORAGE=auto        # auto | blocks | matrixfree
+export TPSCHEM_MAX_MEM_H=200         # GB budget for the stored block-sparse H
+sbatch examples/multinode/run_tpsci_ci_sharded_4nodes.slurm
+```
+
+Entry point: `tpsci_ci_sharded(ref, cluster_ops, clustered_ham; thresh_cipsi,
+thresh_foi, h_storage=:auto, max_mem_H, ...)`. The storage tiers
+(`TPSCHEM_H_STORAGE`) behave exactly as for `tps_ci_davidson_sharded` above.
+
+Intentional limitations (documented, not bugs): `tpsci_ci_sharded` errors on
+`incremental` sigma updates and the `thresh_spin` S² space extension — use
+`tpsci_ci_multinode` for those. Config-level `thresh_asci`/`thresh_var` clipping
+is safe, but clipping so aggressively that an entire Fock sector leaves the
+search vector while it remains in the variational state can trip the `add!`
+ownership guard.
+
+## Never-gather variational SPT
+
+When the Tucker-compressed SPT state itself outgrows a node, run the variational
+SPT loop (`subspace_product_tucker`) with `subspace_product_tucker_sharded`: the
+variational vector, the FOIS, and the PT1 all stay `DistributedSPTstate`s across
+the workers for the whole loop and are never assembled on the master. It uses the
+distributed Tucker CI solver `spt_ci_davidson_sharded` instead of a node-local
+`ci_solve`.
+
+Entry points: `subspace_product_tucker_sharded(ref, cluster_ops, clustered_ham;
+thresh_var, thresh_foi, thresh_pt, ...)`, `compute_pt1_wavefunction_sharded`,
+`spt_ci_davidson_sharded`, `build_compressed_1st_order_state_sharded`. Deferred:
+Tier-A stored block-sparse Tucker-H (matrix-free only for now) and the S² spin
+extension (`thresh_spin`) — the driver errors on the latter; use
+`subspace_product_tucker` / `spt_multinode`.
+
+## Concrete end-to-end Cr2 examples
+
+`run_tpsci_multinode_cr2_morokuma.jl` and `run_spt_multinode_cr2_morokuma.jl` are
+self-contained scripts (in the spirit of `examples/bimetallics` /
+`examples/notes/tpsci.jl`) that build the spin cluster bases and reference Fock
+sectors / P-space for the Cr2 Morokuma trimer and run the never-gather TPSCI /
+SPT loops. They read `ints`, `clusters`, `d1` from a CMF JLD2
+(`test/data_cmf_13_cr2_morokuma.jld2` works) and shard the cluster operators.
+
+```bash
+# On a cluster (one worker per node) via the generic launcher:
+sbatch run_multinode.sh run_spt_multinode_cr2_morokuma.jl \
+       ../../test/data_cmf_13_cr2_morokuma.jld2
+
+# Locally with two workers:
+julia -p 2 --project run_tpsci_multinode_cr2_morokuma.jl \
+       ../../test/data_cmf_13_cr2_morokuma.jld2
+```
+
+Both accept the same env knobs as the drivers above (`TPSCHEM_CLUSTER_MAX_ROOTS`,
+`TPSCHEM_NROOTS`, `TPSCHEM_THRESH*`, `TPSCHEM_MAX_ITER`, `TPSCHEM_NBODY`,
+`TPSCHEM_H_STORAGE`, `TPSCHEM_BLAS_THREADS`, `TPSCHEM_OUTPUT_JLD2`, ...).
