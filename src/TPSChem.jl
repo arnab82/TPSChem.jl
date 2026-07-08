@@ -92,6 +92,7 @@ include("core/tpsci_outer.jl")
 include("core/tpsci_multinode.jl")
 include("core/spt_multinode.jl")
 include("core/tpsci_sharded_davidson.jl")
+include("core/spt_sharded.jl")
 include("core/tps_cepa_sharded.jl")
 include("core/tpsci_helpers.jl")
 include("core/tpsci.jl")
@@ -133,6 +134,13 @@ export add_spinfree_2rdm_ops_distributed!
 export subspace_product_tucker
 export subspace_product_tucker_multinode
 export spt_multinode
+export distribute_spt_state
+export collect_spt_state
+export build_sigma_sharded
+export build_compressed_1st_order_state_sharded
+export spt_ci_davidson_sharded
+export compute_pt1_wavefunction_sharded
+export subspace_product_tucker_sharded
 export compute_spt_sigma_norm_blockwise_distributed
 export spt_variance_multinode
 export build_compressed_1st_order_state_distributed

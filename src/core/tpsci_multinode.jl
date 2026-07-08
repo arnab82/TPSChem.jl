@@ -23,6 +23,19 @@ const _TPSCI_SHARDED_CLUSTER_OPS = Dict{Symbol,Any}()
 const _TPSCI_SHARDED_CLUSTER_H0_DIAGS = Dict{Tuple{Symbol,String},Any}()
 
 """
+    AbstractShardedState{T,N,R} <: AbstractState
+
+Common supertype for metadata handles of states whose per-Fock-sector payloads
+live on distributed workers (`DistributedTPSCIstate`, `DistributedSPTstate`).
+The across-node Davidson core (`tpsci_sharded_davidson.jl`) is written against
+this supertype so a single, carefully-tuned solver drives both the TPSCI and the
+SPT sharded backends; concrete sharded primitives (`overlap`, `add_scaled!`,
+`norm`, `scale!`, `copy_sharded_state`, `similar_sharded_state`,
+`precondition_sharded`, ...) dispatch on the runtime type.
+"""
+abstract type AbstractShardedState{T,N,R} <: AbstractState end
+
+"""
     DistributedTPSCIstate{T,N,R}
 
 Metadata handle for a TPSCI vector whose coefficient/configuration blocks live
@@ -30,7 +43,7 @@ on distributed workers. The master stores only ownership, lengths, and offsets;
 each worker stores an ordinary local `TPSCIstate` containing the Fock sectors it
 owns.
 """
-mutable struct DistributedTPSCIstate{T,N,R} <: AbstractState
+mutable struct DistributedTPSCIstate{T,N,R} <: AbstractShardedState{T,N,R}
     id::Symbol
     clusters::Vector{MOCluster}
     workers::Vector{Int}

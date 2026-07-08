@@ -509,7 +509,7 @@ end
 
 # Modified Gram-Schmidt: orthogonalize `t` (a sharded R=1 vector) against every
 # vector in `basis`, in place. Returns the norm of the surviving component.
-function _mgs_against!(t::DistributedTPSCIstate{T,N,1}, basis) where {T,N}
+function _mgs_against!(t::AbstractShardedState{T,N,1}, basis) where {T,N}
     for _ in 1:2
         for v in basis
             c = overlap(t, v)[1, 1]
@@ -520,10 +520,11 @@ function _mgs_against!(t::DistributedTPSCIstate{T,N,1}, basis) where {T,N}
     return norm(t)[1]
 end
 
-function _restart_from_ritz_basis!(ritz_x::Vector{<:DistributedTPSCIstate{T,N,1}},
+function _restart_from_ritz_basis!(ritz_x::Vector{<:AbstractShardedState{T,N,1}},
                                    apply_H, lindep_thresh) where {T,N}
-    V = DistributedTPSCIstate{T,N,1}[]
-    HV = DistributedTPSCIstate{T,N,1}[]
+    S = eltype(ritz_x)
+    V = S[]
+    HV = S[]
     Hss = zeros(T, 0, 0)
     for x in ritz_x
         nrm = _mgs_against!(x, V)
@@ -575,13 +576,14 @@ where `ritz_vectors` is a `Vector{DistributedTPSCIstate{T,N,1}}` of length
 `nroots`. All transient sharded vectors are `destroy!`ed; the returned Ritz
 vectors are the caller's to free.
 """
-function _tps_ci_davidson_sharded_core(seeds::Vector{<:DistributedTPSCIstate{T,N,1}},
-                                       apply_H, Hdiag::DistributedTPSCIstate{T,N,1};
+function _tps_ci_davidson_sharded_core(seeds::Vector{<:AbstractShardedState{T,N,1}},
+                                       apply_H, Hdiag::AbstractShardedState{T,N,1};
                                        nroots::Int, conv_thresh::Float64,
                                        max_ss_vecs::Int, max_iter::Int,
                                        lindep_thresh::Float64, verbose::Int) where {T,N}
-    V = DistributedTPSCIstate{T,N,1}[]
-    HV = DistributedTPSCIstate{T,N,1}[]
+    S = eltype(seeds)
+    V = S[]
+    HV = S[]
     Hss = zeros(T, 0, 0)
     for s in seeds
         Hss = _append_direction!(V, HV, Hss, s, apply_H)
@@ -589,7 +591,7 @@ function _tps_ci_davidson_sharded_core(seeds::Vector{<:DistributedTPSCIstate{T,N
 
     cap = max_ss_vecs * nroots
     theta = zeros(T, nroots)
-    ritz_x = DistributedTPSCIstate{T,N,1}[]
+    ritz_x = S[]
     converged = false
 
     for iter in 1:max_iter
@@ -602,10 +604,10 @@ function _tps_ci_davidson_sharded_core(seeds::Vector{<:DistributedTPSCIstate{T,N
         for x in ritz_x
             destroy!(x)
         end
-        ritz_x = DistributedTPSCIstate{T,N,1}[]
-        ritz_Hx = DistributedTPSCIstate{T,N,1}[]
+        ritz_x = S[]
+        ritz_Hx = S[]
         resnorms = zeros(T, nroots)
-        newdirs = DistributedTPSCIstate{T,N,1}[]
+        newdirs = S[]
 
         for s in 1:nroots
             x = _ritz_vector(V, view(y, :, s), T)
@@ -670,8 +672,8 @@ function _tps_ci_davidson_sharded_core(seeds::Vector{<:DistributedTPSCIstate{T,N
             end
             # Ritz vectors are now the basis; do not free them here. Mark ritz_x
             # empty so the next iteration's cleanup does not double-free.
-            ritz_x = DistributedTPSCIstate{T,N,1}[]
-            ritz_Hx = DistributedTPSCIstate{T,N,1}[]
+            ritz_x = S[]
+            ritz_Hx = S[]
         else
             for hx in ritz_Hx
                 destroy!(hx)
