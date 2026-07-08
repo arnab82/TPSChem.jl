@@ -6,7 +6,7 @@ sharded `DistributedTPSCIstate`s and are never gathered onto the master. It is
 the missing piece for diagonalizing the variational Hamiltonian when the CI
 vector is larger than a single node's memory.
 
-Two Hamiltonian-application backends are provided (see `SHARDED_DAVIDSON_PLAN.md`):
+Two Hamiltonian-application backends are provided (see `examples/multinode/SHARDED_DAVIDSON_PLAN.md`):
 
   * Tier A (`:blocks`): the Hamiltonian is built once as distributed, block-sparse
     dense Fock-pair blocks and reused via block GEMV on every matvec. This

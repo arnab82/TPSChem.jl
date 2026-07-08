@@ -3,7 +3,7 @@ Never-gather (sharded) SPT: a `DistributedSPTstate` whose per-Fock-sector Tucker
 blocks live across workers and are never gathered onto the master, plus a
 distributed Tucker CI solver (`spt_ci_davidson_sharded`).
 
-Motivation (see `SHARDED_SPT_PLAN.md`): Tucker-compressed SPT states are big in
+Motivation (see `examples/multinode/SHARDED_SPT_PLAN.md`): Tucker-compressed SPT states are big in
 practice, so the existing `subspace_product_tucker_multinode` — which gathers the
 full FOIS/variational state on the master and runs a *local* `ci_solve` Davidson
 holding many full vectors — is master-memory-bound. Here the variational vector
