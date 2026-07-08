@@ -218,6 +218,69 @@ end
     TPSChem.destroy!(dg)
 end
 
+@testset "incremental sharded block-H update" begin
+    @load "_testdata_cmf_h8.jld2"
+    ref_fock = FockConfig(init_fspace)
+    cluster_bases = TPSChem.compute_cluster_eigenbasis(ints, clusters;
+        verbose=0, max_roots=4, init_fspace=init_fspace, rdm1a=d1.a, rdm1b=d1.b)
+    clustered_ham = TPSChem.extract_ClusteredTerms(ints, clusters)
+    cluster_ops = TPSChem.compute_cluster_ops(cluster_bases, ints)
+    TPSChem.add_cmf_operators!(cluster_ops, cluster_bases, ints, d1.a, d1.b)
+
+    ci = TPSChem.TPSCIstate(clusters, ref_fock, R=1, T=Float64)
+    ci[ref_fock][ClusterConfig([1, 1])] = [1.0]
+    ci[ref_fock][ClusterConfig([2, 1])] = [0.5]
+
+    dg = TPSChem.distribute_tpsci_state(deepcopy(ci); workers=workers(),
+                                        strategy=:balanced)
+
+    # Stored H on the small space, then grow the space (selected-CI style) and
+    # extend the SAME stored H incrementally.
+    bh = TPSChem.build_block_h_sharded(dg, cluster_ops, clustered_ham;
+                                       workers=workers(), verbose=0)
+    sig = TPSChem.open_matvec_sharded(dg, cluster_ops, clustered_ham;
+        nbody=4, thresh=1e-8, prescreen=false, verbose=0)
+    TPSChem.zero!(sig)
+    TPSChem.add!(dg, sig)
+    TPSChem.destroy!(sig)
+    TPSChem.update_block_h_sharded!(bh, dg, cluster_ops, clustered_ham;
+                                    workers=workers())
+
+    # Reference: H built from scratch on the grown space.
+    bh_fresh = TPSChem.build_block_h_sharded(dg, cluster_ops, clustered_ham;
+                                             workers=workers(), verbose=0)
+    @test bh.nnz == bh_fresh.nnz
+
+    # A random vector on the grown space: the incrementally updated H, the
+    # freshly built H, and the matrix-free matvec must all agree.
+    lv = TPSChem.collect_tpsci_state(dg)
+    Random.seed!(42)
+    TPSChem.randomize!(lv)
+    dv = TPSChem.distribute_tpsci_state(lv; workers=workers(),
+                                        strategy=:balanced)
+
+    h_upd = TPSChem.apply_sharded_H(bh, dv)
+    h_new = TPSChem.apply_sharded_H(bh_fresh, dv)
+    h_mf = TPSChem.tps_ci_matvec_sharded(dv, cluster_ops, clustered_ham;
+                                         workers=workers(), verbose=0)
+
+    l_upd = TPSChem.collect_tpsci_state(h_upd)
+    l_new = TPSChem.collect_tpsci_state(h_new)
+    l_mf = TPSChem.collect_tpsci_state(h_mf)
+    for (fock, configs) in l_new.data
+        for (config, coeffs) in configs
+            @test isapprox(l_upd[fock][config][1], coeffs[1], atol=1e-12)
+            @test isapprox(l_mf[fock][config][1], coeffs[1], atol=1e-10)
+        end
+    end
+
+    for s in (h_upd, h_new, h_mf, dv, dg)
+        TPSChem.destroy!(s)
+    end
+    TPSChem.destroy!(bh)
+    TPSChem.destroy!(bh_fresh)
+end
+
 if RUN_HEAVY_MULTINODE
 @testset "never-gather tpsci_ci_sharded vs single-node tpsci_ci" begin
     @load "_testdata_cmf_h8.jld2"

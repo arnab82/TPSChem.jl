@@ -762,6 +762,9 @@ end
 function _tpsci_sharded_set_operator_cache!(cluster_ops, clustered_ham; blas_threads=1)
     _TPSCI_MULTINODE_CLUSTER_OPS[] = cluster_ops
     _TPSCI_MULTINODE_CLUSTERED_HAM[] = clustered_ham
+    # A new operator object invalidates any pre-built SPT term caches
+    # (defined in spt_sharded.jl; see _SPT_SHARDED_PRECACHED).
+    empty!(_SPT_SHARDED_PRECACHED)
     blas_threads === nothing || BLAS.set_num_threads(blas_threads)
     return Distributed.myid()
 end
@@ -1746,15 +1749,21 @@ function ensure_tpsci_multinode_workers!(; workers=Distributed.workers())
         @async Distributed.remotecall_fetch(
             Core.eval, pid, Main,
             :(begin
-                  # Restore the default load path first: under `Pkg.test`, workers
-                  # inherit a restricted `JULIA_LOAD_PATH` (sandbox only) that omits
-                  # `@stdlib`, so even `import Pkg` fails. Resetting to the standard
-                  # entries makes the stdlib reachable before we touch Pkg.
-                  copy!(LOAD_PATH, ["@", "@v#.#", "@stdlib"])
-                  import Pkg
-                  Pkg.activate($project_root; io=devnull)
-                  Pkg.instantiate(; io=devnull)
-                  using TPSChem
+                  ready = isdefined(Main, :_TPSCHEM_MULTINODE_PROJECT_ROOT) &&
+                          getfield(Main, :_TPSCHEM_MULTINODE_PROJECT_ROOT) == $project_root &&
+                          isdefined(Main, :TPSChem)
+                  if !ready
+                      # Restore the default load path first: under `Pkg.test`,
+                      # workers inherit a restricted `JULIA_LOAD_PATH` (sandbox only)
+                      # that omits `@stdlib`, so even `import Pkg` fails. Resetting to
+                      # the standard entries makes the stdlib reachable before Pkg.
+                      copy!(LOAD_PATH, ["@", "@v#.#", "@stdlib"])
+                      import Pkg
+                      Pkg.activate($project_root; io=devnull)
+                      Pkg.instantiate(; io=devnull)
+                      using TPSChem
+                      global _TPSCHEM_MULTINODE_PROJECT_ROOT = $project_root
+                  end
               end))
     end
     return pids
@@ -2555,6 +2564,14 @@ function tpsci_ci_sharded(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
     e0_last = zeros(T, R)
     converged = false
 
+    # One stored block-sparse Hamiltonian, distributed across workers, kept
+    # alive for the whole selected-CI run and extended incrementally as the
+    # space grows — the sharded analog of tps_ci_direct's build-once +
+    # H_old/v_old reuse. Every Davidson matvec is then worker-local block
+    # GEMV; nothing is ever re-contracted and neither H nor the vector is
+    # ever assembled on a single node.
+    block_h = nothing
+
     for it in 1:max_iter
         println()
         println(" ===================================================================")
@@ -2583,14 +2600,46 @@ function tpsci_ci_sharded(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
         end
 
         orthonormalize!(vec_var)
+
+        # Build the stored H on the first iteration; afterwards only extend it
+        # with rows/columns for the newly selected configurations. Falls back
+        # to matrix-free if the (aggregate, distributed) stored H would exceed
+        # max_mem_H.
+        tier = h_storage
+        if tier == :auto
+            rep = sharded_H_memory_report(vec_var, clustered_ham)
+            tier = rep.gb <= max_mem_H ? :blocks : :matrixfree
+            verbose > 0 &&
+                @printf(" H storage :auto -> :%s  (block-sparse H ~ %.3f GB aggregate, budget %.1f GB)\n",
+                        tier, rep.gb, max_mem_H)
+        end
+        if tier == :blocks
+            if block_h === nothing
+                block_h = build_block_h_sharded(vec_var, cluster_ops, clustered_ham;
+                                                workers=worker_ids,
+                                                blas_threads=blas_threads,
+                                                verbose=verbose)
+            else
+                update_block_h_sharded!(block_h, vec_var, cluster_ops, clustered_ham;
+                                        workers=worker_ids,
+                                        blas_threads=blas_threads,
+                                        verbose=verbose)
+            end
+        elseif block_h !== nothing
+            # The space outgrew the stored-H budget mid-run; drop the blocks.
+            destroy!(block_h)
+            block_h = nothing
+        end
+
         e0_it, vec_new = tps_ci_davidson_sharded(vec_var, cluster_ops, clustered_ham;
                                                  nroots=R,
                                                  conv_thresh=ci_conv,
                                                  max_iter=ci_max_iter,
                                                  max_ss_vecs=ci_max_ss_vecs,
                                                  lindep_thresh=ci_lindep_thresh,
-                                                 h_storage=h_storage,
+                                                 h_storage=tier,
                                                  max_mem_H=max_mem_H,
+                                                 block_h=block_h,
                                                  workers=worker_ids,
                                                  threaded_worker=threaded_worker,
                                                  blas_threads=blas_threads,
@@ -2660,6 +2709,7 @@ function tpsci_ci_sharded(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
     end
 
     vec_pt === nothing || destroy!(vec_pt)
+    block_h === nothing || destroy!(block_h)
     converged ||
         @printf(" tpsci_ci_sharded did not converge in %i iterations\n", max_iter)
     @printf(" ==================================================================|\n")

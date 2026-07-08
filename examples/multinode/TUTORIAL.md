@@ -115,7 +115,10 @@ exeflags="--project=$(Base.active_project())")`. On SLURM:
 `init_multinode_workers!()` (`common.jl`) starts one worker per hostname in
 `TPSCHEM_MACHINE_FILE`. Every entry point first calls
 `ensure_tpsci_multinode_workers!`, which on each worker restores the default
-`LOAD_PATH`, activates + instantiates the project, and loads TPSChem.
+`LOAD_PATH`, activates + instantiates the project, and loads TPSChem. That setup
+is cached per worker/project: the first distributed call pays the activation
+cost, and later FOIS/PT2/expectation/RDM calls skip it unless the project root
+changes.
 
 ### 1.2 The two distributed containers
 
@@ -197,8 +200,15 @@ coefficient vector `v` (dim × R). Each Davidson iteration:
      `Σ_ket Σ_terms contract_matrix_element·v[ket]` into its local σ block.
    - Wk → M: `{fock: length}` (move 4). σ stays distributed.
    With `h_storage=:blocks` (Tier A) the contraction is replaced by dense
-   block-GEMV against Hamiltonian sub-blocks built **once** before the loop
-   (see §3 Step 3, same machinery).
+   block-GEMV against Hamiltonian sub-blocks (see §3 Step 3, same machinery).
+   In `tpsci_ci_sharded` this stored H is the workhorse for the whole run:
+   built once at the first iteration and **extended incrementally** as the
+   space grows (`update_block_h_sharded!` — previously computed elements are
+   copied; only rows/columns for the newly selected configurations are
+   contracted, per block `n_bra_new·n_ket + n_bra_old·n_ket_new` instead of
+   `n_bra·n_ket`). This is the distributed analog of `tps_ci_direct`'s
+   build-once + `H_old`/`v_old` reuse — direct-like speed with H spread over
+   aggregate cluster memory instead of one node's.
 2. Small projected matrix: `Hss[i,j] = overlap(V[i], HV[j])` — each worker
    returns one number per pair (move 3); M holds only the k×k `Hss`.
 3. M: `eigen(Symmetric(Hss))` → Ritz values θ and coefficients y (tiny).
@@ -476,8 +486,21 @@ Each single-node step becomes a sharded one:
 Everything crossing the network is a k×k reduction or a single block fetch;
 validated against single-node to machine precision (Davidson 8.9e-15, PT2
 1.8e-15, full loop to 10 digits). Not supported here (use Path A / `spt_multinode`):
-the S² spin extension (`thresh_spin`) — the sharded driver errors on it. A stored
-block-sparse Tucker-H (Tier A) is future work; the sharded matvec is matrix-free.
+the S² spin extension (`thresh_spin`) — the sharded driver errors on it.
+
+**Cached distributed Tucker-H (2026-07-08).** The sharded matvec is no longer
+purely matrix-free: `build_sigma_sharded(…; cache=true)` (the default, used by
+`spt_ci_davidson_sharded`) follows the single-node `ci_solve` convention — on
+the **first** matvec of a solve each worker pre-builds the dense term blocks
+for its **owned bra sectors** (`cache_hamiltonian`, tracked in
+`_SPT_SHARDED_PRECACHED`), and every subsequent matvec reads them as cached
+GEMMs. Because a worker only ever builds its owned rows, the cached
+Hamiltonian is distributed across nodes automatically — per-iteration cost
+after the first matvec matches the single-node cached solve, with no node
+holding the full H. Stale caches are impossible: shipping a new operator
+problem (`_tpsci_sharded_set_operator_cache!`) clears the pre-cached set, and
+the Tucker factors are fixed within a solve. `cache=false` recovers the old
+re-contracting behavior (useful only to bound memory).
 
 **Energy-only shortcuts (memory-safe under either path):** if you only need the
 PT2 *energy* or the σ² variance, `compute_pt2_energy_distributed` and
@@ -526,3 +549,138 @@ When to use what:
 - **Energy-only** (`compute_pt2_energy_distributed`,
   `compute_spt_sigma_norm_blockwise_distributed`) — memory-safe at any size when
   you only need the PT2 energy or σ² variance.
+
+---
+
+## 6. Performance and memory bottlenecks
+
+The shortest rule is: **single-node wins while the full working set fits**.
+Multinode starts to win when the calculation is too large for one node, or when
+each worker's local contraction/GEMM work is much larger than the cost of
+serializing blocks and reducing scalars. The toy tests below are intentionally
+small, so they measure overhead more than production scaling.
+
+### 6.1 Where time goes
+
+| Path | Main time cost | What helps now |
+| --- | --- | --- |
+| TPSCI single-node dense (`tps_ci_direct`) | Dense H build + diagonalization on one node | Best for small fixed spaces; do not use multinode for dim=O(10-1000) unless testing |
+| TPSCI sharded Davidson, `h_storage=:blocks` | First build or incrementally extend dense Fock-pair H blocks; then block-GEMV + reductions | Use `:blocks` or `:auto` for repeated Davidson/CEPA matvecs; keep `max_ss_vecs` modest |
+| TPSCI sharded Davidson, `h_storage=:matrixfree` | Re-contracts cluster terms every matvec and fetches ket Fock blocks repeatedly | Use only when block-H memory is impossible; otherwise prefer `:auto` |
+| SPT compute-distributed Path A | Repeated distributed sigma builds and worker result merges, then local Tucker compression/CI | Good when compressed SPT fits one node; worker setup is now cached to avoid repeated package activation |
+| SPT sharded Path B | Cross-Fock ket block fetches during matvec/FOIS; first cached Tucker-H build | Use when compressed SPT/FOIS/PT1 does not fit one node; keep ownership stable with `:hash` |
+| SPT-PT2 / sigma-norm energy-only | FOIS-sector jobs plus serialized reference state; only scalars return | Use blockwise kernels for memory; avoid building a global sigma if only energy or sigma2 is needed |
+
+Low-risk fixes already made in the multinode layer:
+
+- `ensure_tpsci_multinode_workers!` is idempotent per worker/project, so repeated
+  distributed calls no longer rerun `Pkg.activate`/`Pkg.instantiate`.
+- `build_compressed_1st_order_state_distributed` ships an empty SPT template to
+  workers instead of the full reference state; ket sector data still travels in
+  the job records that need it.
+- `compute_spt_sigma_norm_blockwise_distributed(...; opt_ref=false)` skips an
+  unused distributed zeroth-order energy calculation. The sigma-norm kernel only
+  needs the reference vector and FOIS jobs.
+
+### 6.2 Where memory goes
+
+| Object | Memory owner | Why it grows | Control knob |
+| --- | --- | --- | --- |
+| TPSCI variational vector | Sharded by Fock sector in `DistributedTPSCIstate` | Number of selected configurations times roots | Use `tpsci_ci_sharded`; avoid `collect_tpsci_state` except for debug |
+| TPSCI Davidson subspace | Sharded vectors, one full vector per subspace direction | Roughly `max_ss_vecs * nroots` sharded vector copies plus sigmas/residuals | Lower `max_ss_vecs`; rely on the stable restart |
+| TPSCI/CEPA stored block-H | Worker-local dense blocks for connected Fock-sector pairs | `sum(n_bra * n_ket)` over connected block pairs | Use `h_storage=:auto`, set `max_mem_H`, fall back to matrix-free if needed |
+| CEPA Q space | Sharded by Fock sector | FOIS threshold and `nbody` define Q-space size | Raise `thresh_foi`, reduce `nbody`, call `destroy!(qspace)` between thresholds |
+| SPT Path A FOIS/PT1/variational state | Master process | Gathered compressed Tucker state, plus local CI subspace copies | Switch to `subspace_product_tucker_sharded` when this reaches node memory |
+| SPT Path B FOIS/PT1/variational state | Sharded `DistributedSPTstate` | Tucker blocks per Fock sector and roots | Use `compress_sharded`, stable `:hash` ownership, and `destroy!` temporaries |
+| Cluster operators | Local or `DistributedClusterOps` by cluster index | Large cluster bases and many sector operator tables | Use distributed cluster ops when operator tables do not fit on every node |
+
+### 6.3 TPSCI solver choice: h12 >15K comparison
+
+This is the more useful TPSCI decision table than the tiny test fixture below.
+It was run for h12 with dim = 24,438, R = 3, one physical machine, and two local
+Julia workers for the sharded rows. The important split is between **dense H on
+one node** and **stored block-H spread over workers**.
+
+| Solver | Where | Time (s) | H memory | Vector memory | max\|ΔE\| | Use when |
+| --- | --- | ---: | --- | --- | ---: | --- |
+| `tps_ci_direct` dense H + BLAS | 1 node | 56.4 | 4.78 GB on one node | 5.9e-4 GB | ref | Fastest when dense H fits comfortably on one node |
+| Sharded stored-H: fresh H build + Davidson GEMV | 2 workers | 67.2 build + 49.8 solve = 117.0 | 1.32 GB max/worker, 1.99 GB aggregate reported | 3.7e-4 GB/worker | 1.1e-12 | Production path when dense H is too large for one node but stored block-H fits across workers |
+| Sharded stored-H: incremental update 22,481 -> 24,438, 8% growth | 2 workers | 34.4 update, vs 67.2 fresh, 49% saved | reused | reused | 0.0e+00 | Best path inside selected-CI growth after the first stored-H build |
+| Sharded stored-H: incremental update 9,570 -> 22,481, 57% growth | 2 workers | 51.5 update, about 25% saved | reused | reused | - | Still helpful for large growth; savings improve as the added fraction shrinks |
+| `tps_ci_davidson` matrix-free | 1 node | ~5,200 estimated | 0 | - | skipped | Only if dense H memory is impossible and no sharded stored-H run is available |
+| `tps_ci_davidson_sharded`, `h_storage=:matrixfree` | 2 workers | ~87,000 estimated | 0 | - | fallback only | Emergency fallback when stored block-H exceeds aggregate memory |
+
+Practical TPSCI choice:
+
+- Use `tps_ci_direct` for fixed spaces that fit dense H on one node; it is still
+  the fastest because BLAS diagonalization has no network traffic.
+- Use `tpsci_ci_sharded(...; h_storage=:auto)` for selected-CI production. It
+  builds stored H once, then uses incremental updates as the space grows.
+- Treat matrix-free Davidson as a memory fallback, not a speed path. It avoids H
+  storage, but repeatedly re-contracts Hamiltonian terms.
+
+### 6.4 SPT solver choice
+
+SPT has a different memory shape than TPSCI because the state is Tucker
+compressed. The right path is determined by where the compressed SPT state,
+FOIS, PT1, and Tucker-CI subspace fit.
+
+| SPT task/path | Main entry point | Memory owner | Time bottleneck | Use when | Avoid when |
+| --- | --- | --- | --- | --- | --- |
+| Single-node variational SPT | `subspace_product_tucker` | One node | Tucker compression + local `ci_solve` | Compressed reference/FOIS/PT1 all fit one node | State or local Davidson subspace approaches node memory |
+| Compute-distributed SPT, Path A | `subspace_product_tucker_multinode` | Master holds compressed states; workers handle FOIS/sigma/PT2 jobs | Shipping compressed states and merging worker results; local Tucker CI remains on master | You want more CPU for FOIS/PT2 but the compressed state fits one node | You need true memory relief for the variational/FOIS/PT1 state |
+| Never-gather sharded SPT, Path B | `subspace_product_tucker_sharded` | Fock sectors live in `DistributedSPTstate` on workers | Cross-Fock block fetches and first cached Tucker-H build | Compressed SPT/FOIS/PT1 is too large for one node | You need `thresh_spin` S2 extension, which is still Path A only |
+| SPT-PT2 energy only | `compute_pt2_energy_blockwise_distributed` | Worker-local FOIS sector at a time; scalar reductions | FOIS-sector contractions and reference serialization | You only need PT2 energy and want to avoid storing global sigma/PT1 | You need the PT1 wavefunction for later selection |
+| SPT sigma norm / variance | `compute_spt_sigma_norm_blockwise_distributed` | Worker-local FOIS sector at a time; scalar reductions | Same FOIS contractions as PT2, no global sigma | You only need `<sigma|sigma>` / variance diagnostics | You need a reusable sigma vector |
+
+Practical SPT choice:
+
+- Use single-node SPT while the compressed objects fit; it has the least
+  communication overhead.
+- Use Path A when the compressed state fits but FOIS/PT2 contractions need more
+  cores.
+- Use Path B when memory is the constraint. It is the SPT analogue of
+  `tpsci_ci_sharded`.
+- Use energy-only distributed kernels for diagnostics because they avoid storing
+  global PT1/sigma objects.
+
+### 6.5 Local overhead table
+
+Run on July 8, 2026, from a warmed Julia process on a local laptop-style run
+with two local Julia workers, one thread per worker, and the small test fixtures
+in `test/`. These are correctness/overhead fixtures, not production scaling
+cases.
+
+| Kernel | Problem | best single-node path | multinode path | single-node time (s) | multinode time (s) | speedup |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| SPT FOIS build | He4 CMF fixture, `nbody=2`, `thresh=1e-3` | single-node threaded SPT | 2 local workers | 0.010 | 0.058 | 0.18x |
+| SPT-PT2 blockwise | He4 CMF fixture, `thresh_foi=1e-3` | single-node blockwise PT2 | 2 local workers | 0.013 | 0.135 | 0.10x |
+| SPT sigma norm | He4 CMF fixture, `thresh_foi=1e-3` | single-node blockwise sigma | 2 local workers | 0.009 | 0.060 | 0.16x |
+| TPSCI fixed-space diagonalization | H8 FOIS fixture, dim=37, roots=3 | dense `tps_ci_direct` | 2 local workers, stored block-H | 0.004 | 0.589 | 0.01x |
+| TPSCI fixed-space diagonalization | H8 FOIS fixture, dim=37, roots=3 | dense `tps_ci_direct` | 2 local workers, matrix-free | 0.004 | 1.296 | 0.00x |
+
+Interpretation:
+
+- The single-node path is the correct "best" path for these tiny fixtures.
+  Multinode loses because process/socket serialization and reductions dominate.
+- The stored block-H TPSCI path is still much faster than matrix-free in the
+  sharded Davidson row because it reuses dense block GEMVs instead of
+  re-contracting Hamiltonian terms every matvec.
+- In production, expect multinode to help only when the FOIS/Q/SPT vector or
+  stored H is too large for one node, or when each worker receives enough
+  Fock-sector work to amortize communication.
+
+### 6.6 Remaining deeper fixes
+
+The low-risk overhead fixes above do not change the algorithms. The larger
+remaining improvements are:
+
+- Cache or persist worker-side SPT references for `build_sigma_distributed` and
+  `compute_pt2_energy_distributed`, so repeated Path A calls do not resend the
+  full compressed reference to every worker.
+- Prefer sharded SPT Path B for true memory relief. Path A still gathers the
+  compressed FOIS/PT1/variational state on the master by design.
+- Add more memory-aware block-H compression/sparsification for TPSCI/CEPA when
+  `:blocks` is too large but `:matrixfree` is too slow.
+- Improve sharded Davidson restart policy further for very many roots, where the
+  number of sharded subspace vectors becomes the dominant memory cost.

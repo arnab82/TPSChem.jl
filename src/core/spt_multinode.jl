@@ -89,7 +89,9 @@ function _spt_job_chunks(jobs_vec::Vector{Tuple{FockConfig{N},Vector{Tuple}}},
                          pids; strategy::Symbol=:balanced) where {N}
     chunks = Dict(pid => Tuple{FockConfig{N},Vector{Tuple}}[] for pid in pids)
     loads = Dict(pid => 0 for pid in pids)
-    for job_item in jobs_vec
+    jobs_ordered = strategy == :balanced ?
+        sort(jobs_vec; by=_spt_job_weight, rev=true) : jobs_vec
+    for job_item in jobs_ordered
         fock, _ = job_item
         pid = if strategy == :balanced
             _spt_least_loaded_pid(loads, pids)
@@ -165,8 +167,13 @@ function _spt_fock_chunks_by_length(state::SPTstate{T,N,R}, pids;
                                     strategy::Symbol=:balanced) where {T,N,R}
     chunks = Dict(pid => FockConfig{N}[] for pid in pids)
     loads = Dict(pid => 0 for pid in pids)
+    fock_weights = Tuple{FockConfig{N},Int}[]
     for (fock, tconfigs) in state.data
-        weight = sum(length(tuck) for (_, tuck) in tconfigs; init=0)
+        push!(fock_weights, (fock, sum(length(tuck) for (_, tuck) in tconfigs; init=0)))
+    end
+    fock_weights_ordered = strategy == :balanced ?
+        sort(fock_weights; by=last, rev=true) : fock_weights
+    for (fock, weight) in fock_weights_ordered
         pid = if strategy == :balanced
             _spt_least_loaded_pid(loads, pids)
         elseif strategy == :hash
@@ -246,12 +253,13 @@ function build_compressed_1st_order_state_distributed(psi::SPTstate{T,N,R},
     @printf(" %-50s%10s\n", "Threads per worker enabled: ", string(threaded_worker))
     flush(stdout)
 
+    psi_template = _spt_empty_state_like(psi)
     worker_states = Dict{Int,SPTstate{T,N,R}}()
     t = @elapsed begin
         @sync for pid in pids
             @async begin
                 worker_states[pid] = Distributed.remotecall_fetch(
-                    _spt_fois_worker_chunk, pid, psi, chunks[pid], cluster_ops,
+                    _spt_fois_worker_chunk, pid, psi_template, chunks[pid], cluster_ops,
                     nbody, thresh, max_number, prescreen, compress_twice,
                     threaded_worker, blas_threads)
             end

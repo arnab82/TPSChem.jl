@@ -195,6 +195,7 @@ export tpsci_ci_multinode
 export tpsci_ci_sharded
 export tps_ci_davidson_sharded
 export build_block_h_sharded
+export update_block_h_sharded!
 export estimate_sharded_H_nnz
 export sharded_H_memory_report
 export compute_diagonal_sharded

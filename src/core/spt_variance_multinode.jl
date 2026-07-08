@@ -79,21 +79,16 @@ function compute_spt_sigma_norm_blockwise_distributed(ref::SPTstate{T,N,R},
 
     pids = ensure_tpsci_multinode_workers!(workers=workers)
     ref_vec = deepcopy(ref)
-    E0 = zeros(T, R)
 
     if opt_ref
         @printf(" %-50s\n", "Solve zeroth-order problem: ")
         local_ops = _spt_collect_ops_for_local_step(cluster_ops)
-        time = @elapsed E0, ref_vec = ci_solve(ref_vec, local_ops,
-                                               clustered_ham,
-                                               conv_thresh=ci_tol)
+        time = @elapsed _, ref_vec = ci_solve(ref_vec, local_ops,
+                                              clustered_ham,
+                                              conv_thresh=ci_tol)
         @printf(" %-50s%10.6f seconds\n", "Diagonalization time: ", time)
     else
-        @printf(" %-50s", "Compute zeroth-order energy: ")
-        flush(stdout)
-        @time E0 = compute_expectation_value_distributed(
-            ref_vec, cluster_ops, clustered_ham; nbody=nbody,
-            workers=pids, blas_threads=blas_threads, strategy=strategy)
+        @printf(" %-50s\n", "Use input reference without zeroth-order solve")
     end
 
     jobs_vec = _spt_make_fock_jobs(ref_vec, cluster_ops, clustered_ham,

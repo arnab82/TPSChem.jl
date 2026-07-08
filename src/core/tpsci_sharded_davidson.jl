@@ -447,6 +447,140 @@ function build_block_h_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
                               Float64(nnz))
 end
 
+function _update_block_h_chunk!(block_id::Symbol, ci_vector::DistributedTPSCIstate,
+                                owned_bras)
+    cluster_ops = _TPSCI_MULTINODE_CLUSTER_OPS[]
+    clustered_ham = _TPSCI_MULTINODE_CLUSTERED_HAM[]
+    cluster_ops === nothing && error("TPSCI sharded cluster-ops cache is empty")
+    clustered_ham === nothing && error("TPSCI sharded Hamiltonian cache is empty")
+    if cluster_ops isa DistributedClusterOps
+        cluster_ops = _materialize_cluster_ops_for_indices(
+            cluster_ops, [c.idx for c in ci_vector.clusters])
+    end
+    return _update_block_h_chunk_typed!(block_id, ci_vector, owned_bras,
+                                        cluster_ops, clustered_ham)
+end
+
+function _update_block_h_chunk_typed!(block_id::Symbol,
+                                      ci_vector::DistributedTPSCIstate{T,N,R},
+                                      owned_bras, cluster_ops,
+                                      clustered_ham::ClusteredOperator) where {T,N,R}
+    old = haskey(_TPSCI_SHARDED_BLOCK_H, block_id) ?
+          _tpsci_sharded_get_block_h(block_id) : nothing
+    local_state = _tpsci_sharded_get_state(ci_vector.id)
+    ket_cache = Dict{FockConfig{N},Any}()
+    bra_order = Dict{FockConfig{N},Vector{ClusterConfig{N}}}()
+    ket_order = Dict{FockConfig{N},Vector{ClusterConfig{N}}}()
+    connections = Dict{FockConfig{N},Vector{FockConfig{N}}}()
+    mats = Dict{Tuple{FockConfig{N},FockConfig{N}},Matrix{T}}()
+
+    # Old-column position maps per ket sector, built lazily and shared across
+    # all bra sectors in this chunk.
+    old_ket_pos = Dict{FockConfig{N},Dict{ClusterConfig{N},Int}}()
+
+    for fock_bra in owned_bras
+        bra_cfgs = collect(keys(local_state.data[fock_bra]))
+        bra_order[fock_bra] = bra_cfgs
+        old_bra = old === nothing ? ClusterConfig{N}[] :
+                  get(old.bra_order, fock_bra, ClusterConfig{N}[])
+        bra_pos_old = Dict(c => i for (i, c) in enumerate(old_bra))
+        conns = FockConfig{N}[]
+        for fock_ket in keys(ci_vector.owners)
+            fock_trans = fock_bra - fock_ket
+            haskey(clustered_ham, fock_trans) || continue
+            configs_ket = _tpsci_sharded_get_ket_configs(ci_vector, fock_ket, ket_cache)
+            ket_cfgs = collect(keys(configs_ket))
+            ket_order[fock_ket] = ket_cfgs
+            kpos_old = get!(old_ket_pos, fock_ket) do
+                oldk = old === nothing ? ClusterConfig{N}[] :
+                       get(old.ket_order, fock_ket, ClusterConfig{N}[])
+                Dict(c => i for (i, c) in enumerate(oldk))
+            end
+            M_old = old === nothing ? nothing :
+                    get(old.mats, (fock_bra, fock_ket), nothing)
+            terms = clustered_ham[fock_trans]
+            Hblk = zeros(T, length(bra_cfgs), length(ket_cfgs))
+            for (bi, config_bra) in enumerate(bra_cfgs)
+                bio = M_old === nothing ? 0 : get(bra_pos_old, config_bra, 0)
+                for (ki, config_ket) in enumerate(ket_cfgs)
+                    kio = bio == 0 ? 0 : get(kpos_old, config_ket, 0)
+                    if bio > 0 && kio > 0
+                        # previously computed element: copy, don't re-contract
+                        Hblk[bi, ki] = M_old[bio, kio]
+                    else
+                        acc = zero(T)
+                        for term in terms
+                            check_term(term, fock_bra, config_bra, fock_ket, config_ket) || continue
+                            acc += contract_matrix_element(term, cluster_ops, fock_bra,
+                                                           config_bra, fock_ket, config_ket)
+                        end
+                        Hblk[bi, ki] = acc
+                    end
+                end
+            end
+            mats[(fock_bra, fock_ket)] = Hblk
+            push!(conns, fock_ket)
+        end
+        connections[fock_bra] = conns
+    end
+
+    data = ShardedBlockData{T,N}(collect(owned_bras), bra_order, ket_order,
+                                 connections, mats)
+    _tpsci_sharded_store_block_h!(block_id, data)
+    nbytes = 0
+    for (_, m) in mats
+        nbytes += length(m)
+    end
+    return nbytes
+end
+
+"""
+    update_block_h_sharded!(op::ShardedBlockH, ci_vector, cluster_ops, clustered_ham; ...)
+
+Extend a stored block-sparse Hamiltonian in place after the space `ci_vector`
+has GROWN (a selected-CI iteration): previously computed matrix elements are
+copied from the existing blocks, and only the rows/columns belonging to new
+configurations — plus whole blocks for newly appearing Fock sectors — are
+contracted. This is the sharded analog of `tps_ci_direct`'s `H_old`/`v_old`
+incremental rebuild: per block the contraction cost drops from
+`n_bra·n_ket` to `n_bra_new·n_ket + n_bra_old·n_ket_new`.
+
+Requires the same worker list and (for existing sectors) the same ownership as
+when the operator was built — both guaranteed inside `tpsci_ci_sharded`, where
+ownership is never reshuffled. Transiently holds old + new blocks on each
+worker while swapping.
+"""
+function update_block_h_sharded!(op::ShardedBlockH{T,N},
+                                 ci_vector::DistributedTPSCIstate{T,N,R},
+                                 cluster_ops, clustered_ham::ClusteredOperator;
+                                 workers=ci_vector.workers,
+                                 blas_threads=1,
+                                 verbose=0) where {T,N,R}
+    op.workers == ci_vector.workers ||
+        error("update_block_h_sharded! requires the block-H and state on the same workers")
+    _tpsci_sharded_cache_operator_problem!(cluster_ops, clustered_ham;
+                                           workers=workers,
+                                           blas_threads=blas_threads)
+    chunks = Dict(pid => FockConfig{N}[] for pid in ci_vector.workers)
+    for (fock, owner) in ci_vector.owners
+        push!(chunks[owner], fock)
+    end
+
+    nbyte_maps = Dict{Int,Int}()
+    @sync for pid in ci_vector.workers
+        @async begin
+            nbyte_maps[pid] = Distributed.remotecall_fetch(
+                _update_block_h_chunk!, pid, op.id, ci_vector, chunks[pid])
+        end
+    end
+    old_nnz = op.nnz
+    op.nnz = Float64(sum(values(nbyte_maps); init=0))
+    verbose > 0 &&
+        @printf(" Updated sharded block-sparse H incrementally: nnz %.3e -> %.3e\n",
+                old_nnz, op.nnz)
+    return op
+end
+
 function _apply_block_h_chunk!(out_id::Symbol, block_id::Symbol,
                                v::DistributedTPSCIstate)
     return _apply_block_h_chunk_typed!(out_id, _tpsci_sharded_get_block_h(block_id), v)
@@ -741,6 +875,7 @@ function tps_ci_davidson_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
                                  max_iter=100,
                                  h_storage::Symbol=:auto,
                                  max_mem_H=50.0,
+                                 block_h::Union{Nothing,ShardedBlockH}=nothing,
                                  workers=ci_vector.workers,
                                  threaded_worker=true,
                                  blas_threads=1,
@@ -763,27 +898,36 @@ function tps_ci_davidson_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
     Hdiag = compute_diagonal_sharded(ci_vector, cluster_ops, clustered_ham;
                                      workers=worker_ids, blas_threads=blas_threads)
 
-    # Decide storage tier.
-    tier = h_storage
-    if tier == :auto
-        rep = sharded_H_memory_report(ci_vector, clustered_ham)
-        tier = rep.gb <= max_mem_H ? :blocks : :matrixfree
-        verbose > 0 && @printf(" H storage :auto -> :%s  (block-sparse H ~ %.3f GB, budget %.1f GB)\n",
-                               tier, rep.gb, max_mem_H)
-    end
-
-    block_h = nothing
-    if tier == :blocks
-        block_h = build_block_h_sharded(ci_vector, cluster_ops, clustered_ham;
-                                        workers=worker_ids, blas_threads=blas_threads,
-                                        verbose=verbose)
+    owns_block_h = false
+    if block_h !== nothing
+        # Caller-managed stored H (e.g. tpsci_ci_sharded reusing/updating one
+        # block-sparse H across selected-CI iterations). Use it, don't free it.
+        block_h.workers == worker_ids ||
+            error("supplied block_h lives on different workers than the guess")
         apply_H = v -> apply_sharded_H(block_h, v)
-    elseif tier == :matrixfree
-        op = MatrixFreeShardedH(cluster_ops, clustered_ham, worker_ids,
-                                threaded_worker, Int(blas_threads))
-        apply_H = v -> apply_sharded_H(op, v)
     else
-        error("Unknown h_storage: $h_storage (use :auto, :blocks, or :matrixfree)")
+        # Decide storage tier.
+        tier = h_storage
+        if tier == :auto
+            rep = sharded_H_memory_report(ci_vector, clustered_ham)
+            tier = rep.gb <= max_mem_H ? :blocks : :matrixfree
+            verbose > 0 && @printf(" H storage :auto -> :%s  (block-sparse H ~ %.3f GB, budget %.1f GB)\n",
+                                   tier, rep.gb, max_mem_H)
+        end
+
+        if tier == :blocks
+            block_h = build_block_h_sharded(ci_vector, cluster_ops, clustered_ham;
+                                            workers=worker_ids, blas_threads=blas_threads,
+                                            verbose=verbose)
+            owns_block_h = true
+            apply_H = v -> apply_sharded_H(block_h, v)
+        elseif tier == :matrixfree
+            op = MatrixFreeShardedH(cluster_ops, clustered_ham, worker_ids,
+                                    threaded_worker, Int(blas_threads))
+            apply_H = v -> apply_sharded_H(op, v)
+        else
+            error("Unknown h_storage: $h_storage (use :auto, :blocks, or :matrixfree)")
+        end
     end
 
     # Seed: extract nroots orthonormal guesses from the input state.
@@ -811,7 +955,7 @@ function tps_ci_davidson_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
         destroy!(x)
     end
     destroy!(Hdiag)
-    block_h === nothing || destroy!(block_h)
+    owns_block_h && destroy!(block_h)
 
     if verbose > 0
         @printf(" Sharded Davidson finished in %.2f s\n", elapsed)

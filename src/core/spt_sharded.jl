@@ -23,6 +23,12 @@ arithmetic is exact and every subspace vector shares the same factors.
 
 const _SPT_SHARDED_STATES = Dict{Symbol,Any}()
 
+# Operator objects (by objectid) whose term caches this worker has pre-built
+# via cache_hamiltonian for its owned bra sectors. Cleared whenever a new
+# operator problem is shipped (_tpsci_sharded_set_operator_cache!), so a
+# basis change can never reuse stale blocks.
+const _SPT_SHARDED_PRECACHED = Set{UInt}()
+
 function _spt_sharded_store_state!(id::Symbol, state)
     _SPT_SHARDED_STATES[id] = state
     return length(state)
@@ -686,7 +692,7 @@ end
 # they differ it is <bra-basis|H|ket> (used by PT1's <X|H|0>).
 function _spt_build_sigma_into_chunk!(out_id::Symbol, bra::DistributedSPTstate{T,N,R},
                                       ket::DistributedSPTstate{T,N,R}, owned_bras,
-                                      nbody, blas_threads) where {T,N,R}
+                                      nbody, blas_threads, cache::Bool) where {T,N,R}
     blas_threads === nothing || BLAS.set_num_threads(blas_threads)
     cluster_ops = _TPSCI_MULTINODE_CLUSTER_OPS[]
     clustered_ham = _TPSCI_MULTINODE_CLUSTERED_HAM[]
@@ -718,14 +724,32 @@ function _spt_build_sigma_into_chunk!(out_id::Symbol, bra::DistributedSPTstate{T
         end
     end
 
-    build_sigma!(sig, ketl, cluster_ops, clustered_ham; nbody=nbody, verbose=0)
+    # cache=true follows the single-node ci_solve convention: `cache=true` in
+    # form_sigma_block! READS pre-built term blocks (build-on-miss inside the
+    # threaded matvec would race on term.cache), so the blocks must be built
+    # first with cache_hamiltonian. We pre-build ONCE per shipped operator
+    # object: since a worker only ever builds sigma for its OWNED bra sectors,
+    # each worker caches only its rows — the cached Hamiltonian is distributed
+    # across nodes. The first matvec of a solve pays the contraction; every
+    # later matvec is dense GEMMs. Valid within a solve (fixed Tucker factors);
+    # cannot go stale across solves because every entry point re-ships the
+    # operator problem, which clears _SPT_SHARDED_PRECACHED.
+    if cache
+        hid = objectid(clustered_ham)
+        if !(hid in _SPT_SHARDED_PRECACHED)
+            cache_hamiltonian(sig, ketl, cluster_ops, clustered_ham; nbody=nbody)
+            push!(_SPT_SHARDED_PRECACHED, hid)
+        end
+    end
+    build_sigma!(sig, ketl, cluster_ops, clustered_ham; nbody=nbody, cache=cache,
+                 verbose=0)
     _spt_sharded_store_state!(out_id, sig)
     return _spt_sharded_local_fock_lengths(out_id)
 end
 
 function _spt_build_sigma_into(bra::DistributedSPTstate{T,N,R},
                                ket::DistributedSPTstate{T,N,R}, nbody, blas_threads,
-                               id) where {T,N,R}
+                               id; cache::Bool=false) where {T,N,R}
     output_id = id === nothing ? gensym(:spt_shard_sigma) : Symbol(id)
     chunks = Dict(pid => FockConfig{N}[] for pid in bra.workers)
     for (fock, owner) in bra.owners
@@ -736,7 +760,7 @@ function _spt_build_sigma_into(bra::DistributedSPTstate{T,N,R},
         @async begin
             length_maps[pid] = Distributed.remotecall_fetch(
                 _spt_build_sigma_into_chunk!, pid, output_id, bra, ket, chunks[pid],
-                nbody, blas_threads)
+                nbody, blas_threads, cache)
         end
     end
     return _spt_sharded_metadata_from_lengths(output_id, bra.clusters, bra.p_spaces,
@@ -753,12 +777,19 @@ Tucker basis. Each worker builds the sigma blocks for the Fock sectors it owns,
 fetching only the connected ket Tucker blocks it does not own. The output keeps
 `v`'s Fock ownership. Assumes the operator cache is primed
 (`_tpsci_sharded_cache_operator_problem!`) — this is the hot-loop matvec, so it
-does not re-cache.
+does not re-cache the operator problem.
+
+`cache=true` (default) additionally stores every contracted term block in the
+worker-side `clustered_ham`, so the FIRST matvec of a solve pays the Tucker
+contraction and every subsequent matvec is dense GEMMs against the cached
+blocks — the same build-once behavior as the single-node `ci_solve`
+(`cache=true` + `cache_hamiltonian`), but with each worker caching only its
+owned rows, i.e. the cached Hamiltonian is distributed across nodes.
 """
 function build_sigma_sharded(v::DistributedSPTstate{T,N,R}, cluster_ops, clustered_ham;
                              nbody=4, workers=v.workers, threaded_worker=true,
-                             blas_threads=1, id=nothing) where {T,N,R}
-    return _spt_build_sigma_into(v, v, nbody, blas_threads, id)
+                             blas_threads=1, id=nothing, cache::Bool=true) where {T,N,R}
+    return _spt_build_sigma_into(v, v, nbody, blas_threads, id; cache=cache)
 end
 
 """
@@ -773,10 +804,11 @@ solver cached.
 function build_sigma_into_sharded(bra_basis::DistributedSPTstate{T,N,R},
                                   ket::DistributedSPTstate{T,N,R}, cluster_ops,
                                   clustered_ham; nbody=4, workers=bra_basis.workers,
-                                  blas_threads=1, id=nothing) where {T,N,R}
+                                  blas_threads=1, id=nothing,
+                                  cache::Bool=false) where {T,N,R}
     _tpsci_sharded_cache_operator_problem!(cluster_ops, clustered_ham;
                                            workers=workers, blas_threads=blas_threads)
-    return _spt_build_sigma_into(bra_basis, ket, nbody, blas_threads, id)
+    return _spt_build_sigma_into(bra_basis, ket, nbody, blas_threads, id; cache=cache)
 end
 
 # ---------------------------------------------------------------------------
