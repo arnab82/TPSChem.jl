@@ -643,12 +643,17 @@ end
 
 # Modified Gram-Schmidt: orthogonalize `t` (a sharded R=1 vector) against every
 # vector in `basis`, in place. Returns the norm of the surviving component.
+# Orthogonalize `t` against the (orthonormal) `basis` in place, then return its
+# surviving norm. Two passes of *classical* Gram-Schmidt (CGS-2 / DGKS): for an
+# orthonormal basis this is mathematically identical to modified GS in exact
+# arithmetic, and the second pass restores stability against round-off. Each pass
+# is exactly two network round-trips (one batched overlap, one batched axpy),
+# versus 2*|basis| for the per-vector MGS it replaces.
 function _mgs_against!(t::AbstractShardedState{T,N,1}, basis) where {T,N}
-    for _ in 1:2
-        for v in basis
-            c = overlap(t, v)[1, 1]
-            c == zero(T) && continue
-            add_scaled!(t, -c, v)
+    if !isempty(basis)
+        for _ in 1:2
+            coeffs = overlap_batch(t, basis)      # ⟨t|v_i⟩ for all i, one fan-out
+            add_scaled_multi!(t, -coeffs, basis)  # t -= Σ ⟨t|v_i⟩ v_i, one fan-out
         end
     end
     return norm(t)[1]
@@ -677,10 +682,9 @@ end
 function _append_direction!(V, HV, Hss::Matrix{T}, t, apply_H) where {T}
     hv = apply_H(t)
     m = length(V)
-    newcol = Vector{T}(undef, m)
-    for i in 1:m
-        newcol[i] = overlap(V[i], hv)[1, 1]
-    end
+    # One batched fan-out for the whole projected-matrix column: newcol[i] =
+    # ⟨V[i]|hv⟩ = ⟨hv|V[i]⟩ (real, symmetric H), instead of m separate overlaps.
+    newcol = overlap_batch(hv, V)
     d = overlap(t, hv)[1, 1]
     push!(V, t)
     push!(HV, hv)

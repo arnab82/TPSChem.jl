@@ -414,6 +414,59 @@ function add_scaled!(dest::DistributedSPTstate{T,N,R}, alpha,
     return dest
 end
 
+# --- Batched subspace reductions (see the TPSCI versions in tpsci_multinode.jl):
+# one fan-out for many independent inner products / axpys, used by the shared
+# sharded Davidson core for SPT subspace vectors.
+
+function _spt_sharded_local_overlap_batch(t_id::Symbol, v_ids::Vector{Symbol})
+    t = _spt_sharded_get_state(t_id)
+    return [_spt_orth_overlap(t, _spt_sharded_get_state(vid))[1, 1] for vid in v_ids]
+end
+
+function overlap_batch(t::DistributedSPTstate{T,N,1}, basis::AbstractVector) where {T,N}
+    isempty(basis) && return Vector{T}()
+    for b in basis
+        b.workers == t.workers || error("overlap_batch requires identical worker lists")
+    end
+    v_ids = Symbol[b.id for b in basis]
+    partials = Dict{Int,Vector{T}}()
+    @sync for pid in t.workers
+        @async partials[pid] = Distributed.remotecall_fetch(
+            _spt_sharded_local_overlap_batch, pid, t.id, v_ids)
+    end
+    out = zeros(T, length(basis))
+    for pid in t.workers
+        out .+= partials[pid]
+    end
+    return out
+end
+
+function _spt_sharded_local_add_scaled_multi!(dest_id::Symbol, coeffs::Vector,
+                                              src_ids::Vector{Symbol})
+    dest = _spt_sharded_get_state(dest_id)
+    for (c, sid) in zip(coeffs, src_ids)
+        iszero(c) && continue
+        _spt_local_add_scaled!(dest, c, _spt_sharded_get_state(sid))
+    end
+    return true
+end
+
+function add_scaled_multi!(dest::DistributedSPTstate{T,N,1}, coeffs::AbstractVector,
+                           srcs::AbstractVector) where {T,N}
+    length(coeffs) == length(srcs) || error("add_scaled_multi! length mismatch")
+    isempty(srcs) && return dest
+    for s in srcs
+        s.workers == dest.workers || error("add_scaled_multi! requires identical worker lists")
+    end
+    src_ids = Symbol[s.id for s in srcs]
+    cvec = collect(T, coeffs)
+    @sync for pid in dest.workers
+        @async Distributed.remotecall_fetch(_spt_sharded_local_add_scaled_multi!,
+                                            pid, dest.id, cvec, src_ids)
+    end
+    return dest
+end
+
 function _spt_sharded_local_copy_state!(dest_id::Symbol, src_id::Symbol)
     _spt_sharded_store_state!(dest_id, deepcopy(_spt_sharded_get_state(src_id)))
     return _spt_sharded_local_fock_lengths(dest_id)
@@ -712,15 +765,35 @@ function _spt_build_sigma_into_chunk!(out_id::Symbol, bra::DistributedSPTstate{T
     end
     zero!(sig)
 
-    # Ket: every ket Fock sector connected by H to one of our owned bras.
+    # Ket: every ket Fock sector connected by H to one of our owned bras. Collect
+    # the unique needed sectors, then fetch the remote ones concurrently (one
+    # @async per owner block) instead of serially; local sectors by reference.
     ketl = _spt_empty_local_state(T, Val(R), ket.clusters, ket.p_spaces, ket.q_spaces, Val(N))
-    ket_cache = Dict{FockConfig{N},Any}()
+    needed = Set{FockConfig{N}}()
     for fock_bra in owned_bras
         for fock_ket in keys(ket.owners)
             fock_trans = fock_bra - fock_ket
             haskey(clustered_ham, fock_trans) || continue
-            haskey(ketl.data, fock_ket) && continue
-            ketl.data[fock_ket] = _spt_sharded_get_ket_block(ket, fock_ket, ket_cache)
+            push!(needed, fock_ket)
+        end
+    end
+    myid = Distributed.myid()
+    local_ket = _spt_sharded_get_state(ket.id)
+    remote = FockConfig{N}[]
+    for fock_ket in needed
+        if ket.owners[fock_ket] == myid
+            ketl.data[fock_ket] = local_ket.data[fock_ket]
+        else
+            push!(remote, fock_ket)
+        end
+    end
+    @sync for fock_ket in remote
+        @async begin
+            owner = ket.owners[fock_ket]
+            block = Distributed.remotecall_fetch(_spt_sharded_local_copy_fock_block,
+                                                 owner, ket.id, fock_ket)
+            block === nothing && error("Missing sharded ket Fock block $fock_ket on owner $owner")
+            ketl.data[fock_ket] = block
         end
     end
 
@@ -1087,6 +1160,14 @@ worker). Grows `dest` in place; metadata is refreshed.
 function nonorth_add_sharded!(dest::DistributedSPTstate{T,N,R},
                               src::DistributedSPTstate{T,N,R}) where {T,N,R}
     dest.workers == src.workers || error("nonorth_add_sharded! requires identical worker lists")
+    # Guard the :hash co-location invariant: a Fock sector present in both states
+    # must be owned by the same worker, or the per-worker nonorth_add! would place
+    # two copies on different workers and the metadata refresh would silently keep
+    # only one (double-count / drop). Cheap metadata-only check.
+    for (fock, owner) in src.owners
+        haskey(dest.owners, fock) && dest.owners[fock] != owner &&
+            error("nonorth_add_sharded! requires :hash-consistent ownership: Fock sector $fock is owned by different workers in dest and src")
+    end
     @sync for pid in dest.workers
         @async Distributed.remotecall_fetch(_spt_nonorth_add_chunk!, pid, dest.id, src.id)
     end
@@ -1110,6 +1191,14 @@ sector and the matching `v1` block are co-located.
 function project_into_new_basis_sharded(v1::DistributedSPTstate{T,N,R},
                                         v2::DistributedSPTstate{T,N,R}) where {T,N,R}
     v1.workers == v2.workers || error("project_into_new_basis_sharded requires identical worker lists")
+    # Guard the :hash co-location invariant: each output (v2) Fock sector is
+    # projected worker-locally using v1's matching block, so a sector shared by
+    # v1 and v2 must be co-located; otherwise the worker would see v1's block as
+    # absent and silently zero it. Cheap metadata-only check.
+    for (fock, owner2) in v2.owners
+        haskey(v1.owners, fock) && v1.owners[fock] != owner2 &&
+            error("project_into_new_basis_sharded requires :hash-consistent ownership: Fock sector $fock is owned by different workers in v1 and v2")
+    end
     output_id = gensym(:spt_shard_project)
     length_maps = Dict{Int,Any}()
     @sync for pid in v2.workers

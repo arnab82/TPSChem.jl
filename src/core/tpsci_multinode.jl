@@ -18,6 +18,14 @@ Intended production layout:
 const _TPSCI_MULTINODE_CI = Ref{Any}(nothing)
 const _TPSCI_MULTINODE_CLUSTER_OPS = Ref{Any}(nothing)
 const _TPSCI_MULTINODE_CLUSTERED_HAM = Ref{Any}(nothing)
+# Master-side memo of the last operator problem shipped to workers, so an
+# unchanged `cluster_ops`/`clustered_ham` object is not re-serialized on every
+# `_tpsci_sharded_cache_operator_problem!` (identity `===` compare). Workers keep
+# their existing copy; only the per-basis term cache is flushed. `nothing` forces
+# a ship (e.g. first call).
+const _TPSCI_LAST_SHIPPED_CLUSTER_OPS = Ref{Any}(nothing)
+const _TPSCI_LAST_SHIPPED_HAM = Ref{Any}(nothing)
+const _TPSCI_LAST_SHIPPED_WORKERS = Ref{Vector{Int}}(Int[])
 const _TPSCI_SHARDED_STATES = Dict{Symbol,Any}()
 const _TPSCI_SHARDED_CLUSTER_OPS = Dict{Symbol,Any}()
 const _TPSCI_SHARDED_CLUSTER_H0_DIAGS = Dict{Tuple{Symbol,String},Any}()
@@ -759,10 +767,20 @@ function collect_tpsci_state(state::DistributedTPSCIstate{T,N,R}) where {T,N,R}
     return out
 end
 
-function _tpsci_sharded_set_operator_cache!(cluster_ops, clustered_ham; blas_threads=1)
-    _TPSCI_MULTINODE_CLUSTER_OPS[] = cluster_ops
-    _TPSCI_MULTINODE_CLUSTERED_HAM[] = clustered_ham
-    # A new operator object invalidates any pre-built SPT term caches
+function _tpsci_sharded_set_operator_cache!(cluster_ops, clustered_ham;
+                                            blas_threads=1,
+                                            keep_ops::Bool=false,
+                                            keep_ham::Bool=false)
+    keep_ops || (_TPSCI_MULTINODE_CLUSTER_OPS[] = cluster_ops)
+    keep_ham || (_TPSCI_MULTINODE_CLUSTERED_HAM[] = clustered_ham)
+    # Flush any per-basis term cache carried on this (possibly kept) Hamiltonian:
+    # the SPT build_sigma path caches contracted Tucker blocks keyed only by
+    # (fock,config) — no factor info — so a basis change would otherwise be able
+    # to read a stale block. Cheap dict-clear; the TPSCI matvec path does not use
+    # term.cache, so this is free for TPSCI.
+    ham = _TPSCI_MULTINODE_CLUSTERED_HAM[]
+    ham === nothing || flush_cache(ham)
+    # A cleared term cache also invalidates the "already pre-built" markers
     # (defined in spt_sharded.jl; see _SPT_SHARDED_PRECACHED).
     empty!(_SPT_SHARDED_PRECACHED)
     blas_threads === nothing || BLAS.set_num_threads(blas_threads)
@@ -773,18 +791,32 @@ function _tpsci_sharded_cache_operator_problem!(cluster_ops, clustered_ham;
                                                 workers=Distributed.workers(),
                                                 blas_threads=1)
     pids = ensure_tpsci_multinode_workers!(workers=workers)
+    # Skip re-serializing an unchanged operator object (identity compare). When
+    # the worker set is unchanged and the object is the same, workers keep their
+    # existing copy and we ship only `nothing` — a basis change is handled by the
+    # term-cache flush inside _tpsci_sharded_set_operator_cache!, not by re-ship.
+    same_workers = _TPSCI_LAST_SHIPPED_WORKERS[] == pids
+    keep_ops = same_workers && cluster_ops === _TPSCI_LAST_SHIPPED_CLUSTER_OPS[]
+    keep_ham = same_workers && clustered_ham === _TPSCI_LAST_SHIPPED_HAM[]
+    ship_ops = keep_ops ? nothing : cluster_ops
+    ship_ham = keep_ham ? nothing : clustered_ham
     @sync for pid in pids
         @async begin
             if pid == Distributed.myid()
-                _tpsci_sharded_set_operator_cache!(cluster_ops, clustered_ham;
-                                                   blas_threads=blas_threads)
+                _tpsci_sharded_set_operator_cache!(ship_ops, ship_ham;
+                                                   blas_threads=blas_threads,
+                                                   keep_ops=keep_ops, keep_ham=keep_ham)
             else
                 Distributed.remotecall_fetch(_tpsci_sharded_set_operator_cache!, pid,
-                                             cluster_ops, clustered_ham;
-                                             blas_threads=blas_threads)
+                                             ship_ops, ship_ham;
+                                             blas_threads=blas_threads,
+                                             keep_ops=keep_ops, keep_ham=keep_ham)
             end
         end
     end
+    _TPSCI_LAST_SHIPPED_CLUSTER_OPS[] = cluster_ops
+    _TPSCI_LAST_SHIPPED_HAM[] = clustered_ham
+    _TPSCI_LAST_SHIPPED_WORKERS[] = copy(pids)
     return pids
 end
 
@@ -861,11 +893,36 @@ end
 function _tpsci_sharded_prefetch_ket_cache(input_state::DistributedTPSCIstate{T,N,R},
                                            clustered_ham, fock_bras) where {T,N,R}
     ket_cache = Dict{FockConfig{N},Any}()
+    # Collect the unique ket Fock sectors these bras need, then fetch the remote
+    # ones concurrently (one @async per owner block) instead of serially. Local
+    # sectors are grabbed by reference. @async tasks share this thread
+    # cooperatively, so the disjoint-key Dict writes do not race (same pattern as
+    # the @sync/@async metadata fan-outs elsewhere).
+    needed = Set{FockConfig{N}}()
     for fock_bra in fock_bras
         for fock_ket in keys(input_state.owners)
             fock_trans = fock_bra - fock_ket
             haskey(clustered_ham, fock_trans) || continue
-            _tpsci_sharded_get_ket_configs(input_state, fock_ket, ket_cache)
+            push!(needed, fock_ket)
+        end
+    end
+    myid = Distributed.myid()
+    local_state = _tpsci_sharded_get_state(input_state.id)
+    remote = FockConfig{N}[]
+    for fock_ket in needed
+        if input_state.owners[fock_ket] == myid
+            ket_cache[fock_ket] = local_state.data[fock_ket]
+        else
+            push!(remote, fock_ket)
+        end
+    end
+    @sync for fock_ket in remote
+        @async begin
+            owner = input_state.owners[fock_ket]
+            block = Distributed.remotecall_fetch(_tpsci_sharded_local_copy_fock_block,
+                                                 owner, input_state.id, fock_ket)
+            block === nothing && error("Missing sharded ket Fock block $fock_ket on owner $owner")
+            ket_cache[fock_ket] = block
         end
     end
     return ket_cache
@@ -1357,6 +1414,83 @@ function add_scaled!(dest::DistributedTPSCIstate{T,N,R}, alpha,
     @sync for pid in dest.workers
         @async Distributed.remotecall_fetch(_tpsci_sharded_local_add_scaled!,
                                             pid, dest.id, alpha, src.id)
+    end
+    return dest
+end
+
+# --- Batched subspace reductions -------------------------------------------
+# One network round-trip for many independent inner products / axpys, instead
+# of one per basis vector. Used by the sharded Davidson (`overlap_batch` for the
+# projected-matrix column, `add_scaled_multi!` for classical Gram-Schmidt).
+
+function _tpsci_sharded_local_overlap_batch(t_id::Symbol, v_ids::Vector{Symbol})
+    t = _tpsci_sharded_get_state(t_id)
+    return [overlap(t, _tpsci_sharded_get_state(vid))[1, 1] for vid in v_ids]
+end
+
+"""
+    overlap_batch(t::DistributedTPSCIstate{T,N,1}, basis) -> Vector{T}
+
+Compute `[⟨t|v⟩ for v in basis]` in a single fan-out per worker (each worker
+returns its per-`v` partial; the master sums). All `basis` vectors must share
+`t`'s worker list. Collapses `length(basis)` round-trips into one.
+"""
+function overlap_batch(t::DistributedTPSCIstate{T,N,1}, basis::AbstractVector) where {T,N}
+    isempty(basis) && return Vector{T}()
+    for b in basis
+        b.workers == t.workers || error("overlap_batch requires identical worker lists")
+    end
+    v_ids = Symbol[b.id for b in basis]
+    partials = Dict{Int,Vector{T}}()
+    @sync for pid in t.workers
+        @async partials[pid] = Distributed.remotecall_fetch(
+            _tpsci_sharded_local_overlap_batch, pid, t.id, v_ids)
+    end
+    out = zeros(T, length(basis))
+    for pid in t.workers
+        out .+= partials[pid]
+    end
+    return out
+end
+
+function _tpsci_sharded_local_add_scaled_multi!(dest_id::Symbol, coeffs::Vector,
+                                                src_ids::Vector{Symbol})
+    dest = _tpsci_sharded_get_state(dest_id)
+    for (c, sid) in zip(coeffs, src_ids)
+        iszero(c) && continue
+        src = _tpsci_sharded_get_state(sid)
+        for (fock, configs) in src.data
+            haskey(dest.data, fock) ||
+                error("Destination sharded state is missing Fock sector $fock")
+            dcfg = dest.data[fock]
+            for (config, coeff) in configs
+                haskey(dcfg, config) ||
+                    error("Destination sharded state is missing config $config in Fock sector $fock")
+                dcfg[config] .+= c .* coeff
+            end
+        end
+    end
+    return true
+end
+
+"""
+    add_scaled_multi!(dest::DistributedTPSCIstate{T,N,1}, coeffs, srcs)
+
+`dest += Σ coeffs[i] * srcs[i]`, applied worker-locally in a single fan-out
+instead of `length(srcs)` separate `add_scaled!` round-trips.
+"""
+function add_scaled_multi!(dest::DistributedTPSCIstate{T,N,1}, coeffs::AbstractVector,
+                           srcs::AbstractVector) where {T,N}
+    length(coeffs) == length(srcs) || error("add_scaled_multi! length mismatch")
+    isempty(srcs) && return dest
+    for s in srcs
+        s.workers == dest.workers || error("add_scaled_multi! requires identical worker lists")
+    end
+    src_ids = Symbol[s.id for s in srcs]
+    cvec = collect(T, coeffs)
+    @sync for pid in dest.workers
+        @async Distributed.remotecall_fetch(_tpsci_sharded_local_add_scaled_multi!,
+                                            pid, dest.id, cvec, src_ids)
     end
     return dest
 end
