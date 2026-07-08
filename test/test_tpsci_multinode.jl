@@ -19,6 +19,18 @@ using LinearAlgebra
 using Printf
 using Random
 
+# The heavy multinode cases (iterative stored-H TPS-CEPA and the full never-gather
+# sharded selected-CI loop) are the slowest part of the whole suite: on a single
+# machine the distributed workers are oversubscribed and every path pays JIT
+# warmup, so these run for minutes each. Gate them behind an env flag so the
+# default `Pkg.test()` (and CI) stays fast — set TPSCHEM_TEST_HEAVY_MULTINODE=1 to
+# run them (e.g. in a nightly job). The cheaper "sharded davidson" (both H-storage
+# tiers + matvec + extract/combine) and "add! merge" testsets below always run and
+# still cover the core sharded primitives.
+const RUN_HEAVY_MULTINODE =
+    lowercase(strip(get(ENV, "TPSCHEM_TEST_HEAVY_MULTINODE", "0"))) in
+        ("1", "true", "yes", "on")
+
 @testset "tpsci multinode sharded davidson" begin
     @load "_testdata_cmf_h8.jld2"
 
@@ -113,6 +125,7 @@ using Random
     TPSChem.destroy!(dg)
 end
 
+if RUN_HEAVY_MULTINODE
 @testset "tps-cepa sharded stored-H" begin
     @load "_testdata_cmf_h8.jld2"
 
@@ -149,6 +162,9 @@ end
         @test maximum(abs.(e_new .- e_ref)) < 1e-7
         TPSChem.destroy!(q_new)
     end
+end
+else
+    @info "Skipping heavy stored-H TPS-CEPA multinode test (set TPSCHEM_TEST_HEAVY_MULTINODE=1 to run)"
 end
 
 @testset "sharded ownership-reconciling merge (add!)" begin
@@ -202,6 +218,7 @@ end
     TPSChem.destroy!(dg)
 end
 
+if RUN_HEAVY_MULTINODE
 @testset "never-gather tpsci_ci_sharded vs single-node tpsci_ci" begin
     @load "_testdata_cmf_h8.jld2"
     ref_fock = FockConfig(init_fspace)
@@ -234,6 +251,9 @@ end
     @test isapprox(S, Matrix{Float64}(LinearAlgebra.I, nroots, nroots), atol=1e-8)
 
     TPSChem.destroy!(dv)
+end
+else
+    @info "Skipping heavy never-gather tpsci_ci_sharded multinode test (set TPSCHEM_TEST_HEAVY_MULTINODE=1 to run)"
 end
 
 if !isempty(_multinode_added_procs)

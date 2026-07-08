@@ -1,11 +1,22 @@
 # Plan: Across-node variational diagonalization for TPSCI
 
-Status: IMPLEMENTED (Phases 0-3). Code in `src/core/tpsci_sharded_davidson.jl`,
-wired into `tpsci_ci_multinode(...; use_sharded=true)`. Tests in
+Status: IMPLEMENTED (Phases 0-3 + never-gather loop). Code in
+`src/core/tpsci_sharded_davidson.jl`, wired into
+`tpsci_ci_multinode(...; use_sharded=true)`. Tests in
 `test/test_tpsci_multinode.jl` (18 checks, sharded energies match `tps_ci_direct`
-to ~2e-11). Example driver + SLURM script in `examples/multinode/`. Remaining
-future work: a fully never-gather selected-CI loop (sharded selection + an
-ownership-reconciling merge) so `vec_var` is never materialized on the master.
+to ~2e-11). Example driver + SLURM script in `examples/multinode/`.
+
+The "future work" fully never-gather selected-CI loop is now DONE: `tpsci_ci_sharded`
+(end of `src/core/tpsci_multinode.jl`, exported) keeps the CI vector as a
+`DistributedTPSCIstate` for the ENTIRE selected-CI loop — sharded Davidson +
+sharded PT1 (`compute_pt1_wavefunction_sharded`) + sharded `clip!` + an
+ownership-reconciling `add!` — so `vec_var` is never materialized on the master
+between iterations. Validated against single-node `tpsci_ci` in
+`test/test_tpsci_multinode.jl` (h8: energies match <1e-6, identical selected
+space). Driver + SLURM script: `examples/multinode/tpsci_ci_sharded_driver.jl`,
+`run_tpsci_ci_sharded_4nodes.slurm`. Known intentional limitations: it errors on
+`incremental`/`thresh_spin`, and whole-sector `thresh_asci`/`thresh_var` clipping
+can trip the `add!` ownership guard (config-level clipping is safe).
 
 ## 1. Problem
 
