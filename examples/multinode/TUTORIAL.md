@@ -633,6 +633,35 @@ FOIS, PT1, and Tucker-CI subspace fit.
 | SPT-PT2 energy only | `compute_pt2_energy_blockwise_distributed` | Worker-local FOIS sector at a time; scalar reductions | FOIS-sector contractions and reference serialization | You only need PT2 energy and want to avoid storing global sigma/PT1 | You need the PT1 wavefunction for later selection |
 | SPT sigma norm / variance | `compute_spt_sigma_norm_blockwise_distributed` | Worker-local FOIS sector at a time; scalar reductions | Same FOIS contractions as PT2, no global sigma | You only need `<sigma|sigma>` / variance diagnostics | You need a reusable sigma vector |
 
+Measured on h12 (compressed dim = 356, 173 Fock sectors, R = 2, one physical
+machine, 2 local workers — deliberately below the crossover, to show the
+overhead floor honestly):
+
+| SPT solver | Where | Time (s) | cached-H / node | state / node | max\|ΔE\| |
+| --- | --- | ---: | --- | --- | ---: |
+| `ci_solve` (cache_hamiltonian + cached GEMM) | 1 node | 33.2 | 0.0038 GB on master | 4.1e-4 GB | ref |
+| `spt_ci_davidson_sharded` (distributed cached H) | 2 workers | 76.9 | 0.0125 GB/worker | 2.3e-4 GB/worker | 4.6e-11 |
+| one sharded matvec, cached (post-2026-07-08 fix) | 2 workers | 1.67 | — | — | — |
+| one sharded matvec, uncached (pre-fix behavior) | 2 workers | 1.21 | — | — | 0.0 (identical σ) |
+| `build_compressed_1st_order_state` (FOIS) | 1 node | 0.1 | — | — | — |
+| `build_compressed_1st_order_state_sharded` | 2 workers | 6.3 | — | — | — |
+
+What this table teaches (read alongside the TPSCI trend in §6.3):
+
+- **dim 356 is far below the sharded crossover** — the same fixed harness
+  costs that gave TPSCI 34× overhead at dim 859 and 2.1× at dim 24K put
+  sharded SPT at ~2.3× here. Path B's value is memory headroom, realized only
+  on compressed spaces large enough to strain a node (the reason it exists).
+- **The Tucker-H cache is neutral at tiny block sizes** (1.67 vs 1.21 s: a
+  dict lookup costs more than contracting a near-scalar Tucker core). The
+  cache wins when per-block contraction ≫ lookup — i.e., on production-size
+  Tucker cores, the same regime where everything else here wins. Correctness
+  is exact either way (identical σ above).
+- The per-worker cached-H bytes exceed the master's at this size because each
+  term owns its own small `Dict` whose fixed overhead dominates near-empty
+  caches on two processes; at production block sizes the payload (dense
+  blocks) dominates and per-worker ≈ aggregate/W.
+
 Practical SPT choice:
 
 - Use single-node SPT while the compressed objects fit; it has the least
