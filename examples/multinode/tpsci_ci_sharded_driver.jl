@@ -28,6 +28,7 @@ ci_max_ss_vecs = env_int("TPSCHEM_MAX_SS_VECS", 4)        # small: each subspace
 blas_threads  = env_int("TPSCHEM_BLAS_THREADS", 1)
 h_storage     = Symbol(get(ENV, "TPSCHEM_H_STORAGE", "auto"))   # auto | blocks | matrixfree
 max_mem_H     = env_float("TPSCHEM_MAX_MEM_H", 50.0)     # GB budget for stored block-sparse H
+allow_mf_fallback = env_bool("TPSCHEM_ALLOW_MATRIXFREE_FALLBACK", false)
 compute_s2    = env_bool("TPSCHEM_COMPUTE_S2", true)
 
 @printf("\n============ Never-gather Sharded Selected TPSCI example ============\n")
@@ -43,6 +44,7 @@ compute_s2    = env_bool("TPSCHEM_COMPUTE_S2", true)
 @printf("max_ss_vecs:     %i\n", ci_max_ss_vecs)
 @printf("h_storage:       %s\n", h_storage)
 @printf("max_mem_H (GB):  %.1f\n", max_mem_H)
+@printf("allow mf fallback: %s\n", string(allow_mf_fallback))
 flush(stdout)
 
 # Shard the cluster operators too, so nothing scales with node count on the master.
@@ -68,6 +70,7 @@ e0, vec_var = TPSChem.tpsci_ci_sharded(
     ci_max_ss_vecs=ci_max_ss_vecs,
     h_storage=h_storage,
     max_mem_H=max_mem_H,
+    allow_matrixfree_fallback=allow_mf_fallback,
     compute_s2=compute_s2,
     workers=workers_,
     threaded_worker=true,
@@ -103,7 +106,8 @@ TPSChem.destroy!(dops)
 #
 # --- 1. SINGLE NODE, auto tier (small-to-medium; simplest) -------------------
 #     The whole loop stays sharded on one worker; :auto stores the block-sparse
-#     H if it fits max_mem_H, else runs matrix-free. Launch: `julia -p 1 ...`.
+#     H if it fits max_mem_H, else errors unless matrix-free fallback is
+#     explicitly allowed. Launch: `julia -p 1 ...`.
 #
 #   ws = workers()                  # a single worker pid
 #   e0, v = TPSChem.tpsci_ci_sharded(ref, cluster_ops, clustered_ham;
@@ -122,9 +126,10 @@ TPSChem.destroy!(dops)
 #               ci_conv=1e-8, ci_max_ss_vecs=4, nbody=4,
 #               h_storage=:blocks, workers=ws, blas_threads=1, verbose=1)
 #
-# --- 3. MULTINODE, matrix-free (minimal memory; even sparse H is too big) -----
+# --- 3. MULTINODE, matrix-free (minimal memory; even stored H is too big) -----
 #     Store nothing; re-contract every matvec. Slowest per iteration but only
-#     vector-scale memory anywhere.
+#     vector-scale memory anywhere. Prefer setting h_storage=:matrixfree
+#     explicitly over relying on fallback.
 #
 #   e0, v = TPSChem.tpsci_ci_sharded(ref, dops, clustered_ham;
 #               thresh_cipsi=1e-3, thresh_foi=1e-5, conv_thresh=1e-6,

@@ -2661,6 +2661,7 @@ function tpsci_ci_sharded(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
                           prescreen=false,
                           h_storage::Symbol=:auto,
                           max_mem_H=50.0,
+                          allow_matrixfree_fallback::Bool=false,
                           compute_s2=true,
                           workers=Distributed.workers(),
                           threaded_worker=true,
@@ -2683,6 +2684,7 @@ function tpsci_ci_sharded(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
     println(" h_storage        : ", h_storage)
     println(" workers          : ", worker_ids)
     println(" threaded_worker  : ", threaded_worker)
+    println(" allow_mf_fallback: ", allow_matrixfree_fallback)
     flush(stdout)
 
     clustered_S2 = extract_S2(ci_vector.clusters)
@@ -2736,13 +2738,24 @@ function tpsci_ci_sharded(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
         orthonormalize!(vec_var)
 
         # Build the stored H on the first iteration; afterwards only extend it
-        # with rows/columns for the newly selected configurations. Falls back
-        # to matrix-free if the (aggregate, distributed) stored H would exceed
-        # max_mem_H.
+        # with rows/columns for the newly selected configurations. Matrix-free
+        # is allowed only when explicitly requested because it is far slower
+        # than stored-H TPSCI for production selected-CI runs.
         tier = h_storage
         if tier == :auto
             rep = sharded_H_memory_report(vec_var, clustered_ham)
-            tier = rep.gb <= max_mem_H ? :blocks : :matrixfree
+            if rep.gb <= max_mem_H
+                tier = :blocks
+            elseif allow_matrixfree_fallback
+                tier = :matrixfree
+            else
+                error("Stored sharded H estimate is $(round(rep.gb; digits=3)) GB, " *
+                      "above max_mem_H=$(max_mem_H) GB. Refusing automatic " *
+                      "matrix-free fallback because it is very slow for TPSCI. " *
+                      "Increase max_mem_H / nodes, force h_storage=:blocks if you " *
+                      "accept the memory use, or set allow_matrixfree_fallback=true " *
+                      "or h_storage=:matrixfree explicitly.")
+            end
             verbose > 0 &&
                 @printf(" H storage :auto -> :%s  (block-sparse H ~ %.3f GB aggregate, budget %.1f GB)\n",
                         tier, rep.gb, max_mem_H)

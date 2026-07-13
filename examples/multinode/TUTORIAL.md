@@ -310,8 +310,10 @@ Davidson.
 ### Step 3 — build H_QQ once, distributed (`h_storage=:blocks`)
 
 (`build_block_h_sharded`; `:auto` first estimates
-`nnz = Σ n_bra·n_ket` over connected sector pairs from metadata alone and
-falls back to matrix-free if it exceeds `max_mem_H`.)
+`nnz = Σ n_bra·n_ket` over connected sector pairs from metadata alone. In the
+standalone Davidson solver it can fall back to matrix-free; in the selected-CI
+driver the default is stricter and refuses that slow fallback unless explicitly
+allowed.)
 
 1. M sends each worker the list of Q sectors it owns (row ownership).
 2. Wk, for each owned `fock_bra` and each connected `fock_ket`: fetches the
@@ -566,7 +568,7 @@ small, so they measure overhead more than production scaling.
 | --- | --- | --- |
 | TPSCI single-node dense (`tps_ci_direct`) | Dense H build + diagonalization on one node | Best for small fixed spaces; do not use multinode for dim=O(10-1000) unless testing |
 | TPSCI sharded Davidson, `h_storage=:blocks` | First build or incrementally extend dense Fock-pair H blocks; then block-GEMV + reductions | Use `:blocks` or `:auto` for repeated Davidson/CEPA matvecs; keep `max_ss_vecs` modest |
-| TPSCI sharded Davidson, `h_storage=:matrixfree` | Re-contracts cluster terms every matvec and fetches ket Fock blocks repeatedly | Use only when block-H memory is impossible; otherwise prefer `:auto` |
+| TPSCI sharded Davidson, `h_storage=:matrixfree` | Re-contracts cluster terms every matvec and fetches ket Fock blocks repeatedly | Use only when block-H memory is impossible; force it explicitly rather than reaching it by accident |
 | SPT compute-distributed Path A | Repeated distributed sigma builds and worker result merges, then local Tucker compression/CI | Good when compressed SPT fits one node; worker setup is now cached to avoid repeated package activation |
 | SPT sharded Path B | Cross-Fock ket block fetches during matvec/FOIS; first cached Tucker-H build | Use when compressed SPT/FOIS/PT1 does not fit one node; keep ownership stable with `:hash` |
 | SPT-PT2 / sigma-norm energy-only | FOIS-sector jobs plus serialized reference state; only scalars return | Use blockwise kernels for memory; avoid building a global sigma if only energy or sigma2 is needed |
@@ -588,7 +590,7 @@ Low-risk fixes already made in the multinode layer:
 | --- | --- | --- | --- |
 | TPSCI variational vector | Sharded by Fock sector in `DistributedTPSCIstate` | Number of selected configurations times roots | Use `tpsci_ci_sharded`; avoid `collect_tpsci_state` except for debug |
 | TPSCI Davidson subspace | Sharded vectors, one full vector per subspace direction | Roughly `max_ss_vecs * nroots` sharded vector copies plus sigmas/residuals | Lower `max_ss_vecs`; rely on the stable restart |
-| TPSCI/CEPA stored block-H | Worker-local dense blocks for connected Fock-sector pairs | `sum(n_bra * n_ket)` over connected block pairs | Use `h_storage=:auto`, set `max_mem_H`, fall back to matrix-free if needed |
+| TPSCI/CEPA stored block-H | Worker-local dense blocks for connected Fock-sector pairs | `sum(n_bra * n_ket)` over connected block pairs | Use `h_storage=:auto`, set `max_mem_H`; selected-CI errors instead of silently using matrix-free |
 | CEPA Q space | Sharded by Fock sector | FOIS threshold and `nbody` define Q-space size | Raise `thresh_foi`, reduce `nbody`, call `destroy!(qspace)` between thresholds |
 | SPT Path A FOIS/PT1/variational state | Master process | Gathered compressed Tucker state, plus local CI subspace copies | Switch to `subspace_product_tucker_sharded` when this reaches node memory |
 | SPT Path B FOIS/PT1/variational state | Sharded `DistributedSPTstate` | Tucker blocks per Fock sector and roots | Use `compress_sharded`, stable `:hash` ownership, and `destroy!` temporaries |
@@ -615,7 +617,10 @@ Practical TPSCI choice:
 - Use `tps_ci_direct` for fixed spaces that fit dense H on one node; it is still
   the fastest because BLAS diagonalization has no network traffic.
 - Use `tpsci_ci_sharded(...; h_storage=:auto)` for selected-CI production. It
-  builds stored H once, then uses incremental updates as the space grows.
+  builds stored H once, then uses incremental updates as the space grows. If the
+  estimate exceeds `max_mem_H`, it now errors by default instead of silently
+  choosing matrix-free; set `allow_matrixfree_fallback=true` only when you
+  intentionally accept that slow path.
 - Treat matrix-free Davidson as a memory fallback, not a speed path. It avoids H
   storage, but repeatedly re-contracts Hamiltonian terms.
 

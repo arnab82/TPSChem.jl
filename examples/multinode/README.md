@@ -177,7 +177,12 @@ sbatch examples/multinode/run_tpsci_ci_sharded_4nodes.slurm
 
 Entry point: `tpsci_ci_sharded(ref, cluster_ops, clustered_ham; thresh_cipsi,
 thresh_foi, h_storage=:auto, max_mem_H, ...)`. The storage tiers
-(`TPSCHEM_H_STORAGE`) behave exactly as for `tps_ci_davidson_sharded` above.
+(`TPSCHEM_H_STORAGE`) use the same stored-H machinery as
+`tps_ci_davidson_sharded`, but selected-CI is stricter: `h_storage=auto` errors
+instead of silently falling back to matrix-free when the stored-H estimate
+exceeds `max_mem_H`. Set `TPSCHEM_H_STORAGE=matrixfree`, or
+`TPSCHEM_ALLOW_MATRIXFREE_FALLBACK=true`, only when you intentionally accept the
+slow memory-only path.
 
 Intentional limitations (documented, not bugs): `tpsci_ci_sharded` errors on
 `incremental` sigma updates and the `thresh_spin` S² space extension — use

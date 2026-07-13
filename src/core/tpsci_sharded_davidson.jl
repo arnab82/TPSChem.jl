@@ -629,6 +629,60 @@ function apply_sharded_H(op::ShardedBlockH{T,N}, v::DistributedTPSCIstate{Tv,N,1
                                                 T, Val(1))
 end
 
+function _block_h_local_diagonal!(diag_id::Symbol, block_id::Symbol,
+                                  state_id::Symbol)
+    return _block_h_local_diagonal_typed!(diag_id,
+                                          _tpsci_sharded_get_block_h(block_id),
+                                          _tpsci_sharded_get_state(state_id))
+end
+
+function _block_h_local_diagonal_typed!(diag_id::Symbol,
+                                        block::ShardedBlockData{T,N},
+                                        state::TPSCIstate{Ts,N,R}) where {T,N,Ts,R}
+    out = TPSCIstate(state.clusters, T=T, R=1)
+    for fock in block.owned_bras
+        Hff = get(block.mats, (fock, fock), nothing)
+        Hff === nothing && error("Stored block-H is missing diagonal block for Fock sector $fock")
+        bra_cfgs = block.bra_order[fock]
+        ket_cfgs = block.ket_order[fock]
+        ket_pos = Dict(c => i for (i, c) in enumerate(ket_cfgs))
+        add_fockconfig!(out, fock)
+        for (bi, cfg) in enumerate(bra_cfgs)
+            ki = get(ket_pos, cfg, 0)
+            ki > 0 || error("Stored block-H diagonal block is missing config $cfg in Fock sector $fock")
+            out[fock][cfg] = MVector{1,T}(Hff[bi, ki])
+        end
+    end
+    _tpsci_sharded_store_state!(diag_id, out)
+    return _tpsci_sharded_local_fock_lengths(diag_id)
+end
+
+"""
+    compute_diagonal_sharded(block_h, ci_vector) -> DistributedTPSCIstate{T,N,1}
+
+Extract the Hamiltonian diagonal directly from an already-built stored
+block-H. This avoids a second matrix-element contraction pass when the
+Davidson preconditioner is used with `h_storage=:blocks`.
+"""
+function compute_diagonal_sharded(op::ShardedBlockH{T,N},
+                                  ci_vector::DistributedTPSCIstate{Tv,N,R};
+                                  id=nothing) where {T,N,Tv,R}
+    op.workers == ci_vector.workers ||
+        error("compute_diagonal_sharded(block_h, state) requires matching workers")
+    output_id = id === nothing ? gensym(:tpsci_shard_blockHdiag) : Symbol(id)
+    length_maps = Dict{Int,Any}()
+    @sync for pid in op.workers
+        @async begin
+            length_maps[pid] = Distributed.remotecall_fetch(
+                _block_h_local_diagonal!, pid, output_id, op.id, ci_vector.id)
+        end
+    end
+    return _tpsci_sharded_metadata_from_lengths(output_id, op.clusters,
+                                                op.workers, length_maps,
+                                                collect(keys(ci_vector.owners)),
+                                                T, Val(1))
+end
+
 function destroy!(op::ShardedBlockH)
     @sync for pid in op.workers
         @async Distributed.remotecall_fetch(_tpsci_sharded_delete_block_h!, pid, op.id)
@@ -898,10 +952,6 @@ function tps_ci_davidson_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
         flush(stdout)
     end
 
-    # Diagonal preconditioner (also primes the operator cache on all workers).
-    Hdiag = compute_diagonal_sharded(ci_vector, cluster_ops, clustered_ham;
-                                     workers=worker_ids, blas_threads=blas_threads)
-
     owns_block_h = false
     if block_h !== nothing
         # Caller-managed stored H (e.g. tpsci_ci_sharded reusing/updating one
@@ -909,6 +959,7 @@ function tps_ci_davidson_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
         block_h.workers == worker_ids ||
             error("supplied block_h lives on different workers than the guess")
         apply_H = v -> apply_sharded_H(block_h, v)
+        Hdiag = compute_diagonal_sharded(block_h, ci_vector)
     else
         # Decide storage tier.
         tier = h_storage
@@ -925,7 +976,12 @@ function tps_ci_davidson_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
                                             verbose=verbose)
             owns_block_h = true
             apply_H = v -> apply_sharded_H(block_h, v)
+            Hdiag = compute_diagonal_sharded(block_h, ci_vector)
         elseif tier == :matrixfree
+            # Diagonal preconditioner also primes the operator cache on workers.
+            Hdiag = compute_diagonal_sharded(ci_vector, cluster_ops, clustered_ham;
+                                             workers=worker_ids,
+                                             blas_threads=blas_threads)
             op = MatrixFreeShardedH(cluster_ops, clustered_ham, worker_ids,
                                     threaded_worker, Int(blas_threads))
             apply_H = v -> apply_sharded_H(op, v)
