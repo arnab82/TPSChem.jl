@@ -189,8 +189,25 @@ coefficient vector `v` (dim × R). Each Davidson iteration:
 3. Wk → M: `(rows, values)`; M assembles the full σ (move 3/4 hybrid) and
    runs the standard dense Davidson update on it.
 
-**Sharded path** (`tps_ci_davidson_sharded`): subspace vectors `V` and sigmas
-`HV` are lists of R=1 sharded states. Per iteration:
+**Stored-H direct sharded path** (`tps_ci_direct_sharded`, used by
+`tpsci_ci_sharded` when `h_storage=:blocks`): the Hamiltonian is distributed as
+dense Fock-pair blocks, while the small Davidson subspace is kept as dense
+coefficient matrices on the master. Per iteration:
+
+1. M holds only `V` / `HV` coefficient matrices, not H.
+2. M splits each dense coefficient block by Fock sector and sends these small
+   blocks to workers.
+3. Wk applies its owned Hamiltonian row blocks with batched GEMM
+   (`H_block * X_ket`) and returns only output coefficient rows.
+4. M runs the same small projected Davidson algebra used by `tps_ci_direct`.
+
+This is the distributed analog of `tps_ci_direct`: build stored H once, keep it
+spread over workers, and use BLAS-like dense coefficient matvecs without
+gathering H onto one node.
+
+**Matrix-free sharded path** (`tps_ci_davidson_sharded` with
+`h_storage=:matrixfree`): subspace vectors `V` and sigmas `HV` are lists of R=1
+sharded states. Per iteration:
 
 1. σ = H·v via `tps_ci_matvec_sharded`:
    - M sends each worker the list of *its own* output sectors (move 1, tiny).
@@ -199,16 +216,8 @@ coefficient vector `v` (dim × R). Each Davidson iteration:
      threads over its owned (fock_bra, config_bra) pairs computing
      `Σ_ket Σ_terms contract_matrix_element·v[ket]` into its local σ block.
    - Wk → M: `{fock: length}` (move 4). σ stays distributed.
-   With `h_storage=:blocks` (Tier A) the contraction is replaced by dense
-   block-GEMV against Hamiltonian sub-blocks (see §3 Step 3, same machinery).
-   In `tpsci_ci_sharded` this stored H is the workhorse for the whole run:
-   built once at the first iteration and **extended incrementally** as the
-   space grows (`update_block_h_sharded!` — previously computed elements are
-   copied; only rows/columns for the newly selected configurations are
-   contracted, per block `n_bra_new·n_ket + n_bra_old·n_ket_new` instead of
-   `n_bra·n_ket`). This is the distributed analog of `tps_ci_direct`'s
-   build-once + `H_old`/`v_old` reuse — direct-like speed with H spread over
-   aggregate cluster memory instead of one node's.
+   In selected-CI production this is now an explicit fallback, not the normal
+   stored-H path.
 2. Small projected matrix: `Hss[i,j] = overlap(V[i], HV[j])` — each worker
    returns one number per pair (move 3); M holds only the k×k `Hss`.
 3. M: `eigen(Symmetric(Hss))` → Ritz values θ and coefficients y (tiny).
@@ -589,7 +598,8 @@ Low-risk fixes already made in the multinode layer:
 | Object | Memory owner | Why it grows | Control knob |
 | --- | --- | --- | --- |
 | TPSCI variational vector | Sharded by Fock sector in `DistributedTPSCIstate` | Number of selected configurations times roots | Use `tpsci_ci_sharded`; avoid `collect_tpsci_state` except for debug |
-| TPSCI Davidson subspace | Sharded vectors, one full vector per subspace direction | Roughly `max_ss_vecs * nroots` sharded vector copies plus sigmas/residuals | Lower `max_ss_vecs`; rely on the stable restart |
+| TPSCI stored-H direct subspace | Dense coefficient matrices on master; H stays sharded | `dim * max_ss_vecs * nroots`, usually much smaller than H | Lower `max_ss_vecs`; use `tps_ci_direct_sharded` / stored-H selected-CI |
+| TPSCI matrix-free Davidson subspace | Sharded vectors, one full vector per subspace direction | Roughly `max_ss_vecs * nroots` sharded vector copies plus sigmas/residuals | Use only when stored H cannot fit; lower `max_ss_vecs` |
 | TPSCI/CEPA stored block-H | Worker-local dense blocks for connected Fock-sector pairs | `sum(n_bra * n_ket)` over connected block pairs | Use `h_storage=:auto`, set `max_mem_H`; selected-CI errors instead of silently using matrix-free |
 | CEPA Q space | Sharded by Fock sector | FOIS threshold and `nbody` define Q-space size | Raise `thresh_foi`, reduce `nbody`, call `destroy!(qspace)` between thresholds |
 | SPT Path A FOIS/PT1/variational state | Master process | Gathered compressed Tucker state, plus local CI subspace copies | Switch to `subspace_product_tucker_sharded` when this reaches node memory |
@@ -606,7 +616,7 @@ one node** and **stored block-H spread over workers**.
 | Solver | Where | Time (s) | H memory | Vector memory | max\|ΔE\| | Use when |
 | --- | --- | ---: | --- | --- | ---: | --- |
 | `tps_ci_direct` dense H + BLAS | 1 node | 56.4 | 4.78 GB on one node | 5.9e-4 GB | ref | Fastest when dense H fits comfortably on one node |
-| Sharded stored-H: fresh H build + Davidson GEMV | 2 workers | 67.2 build + 49.8 solve = 117.0 | 1.32 GB max/worker, 1.99 GB aggregate reported | 3.7e-4 GB/worker | 1.1e-12 | Production path when dense H is too large for one node but stored block-H fits across workers |
+| `tps_ci_direct_sharded`: fresh stored-H build + batched GEMM Davidson | 2 workers | 67.2 build + 49.8 solve = 117.0 | 1.32 GB max/worker, 1.99 GB aggregate reported | 3.7e-4 GB/worker | 1.1e-12 | Production path when dense H is too large for one node but stored block-H fits across workers |
 | Sharded stored-H: incremental update 22,481 -> 24,438, 8% growth | 2 workers | 34.4 update, vs 67.2 fresh, 49% saved | reused | reused | 0.0e+00 | Best path inside selected-CI growth after the first stored-H build |
 | Sharded stored-H: incremental update 9,570 -> 22,481, 57% growth | 2 workers | 51.5 update, about 25% saved | reused | reused | - | Still helpful for large growth; savings improve as the added fraction shrinks |
 | `tps_ci_davidson` matrix-free | 1 node | ~5,200 estimated | 0 | - | skipped | Only if dense H memory is impossible and no sharded stored-H run is available |
@@ -617,10 +627,15 @@ Practical TPSCI choice:
 - Use `tps_ci_direct` for fixed spaces that fit dense H on one node; it is still
   the fastest because BLAS diagonalization has no network traffic.
 - Use `tpsci_ci_sharded(...; h_storage=:auto)` for selected-CI production. It
-  builds stored H once, then uses incremental updates as the space grows. If the
-  estimate exceeds `max_mem_H`, it now errors by default instead of silently
+  builds stored H once, solves each variational step with
+  `tps_ci_direct_sharded`, then uses incremental updates as the space grows. If
+  the estimate exceeds `max_mem_H`, it now errors by default instead of silently
   choosing matrix-free; set `allow_matrixfree_fallback=true` only when you
   intentionally accept that slow path.
+- Use standalone `tps_ci_direct_sharded(...; h_storage=:auto)` for fixed spaces
+  when you want the same strict stored-H behavior. If you truly need memory-only
+  operation, call `tps_ci_davidson_sharded(...; h_storage=:matrixfree)`
+  explicitly.
 - Treat matrix-free Davidson as a memory fallback, not a speed path. It avoids H
   storage, but repeatedly re-contracts Hamiltonian terms.
 

@@ -115,9 +115,14 @@ single implementation for both the matrix-free and stored-block Hamiltonians.
 
 ## Across-node variational diagonalization
 
-When the variational CI vector exceeds a single node's memory, diagonalize it
-with `tps_ci_davidson_sharded`: a Davidson solver whose subspace vectors are
-themselves `DistributedTPSCIstate`s and are never gathered onto the master.
+When the variational CI vector exceeds a single node's memory, there are two
+fixed-space sharded diagonalizers:
+
+- `tps_ci_direct_sharded`: stored block-H across workers, dense Davidson
+  coefficient subspace on the master, and batched worker GEMM for `H*X`. This is
+  the multinode analogue of `tps_ci_direct` and is the fast stored-H path.
+- `tps_ci_davidson_sharded`: fully sharded state-vector Davidson, useful for
+  matrix-free operation when stored H cannot fit.
 
 ```bash
 export TPSCHEM_INPUT_JLD2=/path/to/problem_with_variational_space.jld2
@@ -132,13 +137,18 @@ Storage tiers (`TPSCHEM_H_STORAGE`):
 
 - `blocks`     — build the Hamiltonian once as distributed, block-sparse dense
                  Fock-pair blocks and reuse them via block GEMV every iteration.
-                 This recovers the per-iteration speed of `tps_ci_direct` without
-                 ever forming a `dim × dim` dense matrix. Needs the block-sparse H
+                 `tps_ci_direct_sharded` uses these blocks with dense
+                 coefficient matrices and batched GEMM. Needs the block-sparse H
                  to fit aggregate memory.
 - `matrixfree` — re-contract the cluster operators every matvec (via
                  `tps_ci_matvec_sharded`). Minimal memory, slower per iteration.
 - `auto`       — pick `blocks` if the estimated block-sparse H fits within
                  `TPSCHEM_MAX_MEM_H` GB, else `matrixfree`.
+
+`tps_ci_direct_sharded(...; h_storage=:auto)` is stricter: it uses `blocks` only
+when the estimate fits and otherwise errors, because direct-sharded has no
+matrix-free mode. Use `tps_ci_davidson_sharded(...; h_storage=:matrixfree)` when
+you intentionally want the memory-only fallback.
 
 Check the block-sparse H size before committing to a run:
 
@@ -155,8 +165,9 @@ PT/selection steps still gather `vec_var` on the master.
 
 When even the *variational* CI vector must never be gathered between selected-CI
 iterations, use `tpsci_ci_sharded` (`tpsci_ci_sharded_driver.jl`). The vector
-stays a `DistributedTPSCIstate` for the **entire** selected-CI loop: sharded
-Davidson diagonalization, sharded PT1 selection
+stays a `DistributedTPSCIstate` for the **entire** selected-CI loop: stored-H
+direct sharded diagonalization (`tps_ci_direct_sharded`) when
+`h_storage=:blocks`, sharded PT1 selection
 (`compute_pt1_wavefunction_sharded`), sharded `clip!`, and an ownership-
 reconciling `add!` grow the variational space in place. No full CI vector is
 ever materialized on the master or on any single node. The (small) starting
@@ -177,10 +188,10 @@ sbatch examples/multinode/run_tpsci_ci_sharded_4nodes.slurm
 
 Entry point: `tpsci_ci_sharded(ref, cluster_ops, clustered_ham; thresh_cipsi,
 thresh_foi, h_storage=:auto, max_mem_H, ...)`. The storage tiers
-(`TPSCHEM_H_STORAGE`) use the same stored-H machinery as
-`tps_ci_davidson_sharded`, but selected-CI is stricter: `h_storage=auto` errors
-instead of silently falling back to matrix-free when the stored-H estimate
-exceeds `max_mem_H`. Set `TPSCHEM_H_STORAGE=matrixfree`, or
+(`TPSCHEM_H_STORAGE`) use stored block-H plus `tps_ci_direct_sharded` for the
+normal fast path. Selected-CI is strict: `h_storage=auto` errors instead of
+silently falling back to matrix-free when the stored-H estimate exceeds
+`max_mem_H`. Set `TPSCHEM_H_STORAGE=matrixfree`, or
 `TPSCHEM_ALLOW_MATRIXFREE_FALLBACK=true`, only when you intentionally accept the
 slow memory-only path.
 

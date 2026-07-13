@@ -1,12 +1,12 @@
 include("common.jl")
 
 # Never-gather selected TPSCI. The variational vector lives across workers as a
-# `DistributedTPSCIstate` for the ENTIRE selected-CI loop: the diagonalization
-# (sharded Davidson), the PT1 selection, clipping, and the variational-space
-# growth all operate on sharded states, so no full CI vector is ever
-# materialized on the master or on any single node. This is the solver for the
-# case where even the variational CI vector exceeds a single node's memory and
-# must never be gathered between selected-CI iterations.
+# `DistributedTPSCIstate` for the ENTIRE selected-CI loop. With stored H
+# (`h_storage=:blocks` / fitting `:auto`) the diagonalization uses
+# `tps_ci_direct_sharded`: H is distributed across workers and H*X is evaluated
+# with batched dense coefficient GEMM. PT1 selection, clipping, and
+# variational-space growth stay sharded too, so no full CI vector is ever
+# materialized on the master or on any single node.
 
 workers_ = init_multinode_workers!()
 data = load_problem_data()
@@ -22,7 +22,7 @@ thresh_var    = env_bool("TPSCHEM_USE_THRESH_VAR", false) ?
 max_iter      = env_int("TPSCHEM_MAX_ITER", 10)
 conv_thresh   = env_float("TPSCHEM_CONV_THRESH", 1e-4)    # outer selected-CI convergence
 nbody         = env_int("TPSCHEM_NBODY", 4)
-ci_conv       = env_float("TPSCHEM_CI_CONV", 1e-8)        # inner Davidson convergence
+ci_conv       = env_float("TPSCHEM_CI_CONV", 1e-8)        # inner diagonalization convergence
 ci_max_iter   = env_int("TPSCHEM_CI_MAX_ITER", 100)
 ci_max_ss_vecs = env_int("TPSCHEM_MAX_SS_VECS", 4)        # small: each subspace vec is another full vector
 blas_threads  = env_int("TPSCHEM_BLAS_THREADS", 1)
@@ -117,7 +117,7 @@ TPSChem.destroy!(dops)
 #
 # --- 2. MULTINODE, force stored block-sparse H, sharded cluster ops ----------
 #     For a >node-memory vector and H spread across nodes; cluster ops sharded.
-#     Keep ci_max_ss_vecs small — each subspace vector is another full vector.
+#     This is the fast direct-sharded stored-H path.
 #
 #   dops = TPSChem.compute_cluster_ops_distributed(cluster_bases, ints; workers=ws)
 #   TPSChem.add_cmf_operators_distributed!(dops, cluster_bases, ints, d1.a, d1.b)

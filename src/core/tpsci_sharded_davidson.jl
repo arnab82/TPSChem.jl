@@ -683,6 +683,353 @@ function compute_diagonal_sharded(op::ShardedBlockH{T,N},
                                                 T, Val(1))
 end
 
+function _tpsci_sharded_local_dense_coefficients(state_id::Symbol, owned_focks)
+    state = _tpsci_sharded_get_state(state_id)
+    return _tpsci_sharded_local_dense_coefficients_typed(state, owned_focks)
+end
+
+function _tpsci_sharded_local_dense_coefficients_typed(state::TPSCIstate{T,N,R},
+                                                       owned_focks) where {T,N,R}
+    chunks = Dict{FockConfig{N},Matrix{T}}()
+    for fock in owned_focks
+        configs = state.data[fock]
+        X = zeros(T, length(configs), R)
+        for (i, (_, coeffs)) in enumerate(configs)
+            @views X[i, :] .= coeffs
+        end
+        chunks[fock] = X
+    end
+    return chunks
+end
+
+"""
+    dense_coefficients_sharded(state) -> Matrix
+
+Gather only the dense coefficient matrix for a sharded TPSCI state. This does
+not gather the Hamiltonian or configuration metadata beyond the already-known
+master-side offsets, and is used by the stored-H sharded direct solver where the
+Davidson subspace is intentionally kept as dense coefficient matrices.
+"""
+function dense_coefficients_sharded(state::DistributedTPSCIstate{T,N,R}) where {T,N,R}
+    chunks_by_pid = Dict(pid => FockConfig{N}[] for pid in state.workers)
+    for (fock, owner) in state.owners
+        push!(chunks_by_pid[owner], fock)
+    end
+
+    partials = Dict{Int,Dict{FockConfig{N},Matrix{T}}}()
+    @sync for pid in state.workers
+        @async begin
+            partials[pid] = Distributed.remotecall_fetch(
+                _tpsci_sharded_local_dense_coefficients, pid,
+                state.id, chunks_by_pid[pid])
+        end
+    end
+
+    X = zeros(T, length(state), R)
+    for pid in state.workers
+        for (fock, Xf) in partials[pid]
+            off = state.offsets[fock]
+            len = state.lengths[fock]
+            @views X[off:off + len - 1, :] .= Xf
+        end
+    end
+    return X
+end
+
+function _dense_coeff_chunks_from_global(state::DistributedTPSCIstate{T,N,R},
+                                         X::AbstractMatrix) where {T,N,R}
+    size(X, 1) == length(state) || throw(DimensionMismatch("coefficient row count does not match sharded state length"))
+    chunks = Dict{FockConfig{N},Matrix{T}}()
+    for (fock, len) in state.lengths
+        off = state.offsets[fock]
+        chunks[fock] = Matrix{T}(@view X[off:off + len - 1, :])
+    end
+    return chunks
+end
+
+function _tpsci_sharded_local_set_dense_coefficients!(state_id::Symbol, chunks)
+    state = _tpsci_sharded_get_state(state_id)
+    return _tpsci_sharded_local_set_dense_coefficients_typed!(state, chunks)
+end
+
+function _tpsci_sharded_local_set_dense_coefficients_typed!(state::TPSCIstate{T,N,R},
+                                                            chunks) where {T,N,R}
+    for (fock, Xf) in chunks
+        haskey(state.data, fock) ||
+            error("Destination sharded state is missing Fock sector $fock")
+        size(Xf, 2) == R ||
+            throw(DimensionMismatch("coefficient root count does not match destination state"))
+        configs = state.data[fock]
+        size(Xf, 1) == length(configs) ||
+            throw(DimensionMismatch("coefficient block length does not match Fock sector $fock"))
+        for (i, (_, coeffs)) in enumerate(configs)
+            @views coeffs .= Xf[i, :]
+        end
+    end
+    return true
+end
+
+function set_dense_coefficients_sharded!(state::DistributedTPSCIstate{T,N,R},
+                                         X::AbstractMatrix) where {T,N,R}
+    size(X) == (length(state), R) ||
+        throw(DimensionMismatch("coefficient matrix size $(size(X)) does not match sharded state size $(size(state))"))
+    chunks_by_pid = Dict(pid => Dict{FockConfig{N},Matrix{T}}() for pid in state.workers)
+    for (fock, owner) in state.owners
+        off = state.offsets[fock]
+        len = state.lengths[fock]
+        chunks_by_pid[owner][fock] = Matrix{T}(@view X[off:off + len - 1, :])
+    end
+    @sync for pid in state.workers
+        @async Distributed.remotecall_fetch(_tpsci_sharded_local_set_dense_coefficients!,
+                                            pid, state.id, chunks_by_pid[pid])
+    end
+    return state
+end
+
+function _block_h_local_apply_dense(block_id::Symbol, x_chunks)
+    block = _tpsci_sharded_get_block_h(block_id)
+    return _block_h_local_apply_dense_typed(block, x_chunks)
+end
+
+function _block_h_local_apply_dense_typed(block::ShardedBlockData{T,N},
+                                          x_chunks) where {T,N}
+    nrhs = isempty(x_chunks) ? 0 : size(first(values(x_chunks)), 2)
+    y_chunks = Dict{FockConfig{N},Matrix{T}}()
+    for fock_bra in block.owned_bras
+        bra_cfgs = block.bra_order[fock_bra]
+        Yb = zeros(T, length(bra_cfgs), nrhs)
+        for fock_ket in block.connections[fock_bra]
+            haskey(x_chunks, fock_ket) ||
+                error("Dense sharded H apply is missing ket coefficient block for $fock_ket")
+            Hblk = block.mats[(fock_bra, fock_ket)]
+            Xk = x_chunks[fock_ket]
+            mul!(Yb, Hblk, Xk, one(T), one(T))
+        end
+        y_chunks[fock_bra] = Yb
+    end
+    return y_chunks
+end
+
+"""
+    apply_sharded_H_dense(block_h, ci_vector, X)
+
+Apply a stored sharded block Hamiltonian to one or more dense coefficient
+vectors. `X` lives on the master as `dim × nrhs`; the Hamiltonian blocks stay on
+workers. Each worker receives the small dense coefficient blocks and performs
+batched GEMM for its owned row blocks, then returns only its output rows.
+"""
+function apply_sharded_H_dense(op::ShardedBlockH{T,N},
+                               ci_vector::DistributedTPSCIstate{Tv,N,R},
+                               X::Union{AbstractVector,AbstractMatrix}) where {T,N,Tv,R}
+    op.workers == ci_vector.workers ||
+        error("apply_sharded_H_dense requires the block-H and state on the same workers")
+    isvec = X isa AbstractVector
+    Xmat = isvec ? reshape(Vector{T}(X), :, 1) : Matrix{T}(X)
+    size(Xmat, 1) == length(ci_vector) ||
+        throw(DimensionMismatch("coefficient row count does not match sharded state length"))
+    x_chunks = _dense_coeff_chunks_from_global(ci_vector, Xmat)
+
+    partials = Dict{Int,Dict{FockConfig{N},Matrix{T}}}()
+    @sync for pid in op.workers
+        @async begin
+            partials[pid] = Distributed.remotecall_fetch(
+                _block_h_local_apply_dense, pid, op.id, x_chunks)
+        end
+    end
+
+    Y = zeros(T, length(ci_vector), size(Xmat, 2))
+    for pid in op.workers
+        for (fock, Yf) in partials[pid]
+            off = ci_vector.offsets[fock]
+            len = ci_vector.lengths[fock]
+            @views Y[off:off + len - 1, :] .= Yf
+        end
+    end
+    return isvec ? Y[:, 1] : Y
+end
+
+function _block_h_local_dense_diagonal(block_id::Symbol)
+    block = _tpsci_sharded_get_block_h(block_id)
+    return _block_h_local_dense_diagonal_typed(block)
+end
+
+function _block_h_local_dense_diagonal_typed(block::ShardedBlockData{T,N}) where {T,N}
+    chunks = Dict{FockConfig{N},Vector{T}}()
+    for fock in block.owned_bras
+        Hff = get(block.mats, (fock, fock), nothing)
+        Hff === nothing && error("Stored block-H is missing diagonal block for Fock sector $fock")
+        bra_cfgs = block.bra_order[fock]
+        ket_cfgs = block.ket_order[fock]
+        ket_pos = Dict(c => i for (i, c) in enumerate(ket_cfgs))
+        d = zeros(T, length(bra_cfgs))
+        for (bi, cfg) in enumerate(bra_cfgs)
+            ki = get(ket_pos, cfg, 0)
+            ki > 0 || error("Stored block-H diagonal block is missing config $cfg in Fock sector $fock")
+            d[bi] = Hff[bi, ki]
+        end
+        chunks[fock] = d
+    end
+    return chunks
+end
+
+function compute_diagonal_dense_sharded(op::ShardedBlockH{T,N},
+                                        ci_vector::DistributedTPSCIstate{Tv,N,R}) where {T,N,Tv,R}
+    op.workers == ci_vector.workers ||
+        error("compute_diagonal_dense_sharded requires the block-H and state on the same workers")
+    partials = Dict{Int,Dict{FockConfig{N},Vector{T}}}()
+    @sync for pid in op.workers
+        @async begin
+            partials[pid] = Distributed.remotecall_fetch(
+                _block_h_local_dense_diagonal, pid, op.id)
+        end
+    end
+    d = zeros(T, length(ci_vector))
+    for pid in op.workers
+        for (fock, df) in partials[pid]
+            off = ci_vector.offsets[fock]
+            len = ci_vector.lengths[fock]
+            @views d[off:off + len - 1] .= df
+        end
+    end
+    return d
+end
+
+"""
+    tps_ci_direct_sharded(ci_vector, cluster_ops, clustered_ham; ...)
+
+Stored-H sharded analogue of `tps_ci_direct`. The Hamiltonian is kept as
+distributed dense Fock-pair blocks (`ShardedBlockH`), while the small Davidson
+subspace is held as dense coefficient matrices on the master. Hamiltonian
+applications use batched worker-local GEMM, so neither the full Hamiltonian nor
+the full TPSCI state/configuration payload is gathered onto one node.
+
+For large spaces this intentionally mirrors `tps_ci_direct`'s practical solver:
+stored Hamiltonian plus Davidson iterations. It is not the matrix-free sharded
+Davidson path.
+"""
+function tps_ci_direct_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
+                               cluster_ops, clustered_ham::ClusteredOperator;
+                               nroots::Int=R,
+                               conv_thresh=1e-5,
+                               lindep_thresh=1e-12,
+                               max_ss_vecs=12,
+                               max_iter=40,
+                               precond=true,
+                               h_storage::Symbol=:blocks,
+                               max_mem_H=50.0,
+                               block_h::Union{Nothing,ShardedBlockH}=nothing,
+                               workers=ci_vector.workers,
+                               blas_threads=1,
+                               compute_s2=true,
+                               verbose=1,
+                               id=nothing) where {T,N,R}
+    nroots <= R ||
+        error("tps_ci_direct_sharded needs the guess to carry at least nroots ($nroots) roots; got R=$R")
+    worker_ids = ensure_tpsci_multinode_workers!(workers=workers)
+    worker_ids == ci_vector.workers ||
+        error("tps_ci_direct_sharded requires the guess on the requested workers")
+
+    tier = h_storage
+    if block_h === nothing
+        if tier == :auto
+            rep = sharded_H_memory_report(ci_vector, clustered_ham)
+            rep.gb <= max_mem_H ||
+                error("tps_ci_direct_sharded requires stored block-H, but the estimate is " *
+                      "$(round(rep.gb; digits=3)) GB above max_mem_H=$(max_mem_H) GB. " *
+                      "Increase max_mem_H/nodes or use tps_ci_davidson_sharded with h_storage=:matrixfree explicitly.")
+            tier = :blocks
+            verbose > 0 &&
+                @printf(" H storage :auto -> :blocks  (block-sparse H ~ %.3f GB, budget %.1f GB)\n",
+                        rep.gb, max_mem_H)
+        elseif tier != :blocks
+            error("tps_ci_direct_sharded only supports stored block-H (:blocks or fitting :auto); got h_storage=:$tier")
+        end
+        block_h = build_block_h_sharded(ci_vector, cluster_ops, clustered_ham;
+                                        workers=worker_ids,
+                                        blas_threads=blas_threads,
+                                        verbose=verbose)
+    else
+        block_h.workers == worker_ids ||
+            error("supplied block_h lives on different workers than the guess")
+    end
+
+    verbose > 0 && begin
+        println()
+        @printf(" |== Sharded Direct Tensor Product State CI ========================\n")
+        @printf(" Hamiltonian matrix dimension = %i\n", length(ci_vector))
+        @printf(" nroots = %i   max_ss_vecs = %i   conv_thresh = %.1e\n",
+                nroots, max_ss_vecs, conv_thresh)
+        flush(stdout)
+    end
+
+    X0 = dense_coefficients_sharded(ci_vector)
+    X0 = Matrix{T}(@view X0[:, 1:nroots])
+    dim = length(ci_vector)
+
+    function matvec(v::Vector)
+        return apply_sharded_H_dense(block_h, ci_vector, v)
+    end
+    function matvec(v::Matrix)
+        return apply_sharded_H_dense(block_h, ci_vector, v)
+    end
+
+    Hmap = LinOpMat{T}(matvec, dim, true)
+    davidson = Davidson(Hmap, v0=X0,
+                        max_iter=max_iter, max_ss_vecs=max_ss_vecs,
+                        nroots=nroots, tol=conv_thresh,
+                        lindep_thresh=lindep_thresh)
+
+    e = nothing
+    v = nothing
+    elapsed = if precond
+        verbose > 0 && @printf(" %-50s", "Extract stored-H diagonal: ")
+        diag_time = @elapsed Hd = compute_diagonal_dense_sharded(block_h, ci_vector)
+        verbose > 0 && @printf("%10.6f seconds\n", diag_time)
+        verbose > 0 && (println(" Now iterate with sharded stored-H GEMM: "); flush(stdout))
+        @elapsed e, v = BlockDavidson.eigs(davidson, Adiag=Hd)
+    else
+        verbose > 0 && (println(" Now iterate with sharded stored-H GEMM: "); flush(stdout))
+        @elapsed e, v = BlockDavidson.eigs(davidson)
+    end
+
+    vmat = v isa AbstractMatrix ? Matrix{T}(@view v[:, 1:nroots]) :
+           Matrix{T}(hcat(v[1:nroots]...))
+    vec_out = similar_sharded_state(ci_vector; roots=nroots, id=id)
+    set_dense_coefficients_sharded!(vec_out, vmat)
+
+    if verbose > 0
+        @printf(" %-50s%10.6f seconds\n", "Diagonalization time: ", elapsed)
+    end
+
+    if compute_s2
+        clustered_S2 = extract_S2(ci_vector.clusters, T=T)
+        verbose > 0 && @printf(" %-50s", "Compute S2 expectation values: ")
+        s2_time = @elapsed begin
+            sig_s2 = tps_ci_matvec_sharded(vec_out, cluster_ops, clustered_S2;
+                                           workers=worker_ids,
+                                           blas_threads=blas_threads,
+                                           verbose=0)
+            s2 = LinearAlgebra.diag(overlap(vec_out, sig_s2))
+            destroy!(sig_s2)
+        end
+        if verbose > 0
+            @printf("%10.6f seconds\n", s2_time)
+            @printf(" %5s %12s %12s\n", "Root", "Energy", "S2")
+            for r in 1:nroots
+                @printf(" %5i %12.8f %12.8f\n", r, e[r], abs(s2[r]))
+            end
+        end
+    elseif verbose > 0
+        @printf(" %5s %18s\n", "Root", "Energy")
+        for r in 1:nroots
+            @printf(" %5i %18.10f\n", r, e[r])
+        end
+    end
+
+    verbose > 0 && @printf(" ==================================================================|\n")
+    return Vector{T}(e[1:nroots]), vec_out, block_h
+end
+
 function destroy!(op::ShardedBlockH)
     @sync for pid in op.workers
         @async Distributed.remotecall_fetch(_tpsci_sharded_delete_block_h!, pid, op.id)

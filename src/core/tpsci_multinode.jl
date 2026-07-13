@@ -2370,10 +2370,11 @@ end
     tpsci_ci_multinode(ci_vector, cluster_ops, clustered_ham; ...)
 
 Run selected TPSCI using multinode kernels with the replicated TPSCI-state
-backend. This path always uses the matrix-free distributed Davidson solver
-instead of building the dense CI Hamiltonian, but it still caches the full
-`ci_vector` on each worker. For CI vectors larger than per-node memory, use this
-only as a stepping stone toward a sharded distributed state.
+backend. With `use_sharded=true`, the variational diagonalization can use
+stored-H sharded direct diagonalization (`tps_ci_direct_sharded`) or explicit
+matrix-free sharded Davidson. The PT/selection steps still gather the full
+`ci_vector` on the master, so for CI vectors larger than per-node memory use
+`tpsci_ci_sharded`.
 """
 function tpsci_ci_multinode(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
                             clustered_ham::ClusteredOperator;
@@ -2480,7 +2481,8 @@ function tpsci_ci_multinode(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
         end
 
         mem_needed = sizeof(T) * length(vec_var) * length(vec_var) * 1e-9
-        @printf(" Dense CI matrix would need: %12.8f (Gb); multinode path uses matrix-free Davidson\n", mem_needed)
+        @printf(" Dense CI matrix would need: %12.8f (Gb); multinode h_storage=%s\n",
+                mem_needed, string(h_storage))
         flush(stdout)
 
         @timeit to "distributed ci" begin
@@ -2496,18 +2498,35 @@ function tpsci_ci_multinode(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
                 dvar = distribute_tpsci_state(vec_var; workers=worker_ids,
                                               strategy=:balanced,
                                               blas_threads=blas_threads)
-                e0, dvar_out = tps_ci_davidson_sharded(dvar, cluster_ops, clustered_ham;
-                                                       nroots=R,
-                                                       conv_thresh=ci_conv,
-                                                       max_iter=ci_max_iter,
-                                                       max_ss_vecs=ci_max_ss_vecs,
-                                                       lindep_thresh=ci_lindep_thresh,
-                                                       h_storage=h_storage,
-                                                       max_mem_H=max_mem_H,
-                                                       workers=worker_ids,
-                                                       threaded_worker=threaded_worker,
-                                                       blas_threads=blas_threads,
-                                                       verbose=1)
+                if h_storage == :matrixfree
+                    e0, dvar_out = tps_ci_davidson_sharded(dvar, cluster_ops, clustered_ham;
+                                                           nroots=R,
+                                                           conv_thresh=ci_conv,
+                                                           max_iter=ci_max_iter,
+                                                           max_ss_vecs=ci_max_ss_vecs,
+                                                           lindep_thresh=ci_lindep_thresh,
+                                                           h_storage=:matrixfree,
+                                                           max_mem_H=max_mem_H,
+                                                           workers=worker_ids,
+                                                           threaded_worker=threaded_worker,
+                                                           blas_threads=blas_threads,
+                                                           verbose=1)
+                else
+                    e0, dvar_out, block_h = tps_ci_direct_sharded(dvar, cluster_ops,
+                                                                  clustered_ham;
+                                                                  nroots=R,
+                                                                  conv_thresh=ci_conv,
+                                                                  max_iter=ci_max_iter,
+                                                                  max_ss_vecs=ci_max_ss_vecs,
+                                                                  lindep_thresh=ci_lindep_thresh,
+                                                                  h_storage=h_storage,
+                                                                  max_mem_H=max_mem_H,
+                                                                  workers=worker_ids,
+                                                                  blas_threads=blas_threads,
+                                                                  compute_s2=false,
+                                                                  verbose=1)
+                    destroy!(block_h)
+                end
                 vec_var = collect_tpsci_state(dvar_out)
                 destroy!(dvar_out)
                 destroy!(dvar)
@@ -2778,19 +2797,35 @@ function tpsci_ci_sharded(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
             block_h = nothing
         end
 
-        e0_it, vec_new = tps_ci_davidson_sharded(vec_var, cluster_ops, clustered_ham;
-                                                 nroots=R,
-                                                 conv_thresh=ci_conv,
-                                                 max_iter=ci_max_iter,
-                                                 max_ss_vecs=ci_max_ss_vecs,
-                                                 lindep_thresh=ci_lindep_thresh,
-                                                 h_storage=tier,
-                                                 max_mem_H=max_mem_H,
-                                                 block_h=block_h,
-                                                 workers=worker_ids,
-                                                 threaded_worker=threaded_worker,
-                                                 blas_threads=blas_threads,
-                                                 verbose=verbose)
+        if tier == :blocks
+            e0_it, vec_new, _ = tps_ci_direct_sharded(vec_var, cluster_ops, clustered_ham;
+                                                      nroots=R,
+                                                      conv_thresh=ci_conv,
+                                                      max_iter=ci_max_iter,
+                                                      max_ss_vecs=ci_max_ss_vecs,
+                                                      lindep_thresh=ci_lindep_thresh,
+                                                      h_storage=:blocks,
+                                                      block_h=block_h,
+                                                      workers=worker_ids,
+                                                      blas_threads=blas_threads,
+                                                      compute_s2=false,
+                                                      verbose=verbose)
+        elseif tier == :matrixfree
+            e0_it, vec_new = tps_ci_davidson_sharded(vec_var, cluster_ops, clustered_ham;
+                                                     nroots=R,
+                                                     conv_thresh=ci_conv,
+                                                     max_iter=ci_max_iter,
+                                                     max_ss_vecs=ci_max_ss_vecs,
+                                                     lindep_thresh=ci_lindep_thresh,
+                                                     h_storage=:matrixfree,
+                                                     max_mem_H=max_mem_H,
+                                                     workers=worker_ids,
+                                                     threaded_worker=threaded_worker,
+                                                     blas_threads=blas_threads,
+                                                     verbose=verbose)
+        else
+            error("Unknown h_storage tier after selection: $tier")
+        end
         e0 = Vector{T}(e0_it)
         destroy!(vec_var)
         vec_var = vec_new

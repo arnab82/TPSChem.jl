@@ -72,6 +72,27 @@ const RUN_HEAVY_MULTINODE =
         conv_thresh=1e-11, verbose=0)
     e_ref = sort(e_ref)
 
+    # Stored-H sharded direct path: H is distributed, while the Davidson
+    # subspace is a dense coefficient matrix and H*X is evaluated by worker GEMM.
+    dg_direct = TPSChem.distribute_tpsci_state(deepcopy(guess); workers=workers(),
+                                               strategy=:balanced)
+    e_direct, v_direct, bh_direct = TPSChem.tps_ci_direct_sharded(
+        dg_direct, cluster_ops, clustered_ham;
+        nroots=nroots, conv_thresh=1e-8, max_ss_vecs=4, max_iter=300,
+        verbose=0)
+    @test maximum(abs.(sort(e_direct) .- e_ref)) < 1e-6
+    for r in 1:nroots
+        x = TPSChem.extract_root_sharded(v_direct, r)
+        hx = TPSChem.apply_sharded_H(bh_direct, x)
+        rayleigh = TPSChem.overlap(x, hx)[1, 1] / TPSChem.overlap(x, x)[1, 1]
+        @test any(abs(rayleigh - e) < 1e-6 for e in e_ref)
+        TPSChem.destroy!(x)
+        TPSChem.destroy!(hx)
+    end
+    TPSChem.destroy!(v_direct)
+    TPSChem.destroy!(dg_direct)
+    TPSChem.destroy!(bh_direct)
+
     # nnz(H) estimator is positive and consistent with the dense dimension.
     dtmp = TPSChem.distribute_tpsci_state(deepcopy(guess); workers=workers(),
                                           strategy=:balanced)
