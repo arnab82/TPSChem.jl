@@ -48,8 +48,10 @@ function init_multinode_workers!()
         if env_bool("TPSCHEM_SKIP_MASTER_NODE", false) && length(hosts) > 1
             hosts = hosts[2:end]
         end
-        threads = get(ENV, "JULIA_NUM_THREADS", string(Threads.nthreads()))
-        addprocs(hosts; exeflags="--project=$project --threads=$threads",
+        threads = env_int("TPSCHEM_WORKER_THREADS", Threads.nthreads())
+        threads > 0 || error("TPSCHEM_WORKER_THREADS must be positive")
+        worker_flags = `--project=$project --threads=$threads`
+        addprocs(hosts; exeflags=worker_flags,
                  env=worker_env())
     end
 

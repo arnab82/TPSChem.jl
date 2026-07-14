@@ -5,8 +5,8 @@
 #SBATCH --mail-user=abachhar@iu.edu
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
-#SBATCH --time=15:00:00
+#SBATCH --cpus-per-task=64
+#SBATCH --time=95:00:00
 #SBATCH --mem=0
 #SBATCH -A r01859
 
@@ -28,7 +28,8 @@ export JULIAENV="${JULIAENV:-/N/u/abachhar/BigRed200/multinode-tpsci}"
 export MKL_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
-export JULIA_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
+export JULIA_NUM_THREADS="${JULIA_NUM_THREADS:-32}"
+export TPSCHEM_WORKER_THREADS="${TPSCHEM_WORKER_THREADS:-$SLURM_CPUS_PER_TASK}"
 export TPSCHEM_BLAS_THREADS="${TPSCHEM_BLAS_THREADS:-1}"
 
 if [ "$#" -lt 2 ]; then
@@ -81,6 +82,8 @@ cd "$TMPDIR"
 echo "Project: $JULIAENV"
 echo "Depot:   $JULIA_DEPOT_PATH"
 echo "Scratch: $TMPDIR"
+echo "Master threads: $JULIA_NUM_THREADS"
+echo "Worker threads: $TPSCHEM_WORKER_THREADS"
 echo "Nodes:"
 cat "$TPSCHEM_MACHINE_FILE"
 
