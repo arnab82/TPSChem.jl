@@ -1,3 +1,7 @@
+```@meta
+CurrentModule = TPSChem
+```
+
 # SPT
 The Subspace Product Tucker (SPT) method (formerly called Block-Sparse Tucker, BST) approximates FCI as a linear combination of individually compressed (via HOSVD)
 blocks of the Hilbert space.
@@ -14,12 +18,35 @@ a purely sparse form (where only a few TPS's are needed), but rather we assume t
 Pages   = ["SPT.md"]
 ```
 
-## Documentation 
+SPT is a **variational method**: [`subspace_product_tucker`](@ref) grows and
+variationally solves over HOSVD-compressed blocks; [`do_fois_ci`](@ref) treats
+the first-order interacting space, and [`tucker_cepa_solve`](@ref) applies a
+CEPA correction in the Tucker representation.
+
+## Variational SPT
 ```@autodocs
 Modules = [TPSChem]
-Pages   = ["tucker_inner.jl","tucker_outer.jl","spt.jl"]
+Pages   = ["spt.jl",
+           "spt_helpers.jl",
+           "tucker_inner.jl",
+           "tucker_outer.jl",
+           "tucker_build_dense_H_term.jl",
+           "tucker_contract_dense_H_with_state.jl",
+           "tucker_form_sigma_block_expand.jl"]
 Order   = [:type, :function]
-Depth	= 2
+```
+
+## Perturbation theory & variance
+
+PT2 corrections ([`do_fois_pt2`](@ref), [`compute_pt2_energy`](@ref),
+[`compute_pt2_energy_blockwise`](@ref)) and the blockwise σ-norm variance
+estimate ([`compute_spt_sigma_norm_blockwise`](@ref)).
+
+```@autodocs
+Modules = [TPSChem]
+Pages   = ["tucker_pt.jl",
+           "spt_variance.jl"]
+Order   = [:type, :function]
 ```
 
 ## HOSVD
@@ -27,5 +54,4 @@ Depth	= 2
 Modules = [TPSChem]
 Pages   = ["hosvd.jl"]
 Order   = [:type, :function]
-Depth	= 2
 ```

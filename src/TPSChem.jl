@@ -89,14 +89,21 @@ include("core/tpsci_matvec_thread.jl")
 include("core/tpsci_pt1_wavefunction.jl")
 include("core/tpsci_pt2_energy.jl")
 include("core/tpsci_outer.jl")
+include("core/tpsci_multinode.jl")
+include("core/spt_multinode.jl")
+include("core/tpsci_sharded_davidson.jl")
+include("core/spt_sharded.jl")
+include("core/tps_cepa_sharded.jl")
 include("core/tpsci_helpers.jl")
 include("core/tpsci.jl")
 
 include("core/dense_inner.jl")
 include("core/dense_outer.jl")
 include("core/spt_variance.jl")
+include("core/spt_variance_multinode.jl")
 
 include("core/tpsci_property.jl")
+include("core/tpsci_property_multinode.jl")
 include("core/absorption_spectrum.jl")
 
 #
@@ -121,15 +128,37 @@ export add_subspace!
 export add_fockconfig!
 export expand_each_fock_space!
 export compute_cluster_ops_2rdm
+export compute_cluster_ops_2rdm_distributed
 export add_spinfree_2rdm_ops!
+export add_spinfree_2rdm_ops_distributed!
 export subspace_product_tucker
+export subspace_product_tucker_multinode
+export spt_multinode
+export distribute_spt_state
+export collect_spt_state
+export build_sigma_sharded
+export build_compressed_1st_order_state_sharded
+export spt_ci_davidson_sharded
+export compute_pt1_wavefunction_sharded
+export subspace_product_tucker_sharded
+export compute_spt_sigma_norm_blockwise_distributed
+export spt_variance_multinode
+export build_compressed_1st_order_state_distributed
+export build_sigma_distributed
+export compute_expectation_value_distributed
+export compute_pt2_energy_distributed
+export compute_pt2_energy_blockwise_distributed
+export spt_pt2_multinode
 export correlation_functions
 export compute_1rdm
 export compute_1rdm_sf
 export compute_1rdm_threaded
 export compute_1rdm_sf_threaded
+export compute_1rdm_distributed
+export compute_1rdm_sf_distributed
 export contract_1rdm_property
 export compute_1e_property_direct
+export compute_1e_property_direct_distributed
 export compute_transition_dipoles
 export compute_oscillator_strengths
 export absorption_spectrum
@@ -137,4 +166,40 @@ export print_stick_spectrum
 export compute_2rdm
 export compute_2rdm_threaded
 export compute_2rdm_blas
+export compute_2rdm_distributed
+export DistributedTPSCIstate
+export DistributedClusterOps
+export distribute_tpsci_state
+export collect_tpsci_state
+export copy_sharded_state
+export similar_sharded_state
+export restrict_to_basis_sharded
+export compute_cluster_ops_distributed
+export collect_cluster_ops
+export cluster_ops_summary
+export add_cmf_operators_distributed!
+export sharded_state_summary
+export destroy!
+export ensure_tpsci_multinode_workers!
+export open_matvec_distributed
+export open_matvec_sharded
+export tps_ci_matvec_sharded
+export compute_expectation_value_sharded_h0
+export compute_pt1_wavefunction_sharded
+export tpsci_cepa_solve_sharded
+export do_fois_cepa_sharded
+export tps_ci_matvec_distributed
+export tps_ci_davidson_distributed
+export compute_pt1_wavefunction_distributed
+export tpsci_ci_multinode
+export tpsci_ci_sharded
+export tps_ci_direct_sharded
+export tps_ci_davidson_sharded
+export build_block_h_sharded
+export update_block_h_sharded!
+export estimate_sharded_H_nnz
+export sharded_H_memory_report
+export compute_diagonal_sharded
+export tps_sharded_cepa_solve
+export do_tps_sharded_cepa
 end

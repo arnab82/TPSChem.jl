@@ -1418,6 +1418,18 @@ function cmf_oo_diis(ints_in::InCoreInts{T}, clusters::Vector{MOCluster}, fspace
     #=}}}=#
 end
 
+"""
+    cmf_oo_newton(ints, clusters, fspace, ansatze, dguess::RDM1; kwargs...)
+    cmf_oo_newton(ints, clusters, fspace, dguess::RDM1; kwargs...)
+
+Cluster mean-field (CMF) orbital optimization using a Newton solver that uses
+both the (analytically computed) orbital gradient and Hessian. Alternates
+cluster CI solves with Newton steps on the orbital-rotation parameters until the
+orbital gradient (`tol_oo`), 1-RDM (`tol_d1`), and CI (`tol_ci`) are converged.
+Pass `zero_intra_rots=true` to freeze intra-cluster rotations. Returns
+`(e_cmf, U, d1)`: the CMF energy, the orbital-rotation unitary, and the
+converged 1-RDM.
+"""
 function cmf_oo_newton(ints_in::InCoreInts{T}, clusters::Vector{MOCluster}, fspace, ansatze::Vector{<:Ansatz}, dguess::RDM1{T};
                     maxiter_oo      = 100,
                     maxiter_ci      = 100,

@@ -6,5 +6,4 @@ Pages = ["ActiveSpaceSolvers.md"]
 ```@autodocs
 Modules = [TPSChem.ActiveSpaceSolvers, TPSChem.ActiveSpaceSolvers.FCI]
 Order   = [:module, :type, :function]
-Depth	= 2
 ```

@@ -1,43 +1,46 @@
-# Simple (and slow) FCI Calculation (FCI)
-In this example, we cluster a sequence of H<sub>2</sub> molecules
+```@meta
+CurrentModule = TPSChem.ActiveSpaceSolvers
+```
 
+# Full CI (FCI)
 
-### First create a molecule
+The active-space FCI solver is exposed through the
+[ActiveSpaceSolvers](library/ActiveSpaceSolvers.md) interface: build an
+[`FCIAnsatz`](@ref), then call [`solve`](@ref). This example does FCI on the
+same H₆/STO-3G integrals used in the [CMF example](cmf.md).
+
+## Build integrals
+
 ```julia
-using TPSChem
+using TPSChem.QCBase
+using TPSChem.InCoreIntegrals
+using TPSChem.ActiveSpaceSolvers
+using PyCall            # activates the PySCF-backed helpers
 
-atoms = []
-push!(atoms,Atom(1,"H",[0,0,0]))
-push!(atoms,Atom(2,"H",[0,0,1]))
-push!(atoms,Atom(3,"H",[0,0,2]))
-push!(atoms,Atom(4,"H",[0,0,3]))
-push!(atoms,Atom(5,"H",[0,0,4]))
-push!(atoms,Atom(6,"H",[0,0,5]))
-basis = "sto-3g"
+atoms = [Atom(i, "H", [Float64(i-1), 0.0, 0.0]) for i in 1:6]
+mol   = Molecule(0, 1, atoms, "sto-3g")
+
+mf   = pyscf_do_scf(mol)
+nbas = size(mf.mo_coeff, 1)
+ints = pyscf_build_ints(mol, mf.mo_coeff, zeros(nbas, nbas))
 ```
 
-Now create a PySCF object for creating integrals,
-and run FCI with 3 alpha and 3 beta electrons
+## Solve FCI
+
+`FCIAnsatz(norb, nα, nβ)` defines the determinant space; `SolverSettings`
+controls the eigensolver.
+
 ```julia
-mol  = Molecule(0,1,atoms)
-mf   = TPSChem.pyscf_do_scf(mol,basis)
-ints = TPSChem.pyscf_build_ints(mf.mol,mf.mo_coeff);
-
-na = 3
-nb = 3
-e_fci, d1_fci, d2_fci = TPSChem.pyscf_fci(ints,na,nb)
-C = mf.mo_coeff
-rdm_mf = C[:,1:2] * C[:,1:2]'
-```
-Create an FCIProblem object containing problem data
-```
-norbs = size(ints.h1)[1]
-
-problem = StringCI.FCIProblem(norbs, 4, 4)
+ansatz = FCIAnsatz(6, 3, 3)          # 6 orbitals, 3 α + 3 β electrons
+sol    = solve(ints, ansatz, SolverSettings())
+display(sol)
 ```
 
-Now run the CI code. This seems to be about 10x slower than pyscf at the moment,
-and only uses lanczos instead of a preconditioned solver 
-```
-StringCI.run_fci(ints, problem)
+`sol` is a [`Solution`](@ref) holding the energies and CI vectors; from it you
+can compute 1- and 2-RDMs via [`compute_1rdm_2rdm`](@ref).
+
+For a quick reference value you can compare against PySCF's FCI directly:
+
+```julia
+e_fci, d1a_fci, d1b_fci, d2_fci = pyscf_fci(ints, 3, 3)
 ```

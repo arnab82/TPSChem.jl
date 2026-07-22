@@ -14,5 +14,4 @@ Pages = ["CMFs.md"]
 ```@autodocs
 Modules = [TPSChem.ClusterMeanField]
 Order   = [:type, :function]
-Depth	= 2
 ```

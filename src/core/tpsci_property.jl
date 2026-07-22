@@ -15,8 +15,8 @@ Two contributions are assembled:
         ρ_i[s,t,r1,r2] = Σ_{matching configs} C_bra[r1] * C_ket[r2]
 
   2. Inter-cluster (p on cluster i, q on cluster j, i≠j):
-        uses "A"[p,s,t] × "a"[q,s,t] (alpha-alpha) and
-            "B"[p,s,t] × "b"[q,s,t] (beta-beta)
+        uses `A[p,s,t]` × `a[q,s,t]` (alpha-alpha) and
+            `B[p,s,t]` × `b[q,s,t]` (beta-beta)
         with the appropriate fermionic sign.
 
 Once γ is in hand, any one-electron property is just Tr(prop_ints * γ).
@@ -358,8 +358,8 @@ Two contributions per spin case:
         bra and ket Fock sectors at cluster i differ by (±1,∓1).
 
   2. Inter-cluster (p on cluster i, q on cluster j, i≠j):
-        α→β: uses "A"[p,s,t] (create α at i) × "b"[q,s,t] (annihilate β at j)
-        β→α: uses "B"[p,s,t] (create β at i) × "a"[q,s,t] (annihilate α at j)
+        α→β: uses `A[p,s,t]` (create α at i) × `b[q,s,t]` (annihilate β at j)
+        β→α: uses `B[p,s,t]` (create β at i) × `a[q,s,t]` (annihilate α at j)
         with the standard fermionic anticommutation sign.
 """
 function compute_1rdm_sf(bra::TPSCIstate{T,N,R1},
@@ -758,13 +758,13 @@ without forming the full (norb,norb,R1,R2) 1-RDM.  Instead the orbital-index
 contraction with `h_prop` is performed on-the-fly:
 
   • On-cluster I:
-        M_I[s,t] = Σ_{p,q∈I} h_prop_I[p,q] (Aa_I[p,q,s,t] + Bb_I[p,q,s,t])
+        M_I[s,t] = Σ_{p,q∈I} `h_prop_I[p,q]` (Aa_I[p,q,s,t] + Bb_I[p,q,s,t])
         P[r1,r2] += Σ_{s,t} M_I[s,t] ρ_I[s,t,r1,r2]
 
   • Inter-cluster CT (α): p∈I creates, q∈J annihilates
         coupling_IJ[s_I,t_I,s_J,t_J] = Σ_{p∈I,q∈J} h_prop[off_I+p, off_J+q]
                                           × A_I[p,s_I,t_I] × a_J[q,s_J,t_J]
-        P[r1,r2] += sign × coupling_IJ × c_bra[r1] × c_ket[r2]   (+ h.c.)
+        P[r1,r2] += sign × coupling_IJ × c_bra[r1] × `c_ket[r2]`   (+ h.c.)
 
   • Same for β (B/b operators).
 
@@ -2492,8 +2492,8 @@ Three topological contributions are assembled:
         Signs: all spin components → +1.
           "AB"/"ba" and "BA"/"ab" are each 2-body (even parity) at their cluster,
           so no inter-cluster JW string is accumulated for any CT spin component.
-        Uses "AA"[I]×"aa"[J] (αα), "BB"[I]×"bb"[J] (ββ),
-             "AB"[I]×"ba"[J] (αβ), "BA"[I]×"ab"[J] (βα).
+        Uses `AA[I]`×`aa[J]` (αα), `BB[I]`×`bb[J]` (ββ),
+             `AB[I]`×`ba[J]` (αβ), `BA[I]`×`ab[J]` (βα).
 """
 function compute_2rdm(bra::TPSCIstate{T,N,R1},
                       ket::TPSCIstate{T,N,R2},

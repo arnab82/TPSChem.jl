@@ -28,4 +28,7 @@ Random.seed!(1234567)
     include("test_tpsci_helpers.jl")
     include("test_spt_helpers.jl")
     include("test_direct_cmf.jl")
+    include("test_tpsci_property_spt_variance_multinode.jl")
+    include("test_tpsci_multinode.jl")
+    include("test_spt_sharded.jl")
 end

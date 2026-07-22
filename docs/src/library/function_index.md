@@ -1,5 +1,13 @@
-### [Index](@id main-index)
+# Function Index
+
+Index of every documented type and function across the package.
 
 ```@index
-Pages = ["public.md", "internals.md", "function_index.md"]
+Modules = [TPSChem,
+           TPSChem.QCBase,
+           TPSChem.InCoreIntegrals,
+           TPSChem.RDM,
+           TPSChem.BlockDavidson,
+           TPSChem.ActiveSpaceSolvers,
+           TPSChem.ClusterMeanField]
 ```

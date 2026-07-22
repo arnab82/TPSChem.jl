@@ -1,4 +1,8 @@
-# TPSCI 
+```@meta
+CurrentModule = TPSChem
+```
+
+# TPSCI
 ## Background
 
 Tensor Product Selected CI (TPSCI) approximates FCI on large active spaces using a sparse basis of tensor products of many-body cluster states.
@@ -45,11 +49,41 @@ The algorithm consists of the following steps:
 ```@index
 Pages = ["TPSCI.md"]
 ```
-## Documentation 
+
+TPSCI is a **variational method**: the selected-CI loop variationally
+diagonalizes ``\hat H`` in a growing sparse model space of tensor products.
+[`tpsci_ci`](@ref) drives the loop; [`tps_ci_direct`](@ref) /
+[`tps_ci_davidson`](@ref) perform the variational diagonalization in a fixed
+space (the latter via the [BlockDavidson](BlockDavidson.md) eigensolver);
+[`do_fois_ci`](@ref) / [`do_fois_cepa`](@ref) expand into the first-order
+interacting space.
+
+Reduced density matrices and one-electron properties built from a converged
+TPSCI wavefunction have their own page: [RDMs & Properties](Properties.md).
+
+## Variational TPSCI
 ```@autodocs
 Modules = [TPSChem]
-Pages   = ["tpsci_inner.jl","tpsci_outer.jl","tpsci_matvec_thread.jl"]
+Pages   = ["tpsci.jl",
+           "tpsci_outer.jl",
+           "tpsci_inner.jl",
+           "tpsci_helpers.jl",
+           "tpsci_matvec_thread.jl",
+           "dense_inner.jl",
+           "dense_outer.jl"]
 Order   = [:type, :function]
-Depth	= 2
+```
+
+## Perturbation theory (PT1, PT2, QDPT)
+
+Perturbative corrections and PT1 wavefunctions on top of a TPSCI reference:
+[`compute_pt1_wavefunction`](@ref), [`compute_pt2_energy`](@ref), and the
+quasi-degenerate [`compute_qdpt_energy`](@ref).
+
+```@autodocs
+Modules = [TPSChem]
+Pages   = ["tpsci_pt1_wavefunction.jl",
+           "tpsci_pt2_energy.jl"]
+Order   = [:type, :function]
 ```
 
