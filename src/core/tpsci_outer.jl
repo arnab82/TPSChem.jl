@@ -1263,6 +1263,17 @@ end
 #end
 
 
+"""
+    do_fois_ci(ref::TPSCIstate, cluster_ops, clustered_ham; H0="Hcmf", thresh_foi=1e-6, nbody=4, tol=1e-5, kwargs...)
+
+Perform a CI in the first-order interacting space (FOIS) defined over a CMF
+reference. Solves the zeroth-order problem in `ref`, generates the FOIS from up
+to `nbody`-body terms acting on the reference (keeping coefficients above
+`thresh_foi`), and variationally diagonalizes the Hamiltonian in the combined
+reference + FOIS space. Returns the variational energies and the expanded
+`TPSCIstate`. `H0` selects the zeroth-order Hamiltonian (default the CMF
+Hamiltonian `"Hcmf"`).
+"""
 function do_fois_ci(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
                     H0          = "Hcmf",
                     max_iter    = 50,
@@ -1376,6 +1387,16 @@ Do CEPA in FOIS defined by ref and thresh_foi
 
 
 
+"""
+    do_fois_cepa(ref::TPSCIstate, cluster_ops, clustered_ham; cepa_shift="cepa", thresh_foi=1e-6, nbody=4, solver=:krylov, kwargs...)
+
+Apply a CEPA-style correction over the first-order interacting space (FOIS)
+defined over a CMF reference. Solves the zeroth-order problem in `ref`, builds
+the FOIS from up to `nbody`-body terms (threshold `thresh_foi`), and solves the
+dressed CEPA equations. `cepa_shift` selects the correction flavour (default
+`"cepa"`) and `solver` the linear solver (`:krylov` by default). Returns the
+CEPA-corrected energies and the associated wavefunction.
+"""
 function do_fois_cepa(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
                         cepa_shift="cepa",
                         cepa_mit=30,

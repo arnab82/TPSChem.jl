@@ -1,68 +1,83 @@
-# Cluster Mean-Field Calculation (CMF)
-In this example, we cluster a sequence of H<sub>2</sub> molecules
-and solve them self-consistently
+```@meta
+CurrentModule = TPSChem.ClusterMeanField
+```
 
+# Cluster Mean-Field (CMF)
 
-### First create a molecule
+This example clusters a chain of six hydrogen atoms into three H₂ pairs and
+optimizes the orbitals and local cluster states self-consistently. It mirrors
+the maintained test `test/upstream/ClusterMeanField/test_cmf.jl`.
+
+!!! note "PySCF required"
+    The `pyscf_*` and `localize` helpers come from the `TPSChemPyCallExt`
+    extension, which activates when `PyCall` is loaded (see
+    [Installation](installation_instructions.md)).
+
+## Set up the workspace
+
 ```julia
-using TPSChem
+using TPSChem.QCBase
+using TPSChem.RDM
+using TPSChem.InCoreIntegrals
+using TPSChem.ActiveSpaceSolvers
+using TPSChem.ClusterMeanField
+using PyCall            # activates the PySCF-backed helpers
+using LinearAlgebra
+```
 
-atoms = []
-push!(atoms,Atom(1,"H",[0,0,0]))
-push!(atoms,Atom(2,"H",[0,0,1]))
-push!(atoms,Atom(3,"H",[0,0,2]))
-push!(atoms,Atom(4,"H",[0,0,3]))
-push!(atoms,Atom(5,"H",[0,0,4]))
-push!(atoms,Atom(6,"H",[0,0,5]))
+## Build the molecule and integrals
+
+The basis is part of the [`Molecule`](@ref); `pyscf_do_scf` then takes the
+molecule alone.
+
+```julia
+atoms = [Atom(i, "H", [Float64(i-1), 0.0, 0.0]) for i in 1:6]
 basis = "sto-3g"
+mol   = Molecule(0, 1, atoms, basis)
+
+mf   = pyscf_do_scf(mol)
+nbas = size(mf.mo_coeff, 1)
+ints = pyscf_build_ints(mol, mf.mo_coeff, zeros(nbas, nbas))
 ```
 
-Now create a PySCF object for creating integrals,
-and run FCI with 3 alpha and 3 beta electrons
+Optionally get a reference FCI energy (3 α, 3 β electrons):
+
 ```julia
-mol  = Molecule(0,1,atoms)
-mf   = TPSChem.pyscf_do_scf(mol,basis)
-ints = TPSChem.pyscf_build_ints(mf.mol,mf.mo_coeff);
-
-na = 3
-nb = 3
-e_fci, d1_fci, d2_fci = TPSChem.pyscf_fci(ints,na,nb)
-C = mf.mo_coeff
-rdm_mf = C[:,1:2] * C[:,1:2]'
+e_fci, d1a_fci, d1b_fci, d2_fci = pyscf_fci(ints, 3, 3)
 ```
 
-Localize the orbitals and print to molden file for viewing
+## Localize and rotate the integrals
+
 ```julia
-Cl = TPSChem.localize(mf.mo_coeff,"lowdin",mf)
-TPSChem.pyscf_write_molden(mol,basis,Cl,filename="lowdin.molden")
-S = TPSChem.get_ovlp(mf)
-U =  C' * S * Cl
+C  = mf.mo_coeff
+Cl = localize(mf.mo_coeff, "lowdin", mf)
+S  = get_ovlp(mf)
+U  = C' * S * Cl
+ints = orbital_rotation(ints, U)         # integrals in the localized basis
 ```
 
-Rotate the integrals to this new localized basis
+## Define the clustering
+
 ```julia
-ints = TPSChem.orbital_rotation(ints,U)
+clusters    = [MOCluster(i, collect(r)) for (i, r) in enumerate([1:2, 3:4, 5:6])]
+init_fspace = [(1, 1), (1, 1), (1, 1)]   # (nα, nβ) per cluster
 ```
 
-Now we need to specify a clustering
+## Run the CMF orbital optimization
+
+Start from a mean-field 1-RDM guess and optimize:
+
 ```julia
-clusters    = [(1:2),(3:4),(5:6)]
-init_fspace = [(1,1),(1,1),(1,1)]
+rdm_mf   = C[:, 1:2] * C[:, 1:2]'
+rdm1     = RDM1(rdm_mf, rdm_mf)
 
-clusters = [Cluster(i,collect(clusters[i])) for i = 1:length(clusters)]
-display(clusters)
-
-rdm1 = zeros(size(ints.h1))
-rdm1a = rdm_mf*.5
-rdm1b = rdm_mf*.5
-
+e_cmf, U = cmf_oo(ints, clusters, init_fspace, rdm1;
+                  verbose=0, gconv=1e-6, method="cg")
 ```
 
-Now run the orbital optimization and dump the resultinging orbitals 
-```julia
-U = TPSChem.cmf_oo(ints, clusters, init_fspace, rdm1, verbose=0, gconv=1e-6)
+For the H₆/STO-3G example above, `e_cmf ≈ -3.205983033016`. The rotation `U`
+maps the localized orbitals to the CMF orbitals (`C_cmf = Cl * U`), which you can
+write to a molden file with `pyscf_write_molden(mol, Cl*U, filename="cmf.molden")`.
 
-C_cmf = Cl*U
-
-TPSChem.pyscf_write_molden(mol,basis,C_cmf,filename="cmf.molden")
-```
+See also [`cmf_ci`](@ref), [`cmf_oo_newton`](@ref), and [`cmf_oo_diis`](@ref) in
+the [ClusterMeanField](library/CMFs.md) reference.

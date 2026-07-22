@@ -1875,6 +1875,14 @@ function _tpsci_active_project_root()
     return project === nothing ? dirname(dirname(@__DIR__)) : dirname(project)
 end
 
+"""
+    ensure_tpsci_multinode_workers!(; workers=Distributed.workers())
+
+Make sure every process in `workers` has the current project activated and
+`TPSChem` loaded, so the distributed TPSCI / SPT / CEPA drivers can
+`remotecall` into it. Idempotent — workers already prepared for this project are
+skipped. Returns the vector of worker pids.
+"""
 function ensure_tpsci_multinode_workers!(; workers=Distributed.workers())
     pids = _tpsci_worker_ids(workers)
     project_root = _tpsci_active_project_root()

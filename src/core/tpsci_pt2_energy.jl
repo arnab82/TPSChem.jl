@@ -305,7 +305,6 @@ end
     Return:
     corrected_energies::Vector{T} : Pt2 corrected energies
 """
-
 function compute_qdpt_energy(ci_vector_in::TPSCIstate{T,N,R}, cluster_ops, clustered_ham::ClusteredOperator;
                              nbody=4, 
                              H0="Hcmf",

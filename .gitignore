@@ -8,6 +8,7 @@ __pycache__
 Manifest.toml
 docs/Manifest.toml
 docs/build/
+docs/src/generated/
 # Large data/output files in examples/notes — not for version control
 examples/notes/*.jld2
 examples/notes/*.npy

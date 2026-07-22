@@ -1211,6 +1211,16 @@ function _add_results!(sig_cts, data, compress_twice, thresh, N)
 end
 
     
+"""
+    do_fois_ci(ref::SPTstate, cluster_ops, clustered_ham; H0="Hcmf", thresh_foi=1e-6, nbody=4, tol=1e-5, kwargs...)
+
+SPT (Tucker) analogue: perform a CI in the first-order interacting space (FOIS)
+defined over a CMF reference. Solves the zeroth-order problem in `ref`, builds
+the FOIS as HOSVD-compressed Tucker blocks (up to `nbody`-body, threshold
+`thresh_foi`), and variationally diagonalizes the Hamiltonian in the combined
+reference + FOIS space. Returns the variational energies and the expanded
+`SPTstate`.
+"""
 function do_fois_ci(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
             H0          = "Hcmf",
             max_iter    = 50,
@@ -1310,6 +1320,14 @@ Perform Coupled Electron Pair Approximation (CEPA) calculations.
 """
 
 
+"""
+    do_fois_cepa(ref::SPTstate, cluster_ops, clustered_ham; cepa_shift="cepa", thresh_foi=1e-6, nbody=4, solver=:minres, kwargs...)
+
+SPT (Tucker) CEPA correction over the first-order interacting space (FOIS)
+defined over a CMF reference. Solves the zeroth-order problem in `ref`, builds
+the FOIS of compressed Tucker blocks, and solves the dressed CEPA equations.
+Returns the CEPA-corrected energies and the associated `SPTstate` wavefunction.
+"""
 function do_fois_cepa(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
     max_iter     = 20,
     cepa_shift   = "cepa",
