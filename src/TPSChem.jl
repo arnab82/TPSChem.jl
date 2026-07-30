@@ -198,7 +198,11 @@ export tps_ci_davidson_sharded
 export build_block_h_sharded
 export update_block_h_sharded!
 export estimate_sharded_H_nnz
+export estimate_sharded_H_nnz_per_worker
 export sharded_H_memory_report
+export probe_worker_memory
+export sharded_H_fit_report
+export print_sharded_H_fit
 export compute_diagonal_sharded
 export tps_sharded_cepa_solve
 export do_tps_sharded_cepa

@@ -28,6 +28,41 @@ All subspace linear algebra reuses the sharded primitives already defined in
 # ---------------------------------------------------------------------------
 
 """
+    estimate_sharded_H_nnz_per_worker(ci_vector::DistributedTPSCIstate, clustered_ham)
+
+Per-worker breakdown of the block-sparse Hamiltonian element count, keyed by pid.
+
+`build_block_h_sharded` gives each worker the *row blocks* for the Fock-bra
+sectors it owns, against every connected ket sector (see
+`_build_block_h_chunk_typed!`). A worker's share is therefore
+
+    Σ_{bra owned by pid} len(bra) * Σ_{ket : (bra-ket) ∈ clustered_ham} len(ket)
+
+which is *not* proportional to the number of configurations it owns: connectivity
+varies per sector, so a length-balanced shard layout can still be badly
+memory-imbalanced. This is the quantity that decides whether a node OOMs, so it
+is what `:auto` must test — the aggregate over all workers never sees the peak.
+"""
+function estimate_sharded_H_nnz_per_worker(ci_vector::DistributedTPSCIstate{T,N,R},
+                                           clustered_ham::ClusteredOperator) where {T,N,R}
+    focks = collect(keys(ci_vector.owners))
+    lens = ci_vector.lengths
+    per_worker = OrderedDict{Int,Float64}(pid => 0.0 for pid in ci_vector.workers)
+    for fock_bra in focks
+        lb = Float64(lens[fock_bra])
+        row = 0.0
+        for fock_ket in focks
+            fock_trans = fock_bra - fock_ket
+            haskey(clustered_ham, fock_trans) || continue
+            row += Float64(lens[fock_ket])
+        end
+        owner = ci_vector.owners[fock_bra]
+        per_worker[owner] = get(per_worker, owner, 0.0) + lb * row
+    end
+    return per_worker
+end
+
+"""
     estimate_sharded_H_nnz(ci_vector::DistributedTPSCIstate, clustered_ham)
 
 Estimate the number of nonzero elements in the block-sparse variational
@@ -38,33 +73,194 @@ touches no coefficient data.
 """
 function estimate_sharded_H_nnz(ci_vector::DistributedTPSCIstate{T,N,R},
                                 clustered_ham::ClusteredOperator) where {T,N,R}
-    focks = collect(keys(ci_vector.owners))
-    lens = ci_vector.lengths
-    nnz = 0.0
-    for fock_bra in focks
-        lb = lens[fock_bra]
-        for fock_ket in focks
-            fock_trans = fock_bra - fock_ket
-            haskey(clustered_ham, fock_trans) || continue
-            nnz += Float64(lb) * Float64(lens[fock_ket])
-        end
-    end
-    return nnz
+    return sum(values(estimate_sharded_H_nnz_per_worker(ci_vector, clustered_ham));
+               init=0.0)
 end
 
 """
-    sharded_H_memory_report(ci_vector, clustered_ham; ::Type{T}=Float64)
+    sharded_H_memory_report(ci_vector, clustered_ham)
 
 Return a NamedTuple summarizing the block-sparse Hamiltonian size so a run can
 decide between Tier A (stored H) and Tier B (matrix-free). `nnz` is the number of
 stored matrix elements (summed over all workers), `bytes` its dense-block memory.
+
+`per_worker_gb` gives the same figure split by owning pid, and `max_worker_gb` /
+`max_worker_pid` identify the worker that has to hold the most. The aggregate
+`gb` says whether the problem fits the *cluster*; only `max_worker_gb` says
+whether it fits a *node*.
 """
 function sharded_H_memory_report(ci_vector::DistributedTPSCIstate{T,N,R},
                                  clustered_ham::ClusteredOperator) where {T,N,R}
-    nnz = estimate_sharded_H_nnz(ci_vector, clustered_ham)
+    per_worker_nnz = estimate_sharded_H_nnz_per_worker(ci_vector, clustered_ham)
+    nnz = sum(values(per_worker_nnz); init=0.0)
     bytes = nnz * sizeof(T)
+    per_worker_gb = OrderedDict{Int,Float64}(pid => n * sizeof(T) * 1e-9
+                                             for (pid, n) in per_worker_nnz)
+    max_worker_pid = isempty(per_worker_gb) ? 0 :
+                     argmax(pid -> per_worker_gb[pid], keys(per_worker_gb))
+    max_worker_gb = isempty(per_worker_gb) ? 0.0 : per_worker_gb[max_worker_pid]
     return (dim=length(ci_vector), nfocks=length(ci_vector.owners),
-            nnz=nnz, bytes=bytes, gb=bytes * 1e-9)
+            nnz=nnz, bytes=bytes, gb=bytes * 1e-9,
+            per_worker_gb=per_worker_gb,
+            max_worker_gb=max_worker_gb, max_worker_pid=max_worker_pid)
+end
+
+# Resident set size of the calling process, in bytes. On Linux read it from
+# /proc/self/statm (the truth, and what the OOM killer scores). Elsewhere fall
+# back to the live Julia heap, which understates RSS but is the best portable
+# proxy. Deliberately NOT Sys.free_memory(): that reads MemFree and excludes
+# reclaimable page cache, so on a node that has just streamed a large JLD2 file
+# it reports almost nothing free and would veto runs that fit comfortably.
+function _process_rss_bytes()
+    if Sys.islinux()
+        try
+            fields = split(read("/proc/self/statm", String))
+            length(fields) >= 2 && return parse(Int, fields[2]) * Int(Sys.PAGESIZE)
+        catch
+            # fall through to the portable estimate
+        end
+    end
+    return Int(Base.gc_live_bytes())
+end
+
+"""
+    probe_worker_memory(workers=Distributed.workers())
+
+Ask every worker how much memory its machine actually has, how much this job is
+already holding there, and how many processes share that machine.
+
+Returns an `OrderedDict` pid => NamedTuple with `host`, `total_gb`, `free_gb`,
+`rss_gb` (this process), `host_rss_gb` (all of the job's processes on that host,
+master included), `nprocs_on_host`, and `master_on_host`.
+
+`Sys.total_memory()` is cgroup-aware on Linux, so under SLURM it reflects the
+job's memory allocation rather than the bare hardware. `free_gb` is reported for
+information only; the budget in `sharded_H_fit_report` is built from
+`total_gb - host_rss_gb`, which is insensitive to page cache.
+"""
+function probe_worker_memory(workers=Distributed.workers())
+    pids = collect(workers)
+    probe = () -> (gethostname(), Sys.total_memory(), Sys.free_memory(),
+                   _process_rss_bytes())
+    raw = Dict{Int,Tuple{String,UInt64,UInt64,Int}}()
+    @sync for pid in pids
+        @async raw[pid] = Distributed.remotecall_fetch(probe, pid)
+    end
+    # The master is usually co-located with a worker (addprocs over a SLURM node
+    # list includes the master's own host unless TPSCHEM_SKIP_MASTER_NODE=1), and
+    # it holds the cluster bases and integrals. Charge its RSS to its host.
+    master = probe()
+    master_host = master[1]
+
+    host_counts = Dict{String,Int}()
+    host_rss = Dict{String,Int}()
+    for pid in pids
+        host = raw[pid][1]
+        host_counts[host] = get(host_counts, host, 0) + 1
+        host_rss[host] = get(host_rss, host, 0) + raw[pid][4]
+    end
+    host_rss[master_host] = get(host_rss, master_host, 0) + master[4]
+
+    out = OrderedDict{Int,Any}()
+    for pid in pids
+        host, total, free, rss = raw[pid]
+        out[pid] = (host=host,
+                    total_gb=Float64(total) * 1e-9,
+                    free_gb=Float64(free) * 1e-9,
+                    rss_gb=Float64(rss) * 1e-9,
+                    host_rss_gb=Float64(host_rss[host]) * 1e-9,
+                    nprocs_on_host=host_counts[host],
+                    master_on_host=(host == master_host))
+    end
+    return out
+end
+
+"""
+    sharded_H_fit_report(rep, workers; headroom=0.85)
+
+Combine a `sharded_H_memory_report` with a live `probe_worker_memory` and decide,
+per worker, whether the stored block-sparse H actually fits in RAM.
+
+A host's spare capacity is `total_gb * headroom - host_rss_gb`: its memory
+allocation, less what this job already holds there (all co-located workers plus
+the master), with `headroom` left for the solver's Krylov vectors and transient
+build allocations. That spare capacity is split evenly among the workers on the
+host, since `build_block_h_sharded` fills them concurrently.
+
+Returns `(fits, worst_pid, worst_deficit_gb, rows)`; `rows` carries the
+per-worker numbers for printing.
+"""
+function sharded_H_fit_report(rep, workers; headroom=0.85)
+    mem = probe_worker_memory(workers)
+    rows = NamedTuple[]
+    fits = true
+    worst_pid = 0
+    worst_deficit = -Inf
+    for (pid, info) in mem
+        need = get(rep.per_worker_gb, pid, 0.0)
+        spare = info.total_gb * headroom - info.host_rss_gb
+        budget = spare / max(info.nprocs_on_host, 1)
+        deficit = need - budget
+        ok = deficit <= 0
+        fits &= ok
+        if deficit > worst_deficit
+            worst_deficit = deficit
+            worst_pid = pid
+        end
+        push!(rows, (pid=pid, host=info.host, need_gb=need,
+                     total_gb=info.total_gb, free_gb=info.free_gb,
+                     rss_gb=info.rss_gb, host_rss_gb=info.host_rss_gb,
+                     nprocs_on_host=info.nprocs_on_host,
+                     master_on_host=info.master_on_host,
+                     budget_gb=budget, ok=ok))
+    end
+    return (fits=fits, worst_pid=worst_pid, worst_deficit_gb=worst_deficit, rows=rows)
+end
+
+"""
+    print_sharded_H_fit(rep, fit; label="H")
+
+Print the per-worker feasibility table for a stored block-sparse Hamiltonian.
+"""
+function print_sharded_H_fit(rep, fit; label="H")
+    @printf(" Sharded %s memory feasibility  (dim=%i, nfocks=%i, aggregate=%.3f GB over %i workers)\n",
+            label, rep.dim, rep.nfocks, rep.gb, length(fit.rows))
+    @printf("   %-5s %-20s %11s %10s %10s %11s %9s %5s\n",
+            "pid", "host", "needs(GB)", "node(GB)", "used(GB)", "budget(GB)",
+            "procs", "fits")
+    for r in fit.rows
+        @printf("   %-5i %-20s %11.2f %10.1f %10.1f %11.2f %9s %5s\n",
+                r.pid, first(r.host, 20), r.need_gb, r.total_gb, r.host_rss_gb,
+                r.budget_gb,
+                string(r.nprocs_on_host, r.master_on_host ? "+mstr" : ""),
+                r.ok ? "yes" : "NO")
+    end
+    if !fit.fits
+        @printf("   >> worker %i is short by %.2f GB; stored %s would be OOM-killed\n",
+                fit.worst_pid, fit.worst_deficit_gb, label)
+    end
+    flush(stdout)
+    return nothing
+end
+
+# Shared `:auto` decision. `max_mem_H` stays an *aggregate* GB budget so existing
+# callers keep their meaning; the live per-worker probe is an additional gate that
+# can only make the choice more conservative. Returns the chosen tier.
+function _sharded_H_auto_tier(ci_vector, clustered_ham, workers, max_mem_H;
+                              headroom=0.85, verbose=1, label="H")
+    rep = sharded_H_memory_report(ci_vector, clustered_ham)
+    fit = sharded_H_fit_report(rep, workers; headroom=headroom)
+    verbose > 0 && print_sharded_H_fit(rep, fit; label=label)
+    tier = (rep.gb <= max_mem_H && fit.fits) ? :blocks : :matrixfree
+    if verbose > 0
+        reason = rep.gb > max_mem_H ? "aggregate over max_mem_H" :
+                 (fit.fits ? "fits" : "a worker would exceed node RAM")
+        @printf(" %s storage :auto -> :%s  (aggregate %.3f GB vs max_mem_H %.1f GB; per-worker peak %.3f GB on pid %i; %s)\n",
+                label, tier, rep.gb, max_mem_H, rep.max_worker_gb,
+                rep.max_worker_pid, reason)
+        flush(stdout)
+    end
+    return tier, rep, fit
 end
 
 # ---------------------------------------------------------------------------
@@ -933,10 +1129,17 @@ function tps_ci_direct_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
     if block_h === nothing
         if tier == :auto
             rep = sharded_H_memory_report(ci_vector, clustered_ham)
+            fit = sharded_H_fit_report(rep, worker_ids)
+            verbose > 0 && print_sharded_H_fit(rep, fit)
             rep.gb <= max_mem_H ||
                 error("tps_ci_direct_sharded requires stored block-H, but the estimate is " *
                       "$(round(rep.gb; digits=3)) GB above max_mem_H=$(max_mem_H) GB. " *
                       "Increase max_mem_H/nodes or use tps_ci_davidson_sharded with h_storage=:matrixfree explicitly.")
+            fit.fits ||
+                error("tps_ci_direct_sharded requires stored block-H, but worker " *
+                      "$(fit.worst_pid) is short by $(round(fit.worst_deficit_gb; digits=2)) GB " *
+                      "(per-worker peak $(round(rep.max_worker_gb; digits=2)) GB on pid " *
+                      "$(rep.max_worker_pid)). Add nodes or put one worker per node.")
             tier = :blocks
             verbose > 0 &&
                 @printf(" H storage :auto -> :blocks  (block-sparse H ~ %.3f GB, budget %.1f GB)\n",
@@ -1311,10 +1514,17 @@ function tps_ci_davidson_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
         # Decide storage tier.
         tier = h_storage
         if tier == :auto
+            tier, _, _ = _sharded_H_auto_tier(ci_vector, clustered_ham, worker_ids,
+                                              max_mem_H; verbose=verbose)
+        elseif tier == :blocks
             rep = sharded_H_memory_report(ci_vector, clustered_ham)
-            tier = rep.gb <= max_mem_H ? :blocks : :matrixfree
-            verbose > 0 && @printf(" H storage :auto -> :%s  (block-sparse H ~ %.3f GB, budget %.1f GB)\n",
-                                   tier, rep.gb, max_mem_H)
+            fit = sharded_H_fit_report(rep, worker_ids)
+            verbose > 0 && print_sharded_H_fit(rep, fit)
+            fit.fits ||
+                error("h_storage=:blocks needs $(round(rep.max_worker_gb; digits=2)) GB on " *
+                      "worker $(rep.max_worker_pid), but worker $(fit.worst_pid) is short by " *
+                      "$(round(fit.worst_deficit_gb; digits=2)) GB. Add nodes, put one worker " *
+                      "per node, or use h_storage=:matrixfree.")
         end
 
         if tier == :blocks

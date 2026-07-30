@@ -2763,13 +2763,20 @@ function tpsci_ci_sharded(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
         tier = h_storage
         if tier == :auto
             rep = sharded_H_memory_report(vec_var, clustered_ham)
-            if rep.gb <= max_mem_H
+            fit = sharded_H_fit_report(rep, worker_ids)
+            verbose > 0 && print_sharded_H_fit(rep, fit)
+            if rep.gb <= max_mem_H && fit.fits
                 tier = :blocks
             elseif allow_matrixfree_fallback
                 tier = :matrixfree
             else
-                error("Stored sharded H estimate is $(round(rep.gb; digits=3)) GB, " *
-                      "above max_mem_H=$(max_mem_H) GB. Refusing automatic " *
+                why = rep.gb > max_mem_H ?
+                      "above max_mem_H=$(max_mem_H) GB" :
+                      "within max_mem_H=$(max_mem_H) GB, but worker $(fit.worst_pid) is " *
+                      "short by $(round(fit.worst_deficit_gb; digits=2)) GB of real RAM"
+                error("Stored sharded H estimate is $(round(rep.gb; digits=3)) GB " *
+                      "aggregate ($(round(rep.max_worker_gb; digits=2)) GB peak on worker " *
+                      "$(rep.max_worker_pid)), $(why). Refusing automatic " *
                       "matrix-free fallback because it is very slow for TPSCI. " *
                       "Increase max_mem_H / nodes, force h_storage=:blocks if you " *
                       "accept the memory use, or set allow_matrixfree_fallback=true " *

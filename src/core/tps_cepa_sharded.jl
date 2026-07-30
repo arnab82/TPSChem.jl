@@ -183,11 +183,20 @@ function _tps_sharded_cepa_build_hq_op(cepa_vector::DistributedTPSCIstate,
                                        threaded_worker, blas_threads, verbose)
     tier = h_storage
     if tier == :auto
+        tier, _, _ = _sharded_H_auto_tier(cepa_vector, clustered_ham, workers,
+                                          max_mem_H; verbose=max(verbose, 1),
+                                          label="TPS-CEPA H_Q")
+    elseif tier == :blocks
+        # Explicit :blocks still gets a feasibility check — silently OOM-killing a
+        # multi-node job hours in is far worse than refusing up front.
         rep = sharded_H_memory_report(cepa_vector, clustered_ham)
-        tier = rep.gb <= max_mem_H ? :blocks : :matrixfree
-        verbose >= 0 &&
-            @printf(" TPS-CEPA H storage :auto -> :%s  (block-sparse H_Q ~ %.3f GB, budget %.1f GB)\n",
-                    tier, rep.gb, max_mem_H)
+        fit = sharded_H_fit_report(rep, workers)
+        print_sharded_H_fit(rep, fit; label="TPS-CEPA H_Q")
+        fit.fits ||
+            error("h_storage=:blocks needs $(round(rep.max_worker_gb; digits=2)) GB on " *
+                  "worker $(rep.max_worker_pid), but worker $(fit.worst_pid) is short by " *
+                  "$(round(fit.worst_deficit_gb; digits=2)) GB. Add nodes, put one worker " *
+                  "per node, or use h_storage=:matrixfree.")
     end
     if tier == :blocks
         op = build_block_h_sharded(cepa_vector, cluster_ops, clustered_ham;
