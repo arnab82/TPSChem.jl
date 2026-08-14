@@ -494,14 +494,21 @@ struct MatrixFreeShardedH{H}
     blas_threads::Int
 end
 
-function apply_sharded_H(op::MatrixFreeShardedH, v::DistributedTPSCIstate)
+function apply_sharded_H(op::MatrixFreeShardedH, v::DistributedTPSCIstate{T,N,R};
+                         eshift=zero(T), id=nothing) where {T,N,R}
     # verbose=0: this is called once per Davidson direction / MINRES iteration;
     # per-call banners would swamp the solver log.
-    return tps_ci_matvec_sharded(v, op.cluster_ops, op.clustered_ham;
-                                 workers=op.workers,
-                                 threaded_worker=op.threaded_worker,
-                                 blas_threads=op.blas_threads,
-                                 verbose=0)
+    out = tps_ci_matvec_sharded(v, op.cluster_ops, op.clustered_ham;
+                                workers=op.workers,
+                                threaded_worker=op.threaded_worker,
+                                blas_threads=op.blas_threads,
+                                id=id,
+                                verbose=0)
+    # The re-contracted matvec builds its own output state, so the shift cannot be
+    # folded into it the way the stored-block path does; it costs one extra
+    # fan-out, still far cheaper than the matvec itself.
+    iszero(eshift) || add_scaled!(out, -eshift, v)
+    return out
 end
 
 # ---------------------------------------------------------------------------
@@ -516,6 +523,221 @@ struct ShardedBlockData{T,N}
     ket_order::Dict{FockConfig{N},Vector{ClusterConfig{N}}}
     connections::Dict{FockConfig{N},Vector{FockConfig{N}}}
     mats::Dict{Tuple{FockConfig{N},FockConfig{N}},Matrix{T}}
+    # Ket sectors this chunk's row blocks read. Fixed for the life of the
+    # operator (it follows the stored sparsity, not the vector), so the matvec
+    # can fetch them in one batch per owner instead of rediscovering them a
+    # blocking round trip at a time.
+    needed_kets::Vector{FockConfig{N}}
+end
+
+# ---------------------------------------------------------------------------
+# Term bucketing: which terms can connect a given pair of configurations.
+#
+# `check_term` is O(n_clusters) and the naive build calls it once per
+# (bra, ket, term); with hundreds of terms per Fock transition almost every call
+# fails, and the failures dominate the build. Two facts remove that work:
+#
+#   * whether a term's *Fock* pattern fits a (fock_bra, fock_ket) pair does not
+#     depend on the configurations, so it is decided once per block;
+#   * a term contributes only if the bra and ket configs agree on every cluster it
+#     does not act on, i.e. only if the set of clusters where the two configs
+#     differ is a subset of the term's active clusters.
+#
+# So the surviving terms are bucketed by difference pattern (each term is filed
+# under every subset of its active-cluster mask, at most 2^4 = 16 of them) and the
+# pair loop computes one difference mask -- with an early exit as soon as more
+# clusters differ than any term can bridge -- followed by a single lookup.
+# ---------------------------------------------------------------------------
+
+@inline function _term_active_mask(term::ClusteredTerm)
+    mask = UInt64(0)
+    for c in term.clusters
+        mask |= UInt64(1) << (c.idx - 1)
+    end
+    return mask
+end
+
+# Configuration-independent half of `check_term`. It depends on the Fock sectors
+# only through their difference, which is what makes the buckets below reusable
+# across every (bra, ket) sector pair with the same transfer.
+function _term_fock_ok(term::ClusteredTerm, fock_trans::TransferConfig{N}) where {N}
+    active = _term_active_mask(term)
+    for ci in 1:N
+        (active >> (ci - 1)) & UInt64(1) == UInt64(1) && continue
+        fock_trans[ci] == (0, 0) || return false
+    end
+    for (i, c) in enumerate(term.clusters)
+        fock_trans[c.idx] == term.delta[i] || return false
+    end
+    return true
+end
+
+const ShardedTermBuckets = Dict{UInt64,Vector{ClusteredTerm}}
+
+"""
+Bucket the terms of one Fock transfer by the cluster-difference patterns they can
+bridge. Returns `(buckets, maxdiff)` where `buckets` maps a difference bitmask to
+the terms that can contribute to a configuration pair with exactly that mask, and
+`maxdiff` is the largest number of differing clusters any surviving term spans
+(0 if no term's Fock pattern fits this transfer at all).
+"""
+function _bucket_terms_by_diff(terms, fock_trans::TransferConfig{N}) where {N}
+    buckets = ShardedTermBuckets()
+    maxdiff = -1
+    for term in terms
+        _term_fock_ok(term, fock_trans) || continue
+        mask = _term_active_mask(term)
+        maxdiff = max(maxdiff, count_ones(mask))
+        sub = mask
+        while true
+            push!(get!(() -> ClusteredTerm[], buckets, sub), term)
+            sub == UInt64(0) && break
+            sub = (sub - UInt64(1)) & mask
+        end
+    end
+    return buckets, max(maxdiff, 0)
+end
+
+# Bitmask of the clusters where `a` and `b` differ. Bails out (returning a
+# popcount above `maxdiff`) as soon as the pair is too far apart for any term.
+@inline function _config_diff_mask(a::ClusterConfig{N}, b::ClusterConfig{N},
+                                   maxdiff::Int) where {N}
+    mask = UInt64(0)
+    pop = 0
+    ac = a.config
+    bc = b.config
+    @inbounds for i in 1:N
+        if ac[i] != bc[i]
+            pop += 1
+            pop <= maxdiff || return (mask, pop)
+            mask |= UInt64(1) << (i - 1)
+        end
+    end
+    return (mask, pop)
+end
+
+# Fill one row of a (fock_bra, fock_ket) block. `Hblk[bi, :]` is owned by the
+# caller's thread, so the row loop over this is race free.
+function _fill_block_h_row!(Hblk::Matrix{T}, bi::Int, config_bra::ClusterConfig{N},
+                            ket_cfgs::Vector{ClusterConfig{N}}, buckets, maxdiff::Int,
+                            cluster_ops, fock_bra::FockConfig{N},
+                            fock_ket::FockConfig{N}) where {T,N}
+    @inbounds for ki in eachindex(ket_cfgs)
+        config_ket = ket_cfgs[ki]
+        mask, pop = _config_diff_mask(config_bra, config_ket, maxdiff)
+        pop <= maxdiff || continue
+        cand = get(buckets, mask, nothing)
+        cand === nothing && continue
+        acc = zero(T)
+        for term in cand
+            acc += contract_matrix_element(term, cluster_ops, fock_bra, config_bra,
+                                           fock_ket, config_ket)
+        end
+        Hblk[bi, ki] = acc
+    end
+    return nothing
+end
+
+function _fill_block_h!(Hblk::Matrix{T}, bra_cfgs::Vector{ClusterConfig{N}},
+                        ket_cfgs::Vector{ClusterConfig{N}}, buckets, maxdiff::Int,
+                        cluster_ops, fock_bra::FockConfig{N},
+                        fock_ket::FockConfig{N}, threaded::Bool) where {T,N}
+    if threaded && length(bra_cfgs) > 1 && Threads.nthreads() > 1
+        Threads.@threads :dynamic for bi in eachindex(bra_cfgs)
+            _fill_block_h_row!(Hblk, bi, bra_cfgs[bi], ket_cfgs, buckets, maxdiff,
+                               cluster_ops, fock_bra, fock_ket)
+        end
+    else
+        for bi in eachindex(bra_cfgs)
+            _fill_block_h_row!(Hblk, bi, bra_cfgs[bi], ket_cfgs, buckets, maxdiff,
+                               cluster_ops, fock_bra, fock_ket)
+        end
+    end
+    return Hblk
+end
+
+# One (fock_bra, fock_ket) block of work: the destination and everything needed
+# to fill it. Collected first so the whole chunk can be threaded at whichever
+# granularity actually has parallelism -- a sharded space is usually many small
+# Fock sectors (thread across blocks) but can be a few large ones (thread across
+# the rows of a block).
+struct ShardedBlockJob{T,N}
+    fock_bra::FockConfig{N}
+    fock_ket::FockConfig{N}
+    Hblk::Matrix{T}
+    bra_cfgs::Vector{ClusterConfig{N}}
+    ket_cfgs::Vector{ClusterConfig{N}}
+    buckets::ShardedTermBuckets
+    maxdiff::Int
+    reuse::Union{Nothing,Tuple{Matrix{T},Vector{Int},Vector{Int},Vector{Int}}}
+end
+
+function _run_block_h_job!(job::ShardedBlockJob{T,N}, cluster_ops,
+                           thread_rows::Bool) where {T,N}
+    if job.reuse === nothing
+        _fill_block_h!(job.Hblk, job.bra_cfgs, job.ket_cfgs, job.buckets, job.maxdiff,
+                       cluster_ops, job.fock_bra, job.fock_ket, thread_rows)
+        return nothing
+    end
+    M_old, old_row, old_col, todo = job.reuse
+    fill_row = bi -> begin
+        bio = old_row[bi]
+        if bio == 0
+            _fill_block_h_row!(job.Hblk, bi, job.bra_cfgs[bi], job.ket_cfgs,
+                               job.buckets, job.maxdiff, cluster_ops, job.fock_bra,
+                               job.fock_ket)
+        else
+            _fill_block_h_row_reuse!(job.Hblk, bi, bio, M_old, old_col, todo,
+                                     job.bra_cfgs[bi], job.ket_cfgs, job.buckets,
+                                     job.maxdiff, cluster_ops, job.fock_bra,
+                                     job.fock_ket)
+        end
+    end
+    if thread_rows && length(job.bra_cfgs) > 1 && Threads.nthreads() > 1
+        Threads.@threads :dynamic for bi in eachindex(job.bra_cfgs)
+            fill_row(bi)
+        end
+    else
+        for bi in eachindex(job.bra_cfgs)
+            fill_row(bi)
+        end
+    end
+    return nothing
+end
+
+function _run_block_h_jobs!(jobs::Vector{ShardedBlockJob{T,N}}, cluster_ops,
+                            threaded::Bool) where {T,N}
+    nt = Threads.nthreads()
+    if !threaded || nt <= 1 || length(jobs) <= 1
+        for job in jobs
+            _run_block_h_job!(job, cluster_ops, threaded && nt > 1)
+        end
+    elseif length(jobs) >= 2 * nt
+        # Plenty of blocks: one thread per block, which avoids paying the
+        # fork/join cost on each of the (often tiny) inner row loops.
+        Threads.@threads :dynamic for i in eachindex(jobs)
+            _run_block_h_job!(jobs[i], cluster_ops, false)
+        end
+    else
+        for job in jobs
+            _run_block_h_job!(job, cluster_ops, true)
+        end
+    end
+    return jobs
+end
+
+# The ket sectors this chunk's row blocks read (see `ShardedBlockData`). Which
+# worker owns each of them is deliberately NOT baked in: `apply_sharded_H` may be
+# handed a vector distributed differently from the one H was built on.
+function _block_h_needed_kets(owned_bras, connections, ::Val{N}) where {N}
+    needed = Set{FockConfig{N}}()
+    for fock_bra in owned_bras
+        push!(needed, fock_bra)          # the diagonal shift reads this sector too
+        for fock_ket in get(connections, fock_bra, FockConfig{N}[])
+            push!(needed, fock_ket)
+        end
+    end
+    return collect(needed)
 end
 
 mutable struct ShardedBlockH{T,N}
@@ -542,7 +764,7 @@ function _tpsci_sharded_get_block_h(id::Symbol)
 end
 
 function _build_block_h_chunk!(block_id::Symbol, ci_vector::DistributedTPSCIstate,
-                               owned_bras)
+                               owned_bras, threaded_worker::Bool=true)
     cluster_ops = _TPSCI_MULTINODE_CLUSTER_OPS[]
     clustered_ham = _TPSCI_MULTINODE_CLUSTERED_HAM[]
     cluster_ops === nothing && error("TPSCI sharded cluster-ops cache is empty")
@@ -552,51 +774,59 @@ function _build_block_h_chunk!(block_id::Symbol, ci_vector::DistributedTPSCIstat
             cluster_ops, [c.idx for c in ci_vector.clusters])
     end
     return _build_block_h_chunk_typed!(block_id, ci_vector, owned_bras,
-                                       cluster_ops, clustered_ham)
+                                       cluster_ops, clustered_ham, threaded_worker)
 end
 
 function _build_block_h_chunk_typed!(block_id::Symbol,
                                      ci_vector::DistributedTPSCIstate{T,N,R},
                                      owned_bras, cluster_ops,
-                                     clustered_ham::ClusteredOperator) where {T,N,R}
+                                     clustered_ham::ClusteredOperator,
+                                     threaded::Bool=true) where {T,N,R}
     local_state = _tpsci_sharded_get_state(ci_vector.id)
-    ket_cache = Dict{FockConfig{N},Any}()
+    # Pull every ket sector this chunk needs up front, one concurrent burst per
+    # remote owner. The old lazy per-sector fetch inside the loop paid a blocking
+    # network round trip for each of the (often hundreds of) Fock sectors.
+    ket_cache = _tpsci_sharded_prefetch_ket_cache(ci_vector, clustered_ham, owned_bras)
     bra_order = Dict{FockConfig{N},Vector{ClusterConfig{N}}}()
     ket_order = Dict{FockConfig{N},Vector{ClusterConfig{N}}}()
     connections = Dict{FockConfig{N},Vector{FockConfig{N}}}()
     mats = Dict{Tuple{FockConfig{N},FockConfig{N}},Matrix{T}}()
+    bucket_cache = Dict{TransferConfig{N},Tuple{ShardedTermBuckets,Int}}()
+    jobs = ShardedBlockJob{T,N}[]
 
     for fock_bra in owned_bras
         bra_cfgs = collect(keys(local_state.data[fock_bra]))
         bra_order[fock_bra] = bra_cfgs
+        ket_order[fock_bra] = bra_cfgs      # needed by the shifted apply
         conns = FockConfig{N}[]
         for fock_ket in keys(ci_vector.owners)
             fock_trans = fock_bra - fock_ket
             haskey(clustered_ham, fock_trans) || continue
-            configs_ket = _tpsci_sharded_get_ket_configs(ci_vector, fock_ket, ket_cache)
-            ket_cfgs = collect(keys(configs_ket))
-            ket_order[fock_ket] = ket_cfgs
-            Hblk = zeros(T, length(bra_cfgs), length(ket_cfgs))
-            terms = clustered_ham[fock_trans]
-            for (bi, config_bra) in enumerate(bra_cfgs)
-                for (ki, config_ket) in enumerate(ket_cfgs)
-                    acc = zero(T)
-                    for term in terms
-                        check_term(term, fock_bra, config_bra, fock_ket, config_ket) || continue
-                        acc += contract_matrix_element(term, cluster_ops, fock_bra,
-                                                       config_bra, fock_ket, config_ket)
-                    end
-                    Hblk[bi, ki] = acc
-                end
+            buckets, maxdiff = get!(bucket_cache, fock_trans) do
+                _bucket_terms_by_diff(clustered_ham[fock_trans], fock_trans)
             end
+            configs_ket = _tpsci_sharded_get_ket_configs(ci_vector, fock_ket, ket_cache)
+            ket_cfgs = get!(() -> collect(keys(configs_ket)), ket_order, fock_ket)
+            # No term's Fock pattern fits this transfer: the block is identically
+            # zero, so neither store it nor GEMV against it later.
+            isempty(buckets) && continue
+            Hblk = zeros(T, length(bra_cfgs), length(ket_cfgs))
+            push!(jobs, ShardedBlockJob{T,N}(fock_bra, fock_ket, Hblk, bra_cfgs,
+                                             ket_cfgs, buckets, maxdiff, nothing))
             mats[(fock_bra, fock_ket)] = Hblk
             push!(conns, fock_ket)
         end
         connections[fock_bra] = conns
     end
+    _run_block_h_jobs!(jobs, cluster_ops, threaded)
+    # The job list only holds references to blocks that `mats` already owns, but
+    # release it before the caller starts sizing the next allocation.
+    empty!(jobs)
+    empty!(bucket_cache)
 
     data = ShardedBlockData{T,N}(collect(owned_bras), bra_order, ket_order,
-                                 connections, mats)
+                                 connections, mats,
+                                 _block_h_needed_kets(owned_bras, connections, Val(N)))
     _tpsci_sharded_store_block_h!(block_id, data)
     nbytes = 0
     for (_, m) in mats
@@ -615,6 +845,7 @@ Reused by `apply_sharded_H` for fast block-GEMV matvecs.
 function build_block_h_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
                                cluster_ops, clustered_ham::ClusteredOperator;
                                workers=ci_vector.workers, blas_threads=1,
+                               threaded_worker=true,
                                id=nothing, verbose=1) where {T,N,R}
     _tpsci_sharded_cache_operator_problem!(cluster_ops, clustered_ham;
                                            workers=workers, blas_threads=blas_threads)
@@ -635,7 +866,8 @@ function build_block_h_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
     @sync for pid in ci_vector.workers
         @async begin
             nbyte_maps[pid] = Distributed.remotecall_fetch(
-                _build_block_h_chunk!, pid, block_id, ci_vector, chunks[pid])
+                _build_block_h_chunk!, pid, block_id, ci_vector, chunks[pid],
+                threaded_worker)
         end
     end
     nnz = sum(values(nbyte_maps); init=0)
@@ -644,7 +876,7 @@ function build_block_h_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
 end
 
 function _update_block_h_chunk!(block_id::Symbol, ci_vector::DistributedTPSCIstate,
-                                owned_bras)
+                                owned_bras, threaded_worker::Bool=true)
     cluster_ops = _TPSCI_MULTINODE_CLUSTER_OPS[]
     clustered_ham = _TPSCI_MULTINODE_CLUSTERED_HAM[]
     cluster_ops === nothing && error("TPSCI sharded cluster-ops cache is empty")
@@ -654,74 +886,109 @@ function _update_block_h_chunk!(block_id::Symbol, ci_vector::DistributedTPSCIsta
             cluster_ops, [c.idx for c in ci_vector.clusters])
     end
     return _update_block_h_chunk_typed!(block_id, ci_vector, owned_bras,
-                                        cluster_ops, clustered_ham)
+                                        cluster_ops, clustered_ham, threaded_worker)
+end
+
+# Fill row `bi` restricted to the ket columns listed in `todo`, copying every
+# other column from the corresponding row `bio` of the previous block.
+function _fill_block_h_row_reuse!(Hblk::Matrix{T}, bi::Int, bio::Int,
+                                  M_old::Matrix{T}, old_col::Vector{Int},
+                                  todo::Vector{Int},
+                                  config_bra::ClusterConfig{N},
+                                  ket_cfgs::Vector{ClusterConfig{N}}, buckets,
+                                  maxdiff::Int, cluster_ops,
+                                  fock_bra::FockConfig{N},
+                                  fock_ket::FockConfig{N}) where {T,N}
+    @inbounds for ki in eachindex(ket_cfgs)
+        kio = old_col[ki]
+        kio > 0 && (Hblk[bi, ki] = M_old[bio, kio])
+    end
+    @inbounds for ki in todo
+        config_ket = ket_cfgs[ki]
+        mask, pop = _config_diff_mask(config_bra, config_ket, maxdiff)
+        pop <= maxdiff || continue
+        cand = get(buckets, mask, nothing)
+        cand === nothing && continue
+        acc = zero(T)
+        for term in cand
+            acc += contract_matrix_element(term, cluster_ops, fock_bra, config_bra,
+                                           fock_ket, config_ket)
+        end
+        Hblk[bi, ki] = acc
+    end
+    return nothing
 end
 
 function _update_block_h_chunk_typed!(block_id::Symbol,
                                       ci_vector::DistributedTPSCIstate{T,N,R},
                                       owned_bras, cluster_ops,
-                                      clustered_ham::ClusteredOperator) where {T,N,R}
+                                      clustered_ham::ClusteredOperator,
+                                      threaded::Bool=true) where {T,N,R}
     old = haskey(_TPSCI_SHARDED_BLOCK_H, block_id) ?
           _tpsci_sharded_get_block_h(block_id) : nothing
     local_state = _tpsci_sharded_get_state(ci_vector.id)
-    ket_cache = Dict{FockConfig{N},Any}()
+    ket_cache = _tpsci_sharded_prefetch_ket_cache(ci_vector, clustered_ham, owned_bras)
     bra_order = Dict{FockConfig{N},Vector{ClusterConfig{N}}}()
     ket_order = Dict{FockConfig{N},Vector{ClusterConfig{N}}}()
     connections = Dict{FockConfig{N},Vector{FockConfig{N}}}()
     mats = Dict{Tuple{FockConfig{N},FockConfig{N}},Matrix{T}}()
+    bucket_cache = Dict{TransferConfig{N},Tuple{ShardedTermBuckets,Int}}()
+    jobs = ShardedBlockJob{T,N}[]
 
-    # Old-column position maps per ket sector, built lazily and shared across
-    # all bra sectors in this chunk.
-    old_ket_pos = Dict{FockConfig{N},Dict{ClusterConfig{N},Int}}()
+    # Old-position maps per sector, built lazily and shared across the chunk.
+    old_ket_col = Dict{FockConfig{N},Vector{Int}}()
+    old_ket_todo = Dict{FockConfig{N},Vector{Int}}()
 
     for fock_bra in owned_bras
         bra_cfgs = collect(keys(local_state.data[fock_bra]))
         bra_order[fock_bra] = bra_cfgs
+        ket_order[fock_bra] = bra_cfgs
         old_bra = old === nothing ? ClusterConfig{N}[] :
                   get(old.bra_order, fock_bra, ClusterConfig{N}[])
         bra_pos_old = Dict(c => i for (i, c) in enumerate(old_bra))
+        old_row = Int[get(bra_pos_old, c, 0) for c in bra_cfgs]
         conns = FockConfig{N}[]
         for fock_ket in keys(ci_vector.owners)
             fock_trans = fock_bra - fock_ket
             haskey(clustered_ham, fock_trans) || continue
-            configs_ket = _tpsci_sharded_get_ket_configs(ci_vector, fock_ket, ket_cache)
-            ket_cfgs = collect(keys(configs_ket))
-            ket_order[fock_ket] = ket_cfgs
-            kpos_old = get!(old_ket_pos, fock_ket) do
-                oldk = old === nothing ? ClusterConfig{N}[] :
-                       get(old.ket_order, fock_ket, ClusterConfig{N}[])
-                Dict(c => i for (i, c) in enumerate(oldk))
+            buckets, maxdiff = get!(bucket_cache, fock_trans) do
+                _bucket_terms_by_diff(clustered_ham[fock_trans], fock_trans)
             end
+            configs_ket = _tpsci_sharded_get_ket_configs(ci_vector, fock_ket, ket_cache)
+            ket_cfgs = get!(() -> collect(keys(configs_ket)), ket_order, fock_ket)
+            isempty(buckets) && continue
             M_old = old === nothing ? nothing :
                     get(old.mats, (fock_bra, fock_ket), nothing)
-            terms = clustered_ham[fock_trans]
-            Hblk = zeros(T, length(bra_cfgs), length(ket_cfgs))
-            for (bi, config_bra) in enumerate(bra_cfgs)
-                bio = M_old === nothing ? 0 : get(bra_pos_old, config_bra, 0)
-                for (ki, config_ket) in enumerate(ket_cfgs)
-                    kio = bio == 0 ? 0 : get(kpos_old, config_ket, 0)
-                    if bio > 0 && kio > 0
-                        # previously computed element: copy, don't re-contract
-                        Hblk[bi, ki] = M_old[bio, kio]
-                    else
-                        acc = zero(T)
-                        for term in terms
-                            check_term(term, fock_bra, config_bra, fock_ket, config_ket) || continue
-                            acc += contract_matrix_element(term, cluster_ops, fock_bra,
-                                                           config_bra, fock_ket, config_ket)
-                        end
-                        Hblk[bi, ki] = acc
-                    end
+            reuse = nothing
+            if M_old !== nothing
+                # Which ket columns are new is the same for every row and every
+                # bra sector, so the reuse pattern is worked out once per sector.
+                if !haskey(old_ket_col, fock_ket)
+                    oldk = get(old.ket_order, fock_ket, ClusterConfig{N}[])
+                    kpos = Dict(c => i for (i, c) in enumerate(oldk))
+                    col = Int[get(kpos, c, 0) for c in ket_cfgs]
+                    old_ket_col[fock_ket] = col
+                    old_ket_todo[fock_ket] = Int[ki for ki in eachindex(col) if col[ki] == 0]
                 end
+                reuse = (M_old, old_row, old_ket_col[fock_ket], old_ket_todo[fock_ket])
             end
+            Hblk = zeros(T, length(bra_cfgs), length(ket_cfgs))
+            push!(jobs, ShardedBlockJob{T,N}(fock_bra, fock_ket, Hblk, bra_cfgs,
+                                             ket_cfgs, buckets, maxdiff, reuse))
             mats[(fock_bra, fock_ket)] = Hblk
             push!(conns, fock_ket)
         end
         connections[fock_bra] = conns
     end
+    _run_block_h_jobs!(jobs, cluster_ops, threaded)
+    empty!(jobs)
+    empty!(bucket_cache)
+    empty!(old_ket_col)
+    empty!(old_ket_todo)
 
     data = ShardedBlockData{T,N}(collect(owned_bras), bra_order, ket_order,
-                                 connections, mats)
+                                 connections, mats,
+                                 _block_h_needed_kets(owned_bras, connections, Val(N)))
     _tpsci_sharded_store_block_h!(block_id, data)
     nbytes = 0
     for (_, m) in mats
@@ -751,6 +1018,7 @@ function update_block_h_sharded!(op::ShardedBlockH{T,N},
                                  cluster_ops, clustered_ham::ClusteredOperator;
                                  workers=ci_vector.workers,
                                  blas_threads=1,
+                                 threaded_worker=true,
                                  verbose=0) where {T,N,R}
     op.workers == ci_vector.workers ||
         error("update_block_h_sharded! requires the block-H and state on the same workers")
@@ -766,7 +1034,8 @@ function update_block_h_sharded!(op::ShardedBlockH{T,N},
     @sync for pid in ci_vector.workers
         @async begin
             nbyte_maps[pid] = Distributed.remotecall_fetch(
-                _update_block_h_chunk!, pid, op.id, ci_vector, chunks[pid])
+                _update_block_h_chunk!, pid, op.id, ci_vector, chunks[pid],
+                threaded_worker)
         end
     end
     old_nnz = op.nnz
@@ -777,28 +1046,96 @@ function update_block_h_sharded!(op::ShardedBlockH{T,N},
     return op
 end
 
+# Dense coefficients of one Fock sector, in the order the stored H expects. The
+# fast path walks the `OrderedDict` once and compares keys (all vectors over a
+# fixed Q space are built in the same insertion order, so this matches); if the
+# orders ever diverge it falls back to keyed lookup, which is what the old code
+# always did.
+function _dense_ket_in_order(::Type{T}, configs, want::Vector{ClusterConfig{N}}) where {T,N}
+    n = length(want)
+    out = Vector{T}(undef, n)
+    length(configs) == n ||
+        error("sharded H apply: vector has $(length(configs)) configs where the stored H expects $n")
+    i = 0
+    aligned = true
+    @inbounds for (config, coeffs) in configs
+        i += 1
+        if config != want[i]
+            aligned = false
+            break
+        end
+        out[i] = coeffs[1]
+    end
+    if !aligned
+        @inbounds for j in 1:n
+            out[j] = configs[want[j]][1]
+        end
+    end
+    return out
+end
+
+function _block_h_local_gather_kets(state_id::Symbol, focks, want, ::Type{T}) where {T}
+    state = _tpsci_sharded_get_state(state_id)
+    return [_dense_ket_in_order(T, state.data[focks[i]], want[i]) for i in eachindex(focks)]
+end
+
+# Collect the ket coefficients of every sector this chunk's row blocks connect
+# to. Sectors owned elsewhere are fetched one call per remote owner (all owners
+# concurrently) as dense `Vector{T}`s, instead of one blocking round trip per
+# Fock sector carrying a whole `OrderedDict` of configurations.
+function _block_h_gather_kets(block::ShardedBlockData{T,N},
+                              v::DistributedTPSCIstate{Tv,N,1}) where {T,N,Tv}
+    myid = Distributed.myid()
+    kets = Dict{FockConfig{N},Vector{T}}()
+    remote = Dict{Int,Vector{FockConfig{N}}}()
+    local_state = nothing
+    for fock in block.needed_kets
+        owner = v.owners[fock]
+        if owner == myid
+            local_state === nothing && (local_state = _tpsci_sharded_get_state(v.id))
+            kets[fock] = _dense_ket_in_order(T, local_state.data[fock],
+                                             block.ket_order[fock])
+        else
+            push!(get!(() -> FockConfig{N}[], remote, owner), fock)
+        end
+    end
+    isempty(remote) && return kets
+    fetched = Dict{Int,Vector{Vector{T}}}()
+    @sync for (owner, focks) in remote
+        @async fetched[owner] = Distributed.remotecall_fetch(
+            _block_h_local_gather_kets, owner, v.id, focks,
+            [block.ket_order[f] for f in focks], T)
+    end
+    for (owner, focks) in remote
+        blocks = fetched[owner]
+        for i in eachindex(focks)
+            kets[focks[i]] = blocks[i]
+        end
+    end
+    return kets
+end
+
 function _apply_block_h_chunk!(out_id::Symbol, block_id::Symbol,
-                               v::DistributedTPSCIstate)
-    return _apply_block_h_chunk_typed!(out_id, _tpsci_sharded_get_block_h(block_id), v)
+                               v::DistributedTPSCIstate, eshift)
+    return _apply_block_h_chunk_typed!(out_id, _tpsci_sharded_get_block_h(block_id),
+                                       v, eshift)
 end
 
 function _apply_block_h_chunk_typed!(out_id::Symbol, block::ShardedBlockData{T,N},
-                                     v::DistributedTPSCIstate{Tv,N,1}) where {T,N,Tv}
-    vket_cache = Dict{FockConfig{N},Any}()
+                                     v::DistributedTPSCIstate{Tv,N,1},
+                                     eshift) where {T,N,Tv}
+    kets = _block_h_gather_kets(block, v)
+    shift = T(eshift)
     out = TPSCIstate(v.clusters, T=T, R=1)
     for fock_bra in block.owned_bras
         bra_cfgs = block.bra_order[fock_bra]
         sig = zeros(T, length(bra_cfgs))
         for fock_ket in block.connections[fock_bra]
-            Hblk = block.mats[(fock_bra, fock_ket)]
-            ket_cfgs = block.ket_order[fock_ket]
-            configs_ket = _tpsci_sharded_get_ket_configs(v, fock_ket, vket_cache)
-            vk = Vector{T}(undef, length(ket_cfgs))
-            for (ki, config_ket) in enumerate(ket_cfgs)
-                vk[ki] = configs_ket[config_ket][1]
-            end
-            mul!(sig, Hblk, vk, one(T), one(T))
+            mul!(sig, block.mats[(fock_bra, fock_ket)], kets[fock_ket], one(T), one(T))
         end
+        # (H - eshift*I) v in the same pass: the CEPA/Davidson solvers always want
+        # the shifted operator, and doing it here saves a whole extra fan-out.
+        iszero(shift) || axpy!(-shift, kets[fock_bra], sig)
         add_fockconfig!(out, fock_bra)
         for (bi, config_bra) in enumerate(bra_cfgs)
             out[fock_bra][config_bra] = MVector{1,T}(sig[bi])
@@ -808,15 +1145,21 @@ function _apply_block_h_chunk_typed!(out_id::Symbol, block::ShardedBlockData{T,N
     return _tpsci_sharded_local_fock_lengths(out_id)
 end
 
+"""
+    apply_sharded_H(op::ShardedBlockH, v; eshift=0, id=nothing)
+
+Apply the stored block-sparse Hamiltonian to a sharded single-root vector,
+optionally shifted: the result is `(H - eshift*I) v`.
+"""
 function apply_sharded_H(op::ShardedBlockH{T,N}, v::DistributedTPSCIstate{Tv,N,1};
-                         id=nothing) where {T,N,Tv}
+                         eshift=zero(T), id=nothing) where {T,N,Tv}
     op.workers == v.workers || error("apply_sharded_H requires the block-H and vector on the same workers")
     output_id = id === nothing ? gensym(:tpsci_shard_blockHv) : Symbol(id)
     length_maps = Dict{Int,Any}()
     @sync for pid in op.workers
         @async begin
             length_maps[pid] = Distributed.remotecall_fetch(
-                _apply_block_h_chunk!, pid, output_id, op.id, v)
+                _apply_block_h_chunk!, pid, output_id, op.id, v, eshift)
         end
     end
     return _tpsci_sharded_metadata_from_lengths(output_id, op.clusters, op.workers,
@@ -837,12 +1180,19 @@ function _block_h_local_diagonal_typed!(diag_id::Symbol,
                                         state::TPSCIstate{Ts,N,R}) where {T,N,Ts,R}
     out = TPSCIstate(state.clusters, T=T, R=1)
     for fock in block.owned_bras
+        # A sector with no Fock-feasible term stores no block at all: its
+        # Hamiltonian diagonal is exactly zero.
         Hff = get(block.mats, (fock, fock), nothing)
-        Hff === nothing && error("Stored block-H is missing diagonal block for Fock sector $fock")
         bra_cfgs = block.bra_order[fock]
+        add_fockconfig!(out, fock)
+        if Hff === nothing
+            for cfg in bra_cfgs
+                out[fock][cfg] = MVector{1,T}(zero(T))
+            end
+            continue
+        end
         ket_cfgs = block.ket_order[fock]
         ket_pos = Dict(c => i for (i, c) in enumerate(ket_cfgs))
-        add_fockconfig!(out, fock)
         for (bi, cfg) in enumerate(bra_cfgs)
             ki = get(ket_pos, cfg, 0)
             ki > 0 || error("Stored block-H diagonal block is missing config $cfg in Fock sector $fock")

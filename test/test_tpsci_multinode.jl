@@ -302,6 +302,84 @@ end
     TPSChem.destroy!(bh_fresh)
 end
 
+@testset "fused sharded vector ops and shifted block-H apply" begin
+    @load "_testdata_cmf_h8.jld2"
+    ref_fock = FockConfig(init_fspace)
+    cluster_bases = TPSChem.compute_cluster_eigenbasis(ints, clusters;
+        verbose=0, max_roots=4, init_fspace=init_fspace, rdm1a=d1.a, rdm1b=d1.b)
+    clustered_ham = TPSChem.extract_ClusteredTerms(ints, clusters)
+    cluster_ops = TPSChem.compute_cluster_ops(cluster_bases, ints)
+    TPSChem.add_cmf_operators!(cluster_ops, cluster_bases, ints, d1.a, d1.b)
+
+    ci = TPSChem.TPSCIstate(clusters, ref_fock, R=1, T=Float64)
+    ci[ref_fock][ClusterConfig([1, 1])] = [1.0]
+    dref = TPSChem.distribute_tpsci_state(deepcopy(ci); workers=workers(),
+                                          strategy=:balanced)
+    q = TPSChem.open_matvec_sharded(dref, cluster_ops, clustered_ham;
+        nbody=4, thresh=1e-6, prescreen=false, workers=workers(), verbose=0)
+    TPSChem.project_out!(q, dref)
+    @test length(q.owners) > 1
+
+    Random.seed!(9876)
+    lu = TPSChem.collect_tpsci_state(q); TPSChem.randomize!(lu)
+    lv = TPSChem.collect_tpsci_state(q); TPSChem.randomize!(lv)
+    mku() = TPSChem.distribute_tpsci_state(deepcopy(lu); workers=workers(),
+                                           strategy=:balanced)
+    mkv() = TPSChem.distribute_tpsci_state(deepcopy(lv); workers=workers(),
+                                           strategy=:balanced)
+
+    # Reductions match the unfused primitives.
+    u, v = mku(), mkv()
+    r = TPSChem.sharded_fused_ops!([u, v], [TPSChem.sv_dot(Float64, 1, 2),
+                                            TPSChem.sv_nrm2sq(Float64, 1)])
+    @test isapprox(r[1], TPSChem.overlap(u, v)[1, 1], atol=1e-12)
+    @test isapprox(sqrt(r[2]), LinearAlgebra.norm(u)[1], atol=1e-12)
+
+    # axpy / axpby / scale / copy match add_scaled! / linear_combination! / scale!.
+    TPSChem.sharded_fused_ops!([u, v], [TPSChem.sv_axpy(Float64, 1, -2.5, 2)])
+    u_ref, v_ref = mku(), mkv()
+    TPSChem.add_scaled!(u_ref, -2.5, v_ref)
+    @test isapprox(TPSChem.get_vector(TPSChem.collect_tpsci_state(u)),
+                   TPSChem.get_vector(TPSChem.collect_tpsci_state(u_ref)), atol=1e-12)
+
+    TPSChem.sharded_fused_ops!([u, v], [TPSChem.sv_axpby(Float64, 1, 0.25, 3.0, 2)])
+    TPSChem.linear_combination!(u_ref, 0.25, v_ref, 3.0)
+    @test isapprox(TPSChem.get_vector(TPSChem.collect_tpsci_state(u)),
+                   TPSChem.get_vector(TPSChem.collect_tpsci_state(u_ref)), atol=1e-12)
+
+    TPSChem.sharded_fused_ops!([u, v], [TPSChem.sv_scale(Float64, 1, -0.5),
+                                        TPSChem.sv_copy(Float64, 2, 1)])
+    TPSChem.scale!(u_ref, -0.5)
+    @test isapprox(TPSChem.get_vector(TPSChem.collect_tpsci_state(v)),
+                   TPSChem.get_vector(TPSChem.collect_tpsci_state(u_ref)), atol=1e-12)
+
+    # Shifted stored-H apply equals H*v - shift*v, and the stored blocks
+    # reproduce the matrix-free matvec on the same space.
+    bh = TPSChem.build_block_h_sharded(q, cluster_ops, clustered_ham;
+                                       workers=workers(), verbose=0)
+    w = mkv()
+    hw = TPSChem.apply_sharded_H(bh, w)
+    hw_shift = TPSChem.apply_sharded_H(bh, w; eshift=0.75)
+    hw_mf = TPSChem.tps_ci_matvec_sharded(w, cluster_ops, clustered_ham;
+                                          workers=workers(), verbose=0)
+    l_w = TPSChem.collect_tpsci_state(w)
+    l_hw = TPSChem.collect_tpsci_state(hw)
+    l_shift = TPSChem.collect_tpsci_state(hw_shift)
+    l_mf = TPSChem.collect_tpsci_state(hw_mf)
+    for (fock, configs) in l_hw.data
+        for (config, coeffs) in configs
+            @test isapprox(l_shift[fock][config][1],
+                           coeffs[1] - 0.75 * l_w[fock][config][1], atol=1e-12)
+            @test isapprox(l_mf[fock][config][1], coeffs[1], atol=1e-10)
+        end
+    end
+
+    for s in (u, v, u_ref, v_ref, w, hw, hw_shift, hw_mf, q, dref)
+        TPSChem.destroy!(s)
+    end
+    TPSChem.destroy!(bh)
+end
+
 if RUN_HEAVY_MULTINODE
 @testset "never-gather tpsci_ci_sharded vs single-node tpsci_ci" begin
     @load "_testdata_cmf_h8.jld2"
