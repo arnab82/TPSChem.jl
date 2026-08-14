@@ -845,6 +845,12 @@ function _tpsci_sharded_local_copy_fock_block(id::Symbol, fock)
     return _tpsci_copy_fock_block(state.data[fock])
 end
 
+function _tpsci_sharded_local_copy_fock_blocks(id::Symbol, focks)
+    state = _tpsci_sharded_get_state(id)
+    return Any[haskey(state.data, f) ? _tpsci_copy_fock_block(state.data[f]) : nothing
+               for f in focks]
+end
+
 function _tpsci_sharded_get_ket_configs(input_state::DistributedTPSCIstate{T,N,R},
                                         fock_ket::FockConfig{N}, ket_cache) where {T,N,R}
     haskey(ket_cache, fock_ket) && return ket_cache[fock_ket]
@@ -894,10 +900,11 @@ function _tpsci_sharded_prefetch_ket_cache(input_state::DistributedTPSCIstate{T,
                                            clustered_ham, fock_bras) where {T,N,R}
     ket_cache = Dict{FockConfig{N},Any}()
     # Collect the unique ket Fock sectors these bras need, then fetch the remote
-    # ones concurrently (one @async per owner block) instead of serially. Local
-    # sectors are grabbed by reference. @async tasks share this thread
-    # cooperatively, so the disjoint-key Dict writes do not race (same pattern as
-    # the @sync/@async metadata fan-outs elsewhere).
+    # ones with ONE call per owning worker (owners queried concurrently). Local
+    # sectors are grabbed by reference. Fetching per Fock sector instead cost a
+    # round trip each, and a sharded space routinely has hundreds of sectors.
+    # @async tasks share this thread cooperatively, so the disjoint-key Dict
+    # writes do not race (same pattern as the @sync/@async fan-outs elsewhere).
     needed = Set{FockConfig{N}}()
     for fock_bra in fock_bras
         for fock_ket in keys(input_state.owners)
@@ -908,21 +915,26 @@ function _tpsci_sharded_prefetch_ket_cache(input_state::DistributedTPSCIstate{T,
     end
     myid = Distributed.myid()
     local_state = _tpsci_sharded_get_state(input_state.id)
-    remote = FockConfig{N}[]
+    remote = Dict{Int,Vector{FockConfig{N}}}()
     for fock_ket in needed
-        if input_state.owners[fock_ket] == myid
+        owner = input_state.owners[fock_ket]
+        if owner == myid
             ket_cache[fock_ket] = local_state.data[fock_ket]
         else
-            push!(remote, fock_ket)
+            push!(get!(() -> FockConfig{N}[], remote, owner), fock_ket)
         end
     end
-    @sync for fock_ket in remote
-        @async begin
-            owner = input_state.owners[fock_ket]
-            block = Distributed.remotecall_fetch(_tpsci_sharded_local_copy_fock_block,
-                                                 owner, input_state.id, fock_ket)
-            block === nothing && error("Missing sharded ket Fock block $fock_ket on owner $owner")
-            ket_cache[fock_ket] = block
+    fetched = Dict{Int,Vector{Any}}()
+    @sync for (owner, focks) in remote
+        @async fetched[owner] = Distributed.remotecall_fetch(
+            _tpsci_sharded_local_copy_fock_blocks, owner, input_state.id, focks)
+    end
+    for (owner, focks) in remote
+        blocks = fetched[owner]
+        for i in eachindex(focks)
+            blocks[i] === nothing &&
+                error("Missing sharded ket Fock block $(focks[i]) on owner $owner")
+            ket_cache[focks[i]] = blocks[i]
         end
     end
     return ket_cache
@@ -1493,6 +1505,239 @@ function add_scaled_multi!(dest::DistributedTPSCIstate{T,N,1}, coeffs::AbstractV
                                             pid, dest.id, cvec, src_ids)
     end
     return dest
+end
+
+# --- Fused worker-local vector algebra --------------------------------------
+# Each sharded vector operation costs a full fan-out (a `remotecall_fetch` to
+# every worker) plus a pass over that worker's nested Fock/config dictionaries.
+# A MINRES step needs about a dozen of them, so a linear solve spent most of its
+# wall clock in round trips rather than in H*v. `sharded_fused_ops!` executes a
+# whole list of axpy/scale/copy operations, together with any inner products, in
+# ONE fan-out.
+#
+# The inner loops also avoid hashing. Every vector over a fixed space is built
+# from the same source (`deepcopy`, `TPSCIstate(src)`, `restrict_to_basis_sharded`,
+# the stored-H matvec), so their `OrderedDict`s carry identical insertion orders
+# and can be addressed by position. That alignment is verified once per fused
+# call per vector; if it ever fails, the slot list for that vector is rebuilt by
+# keyed lookup instead, which is what the unfused primitives always did.
+
+"""
+    ShardedVecOp{T}
+
+One elementwise operation in a fused sharded vector-algebra batch. `dest` and
+`src` are 1-based indices into the state list handed to `sharded_fused_ops!`.
+
+| `kind`   | effect                        | returns   |
+|:---------|:------------------------------|:----------|
+| `:axpy`  | `dest .+= a .* src`           | -         |
+| `:axpby` | `dest .= a.*dest .+ b.*src`   | -         |
+| `:scale` | `dest .*= a`                  | -         |
+| `:copy`  | `dest .= src`                 | -         |
+| `:zero`  | `dest .= 0`                   | -         |
+| `:dot`   | -                             | `dest·src`|
+| `:nrm2sq`| -                             | `dest·dest`|
+"""
+struct ShardedVecOp{T}
+    kind::Symbol
+    dest::Int
+    src::Int
+    a::T
+    b::T
+end
+
+sv_axpy(::Type{T}, dest, a, src) where {T} = ShardedVecOp{T}(:axpy, dest, src, T(a), zero(T))
+sv_axpby(::Type{T}, dest, a, b, src) where {T} = ShardedVecOp{T}(:axpby, dest, src, T(a), T(b))
+sv_scale(::Type{T}, dest, a) where {T} = ShardedVecOp{T}(:scale, dest, 0, T(a), zero(T))
+sv_copy(::Type{T}, dest, src) where {T} = ShardedVecOp{T}(:copy, dest, src, zero(T), zero(T))
+sv_zero(::Type{T}, dest) where {T} = ShardedVecOp{T}(:zero, dest, 0, zero(T), zero(T))
+sv_dot(::Type{T}, a, b) where {T} = ShardedVecOp{T}(:dot, a, b, zero(T), zero(T))
+sv_nrm2sq(::Type{T}, a) where {T} = ShardedVecOp{T}(:nrm2sq, a, a, zero(T), zero(T))
+
+# Gather a state's coefficients into a flat buffer, in the reference state's
+# order. The fast path is one ordered walk with a key comparison per entry (all
+# vectors over a fixed space are built in the same insertion order); if the
+# orders ever diverge it re-walks addressing `state` by the reference's keys,
+# which is what the unfused primitives always did.
+function _tpsci_sharded_gather_flat!(out::Vector{T}, state::TPSCIstate{Ts,N,1},
+                                     ref::TPSCIstate{Tr,N,1}) where {T,Ts,Tr,N}
+    n = length(out)
+    length(state) == n ||
+        error("sharded_fused_ops!: vectors span different spaces on worker $(Distributed.myid())")
+    if state === ref
+        i = 0
+        @inbounds for (_, configs) in state.data
+            for (_, coeffs) in configs
+                i += 1
+                out[i] = coeffs[1]
+            end
+        end
+        return out
+    end
+    i = 0
+    aligned = true
+    for ((fs, cs), (fr, cr)) in zip(state.data, ref.data)
+        if fs != fr || length(cs) != length(cr)
+            aligned = false
+            break
+        end
+        for ((ks, vs), (kr, _)) in zip(cs, cr)
+            if ks != kr
+                aligned = false
+                break
+            end
+            i += 1
+            out[i] = vs[1]
+        end
+        aligned || break
+    end
+    aligned && i == n && return out
+    i = 0
+    for (fock, configs) in ref.data
+        for (config, _) in configs
+            i += 1
+            out[i] = state.data[fock][config][1]
+        end
+    end
+    return out
+end
+
+function _tpsci_sharded_scatter_flat!(state::TPSCIstate{Ts,N,1}, ref::TPSCIstate{Tr,N,1},
+                                      vals::Vector{T}) where {T,Ts,Tr,N}
+    n = length(vals)
+    i = 0
+    aligned = true
+    if state === ref
+        @inbounds for (_, configs) in state.data
+            for (_, coeffs) in configs
+                i += 1
+                coeffs[1] = vals[i]
+            end
+        end
+        return state
+    end
+    for ((fs, cs), (fr, cr)) in zip(state.data, ref.data)
+        if fs != fr || length(cs) != length(cr)
+            aligned = false
+            break
+        end
+        for ((ks, vs), (kr, _)) in zip(cs, cr)
+            if ks != kr
+                aligned = false
+                break
+            end
+            i += 1
+            vs[1] = vals[i]
+        end
+        aligned || break
+    end
+    aligned && i == n && return state
+    i = 0
+    for (fock, configs) in ref.data
+        for (config, _) in configs
+            i += 1
+            state.data[fock][config][1] = vals[i]
+        end
+    end
+    return state
+end
+
+function _tpsci_sharded_fused_ops!(ids::Vector{Symbol}, ops::Vector{ShardedVecOp{T}}) where {T}
+    return _tpsci_sharded_fused_ops_typed!(
+        [_tpsci_sharded_get_state(id) for id in ids], ops)
+end
+
+function _tpsci_sharded_fused_ops_typed!(states::Vector, ops::Vector{ShardedVecOp{T}}) where {T}
+    isempty(states) && return T[]
+    nst = length(states)
+    # Only the vectors this batch actually touches are staged; a MINRES step
+    # names seven buffers but each batch reads two to five of them.
+    used = falses(nst)
+    written = falses(nst)
+    for op in ops
+        used[op.dest] = true
+        op.src == 0 || (used[op.src] = true)
+        (op.kind === :dot || op.kind === :nrm2sq) || (written[op.dest] = true)
+    end
+    refidx = findfirst(used)
+    refidx === nothing && return T[]
+    ref = states[refidx]
+    n = length(ref)
+    bufs = Vector{Vector{T}}(undef, nst)
+    for i in 1:nst
+        used[i] || continue
+        bufs[i] = _tpsci_sharded_gather_flat!(Vector{T}(undef, n), states[i], ref)
+    end
+
+    out = T[]
+    for op in ops
+        d = bufs[op.dest]
+        if op.kind === :scale
+            a = op.a
+            @inbounds @simd for j in 1:n
+                d[j] *= a
+            end
+        elseif op.kind === :zero
+            fill!(d, zero(T))
+        else
+            s = bufs[op.src]
+            if op.kind === :axpy
+                LinearAlgebra.axpy!(op.a, s, d)
+            elseif op.kind === :axpby
+                a = op.a
+                b = op.b
+                @inbounds @simd for j in 1:n
+                    d[j] = a * d[j] + b * s[j]
+                end
+            elseif op.kind === :copy
+                copyto!(d, s)
+            elseif op.kind === :dot || op.kind === :nrm2sq
+                push!(out, LinearAlgebra.dot(d, s))
+            else
+                error("Unknown ShardedVecOp kind: $(op.kind)")
+            end
+        end
+    end
+
+    for i in 1:nst
+        written[i] && _tpsci_sharded_scatter_flat!(states[i], ref, bufs[i])
+    end
+    return out
+end
+
+"""
+    sharded_fused_ops!(states, ops) -> Vector{T}
+
+Run a batch of elementwise operations on a set of sharded single-root vectors in
+a single fan-out, returning the (globally summed) results of the reduction ops in
+the order they appear in `ops`. All `states` must live on the same workers and
+span the same space.
+"""
+function sharded_fused_ops!(states::AbstractVector, ops::Vector{ShardedVecOp{T}}) where {T}
+    isempty(ops) && return T[]
+    pids = states[1].workers
+    owners = states[1].owners
+    for s in states
+        s.workers == pids || error("sharded_fused_ops! requires identical worker lists")
+        # The kernels address coefficients by position within each worker, so a
+        # different shard layout would silently mix unrelated configurations.
+        s.owners == owners || error("sharded_fused_ops! requires matching Fock ownership")
+    end
+    ids = Symbol[s.id for s in states]
+    # Each vector is staged into its own flat buffer and written back at the end,
+    # so listing one twice would silently drop whichever update lands first.
+    allunique(ids) || error("sharded_fused_ops! requires distinct states")
+    nred = count(o -> o.kind === :dot || o.kind === :nrm2sq, ops)
+    partials = Dict{Int,Vector{T}}()
+    @sync for pid in pids
+        @async partials[pid] = Distributed.remotecall_fetch(
+            _tpsci_sharded_fused_ops!, pid, ids, ops)
+    end
+    total = zeros(T, nred)
+    for pid in pids
+        total .+= partials[pid]
+    end
+    return total
 end
 
 function _tpsci_sharded_local_lincomb!(dest_id::Symbol, alpha,
@@ -2771,13 +3016,20 @@ function tpsci_ci_sharded(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
         tier = h_storage
         if tier == :auto
             rep = sharded_H_memory_report(vec_var, clustered_ham)
-            if rep.gb <= max_mem_H
+            fit = sharded_H_fit_report(rep, worker_ids)
+            verbose > 0 && print_sharded_H_fit(rep, fit)
+            if rep.gb <= max_mem_H && fit.fits
                 tier = :blocks
             elseif allow_matrixfree_fallback
                 tier = :matrixfree
             else
-                error("Stored sharded H estimate is $(round(rep.gb; digits=3)) GB, " *
-                      "above max_mem_H=$(max_mem_H) GB. Refusing automatic " *
+                why = rep.gb > max_mem_H ?
+                      "above max_mem_H=$(max_mem_H) GB" :
+                      "within max_mem_H=$(max_mem_H) GB, but worker $(fit.worst_pid) is " *
+                      "short by $(round(fit.worst_deficit_gb; digits=2)) GB of real RAM"
+                error("Stored sharded H estimate is $(round(rep.gb; digits=3)) GB " *
+                      "aggregate ($(round(rep.max_worker_gb; digits=2)) GB peak on worker " *
+                      "$(rep.max_worker_pid)), $(why). Refusing automatic " *
                       "matrix-free fallback because it is very slow for TPSCI. " *
                       "Increase max_mem_H / nodes, force h_storage=:blocks if you " *
                       "accept the memory use, or set allow_matrixfree_fallback=true " *

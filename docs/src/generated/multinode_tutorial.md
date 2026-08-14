@@ -324,21 +324,26 @@ standalone Davidson solver it can fall back to matrix-free; in the selected-CI
 driver the default is stricter and refuses that slow fallback unless explicitly
 allowed.)
 
+**The estimate is per worker, not just aggregate.** Because each worker owns the
+row blocks for its own bra sectors, its share is
+`Σ_{bra it owns} n_bra · Σ_{connected ket} n_ket` — and `distribute_tpsci_state`
+balances the *number of configurations*, not this quantity. Connectivity varies
+per sector, so a length-balanced layout can still be memory-imbalanced, and an
+aggregate that fits the cluster can still not fit a node. `:auto` therefore
+checks `sharded_H_memory_report(...).per_worker_gb` against a live
+`probe_worker_memory` (cgroup-aware `Sys.total_memory()` minus current RSS, with
+co-located processes and the master charged to their host) and prints a
+per-worker feasibility table before allocating anything. If a worker would not
+fit it falls back to matrix-free, or — when `:blocks` was requested explicitly —
+errors with the table rather than being OOM-killed mid-build.
+
 1. M sends each worker the list of Q sectors it owns (row ownership).
-2. Wk prefetches every ket sector it will need in one call per remote owner
-   (move 2, batched — not one round trip per Fock sector).
-3. Wk buckets the Hamiltonian terms of each Fock *transfer* by which clusters
-   they act on. A term can only connect a bra and a ket that agree on every
-   cluster it does not touch, and whether its Fock pattern fits depends solely
-   on the transfer — so both halves of `check_term` are hoisted out of the
-   element loop, which then computes one cluster-difference mask per pair (with
-   an early exit) and visits only the terms that mask selects.
-4. Wk fills the dense blocks `H[bra_configs × ket_configs]` with
-   `contract_matrix_element`, in parallel across its threads (across blocks when
-   there are many, across the rows of a block when there are few). Sector pairs
-   no term can connect are not stored at all. Blocks live worker-locally
+2. Wk, for each owned `fock_bra` and each connected `fock_ket`: fetches the
+   ket sector's config list (move 2, cached), then fills the dense block
+   `H[bra_configs × ket_configs]` element-by-element with
+   `contract_matrix_element`. Blocks are stored worker-locally
    (`_TPSCI_SHARDED_BLOCK_H`), never shipped.
-5. Wk → M: byte counts only. H_QQ now exists as distributed block-sparse
+3. Wk → M: byte counts only. H_QQ now exists as distributed block-sparse
    rows, owned by the same workers that own the Q vector's rows.
 
 ### Step 4 — per root r: coupling vector
@@ -353,31 +358,20 @@ the screened build missed; ownership follows Q).
 For each shift update (`shift = f(E_corr)` per the CEPA variant):
 
 Solve `(H_QQ − (e0+shift))x = −h` with **sharded MINRES** (default; CG
-available). Because every fan-out is a round trip to every worker, the iteration
-is written to need as few of them as possible — **four**, total:
+available). Each MINRES iteration costs exactly:
 
-1. the shifted apply `(H_QQ − E)·v`: one fan-out. Each worker gathers the ket
-   sectors it needs in one call per remote owner (dense vectors, move 2), does a
-   block-GEMV over its stored blocks (`mul!`), and subtracts the diagonal shift
-   in the same pass — with Tier A **no contraction is recomputed, ever**;
-2. fan-out 1: the axpy against `v_prev` plus the reduction `⟨v_curr|v_next⟩`
-   (move 3), batched by `sharded_fused_ops!`;
-3. fan-out 2: orthogonalize against `v_curr` and return `‖v_next‖²`;
+1. one operator apply `H_QQ·v`: worker-local block-GEMV over the stored
+   blocks (`mul!`), ket blocks fetched/cached (move 2) — with Tier A **no
+   contraction is recomputed, ever**;
+2. one `add_scaled!` for the shift (worker-local);
+3. two to three `overlap`/`norm` reductions → scalars to M (move 3);
 4. Givens rotations on 4 numbers, on M;
-5. fan-out 3: normalize, build `w_next` from the three-term recurrence, and take
-   the solution step `x += rhs·w_next`.
-
-The Krylov buffers are allocated once and rotated by name — no per-iteration
-`copy_sharded_state`/`destroy!`, and the apply writes into a recycled buffer.
+5. worker-local axpys to update the iterates; all scratch `destroy!`ed.
 
 Then `E_corr = ⟨x|h⟩` (one reduction), update the shift, repeat until
-`|ΔE_corr| < tol`. Each macro-iteration warm starts from the previous
-amplitudes (`warm_start=true`), which for `acpf`/`aqcc`/`cisd` cuts the later
-solves to a few Krylov steps; convergence is measured against `‖b‖` so the
-tolerance means the same thing warm or cold. The matrix-free names
-(`do_fois_cepa_sharded`, `tpsci_cepa_solve_sharded`) run the same solver with
-the apply replaced by a full re-contraction — same answers (tested to 1e-7),
-many times the work.
+`|ΔE_corr| < tol`. The matrix-free names (`do_fois_cepa_sharded`,
+`tpsci_cepa_solve_sharded`) run the same solver with the apply replaced by a
+full re-contraction — same answers (tested to 1e-7), many times the work.
 
 ### Step 6 — cleanup
 
@@ -560,6 +554,7 @@ harness issues:
 | `requires matching Fock ownership` | mixing sharded states from independent `distribute_tpsci_state` / `distribute_spt_state` calls; derive related states from each other, or use `:hash` so ownership is a stable function of the Fock sector |
 | `No sharded TPSCI state cached` / `No sharded SPT state cached` | use-after-`destroy!`, or wrong worker list |
 | worker memory grows | leaked sharded states — audit `destroy!` |
+| job dies silently with no Julia error, last line is `Build sharded block-sparse H` | OOM kill (SIGKILL leaves no stacktrace). A worker's *share* of the stored H exceeded its node, even if the aggregate fit `max_mem_H`. Read the per-worker feasibility table now printed above that line; add nodes, put one worker per node (`TPSCHEM_SKIP_MASTER_NODE=1`, since `addprocs` over a SLURM nodelist otherwise co-locates a worker with the master), or use `h_storage=:matrixfree`. Confirm with `sacct -j <id> --format=MaxRSS,State` and `grep oom_kill slurm-<id>.out` |
 | Davidson energies dive below the ground state | pre-2026-07-07 build without the restart re-orthonormalization (shared by the TPSCI and SPT sharded solvers via `AbstractShardedState`) |
 
 Memory rules: `destroy!` every sharded state and block-H you create; the
@@ -619,7 +614,7 @@ Low-risk fixes already made in the multinode layer:
 | TPSCI variational vector | Sharded by Fock sector in `DistributedTPSCIstate` | Number of selected configurations times roots | Use `tpsci_ci_sharded`; avoid `collect_tpsci_state` except for debug |
 | TPSCI stored-H direct subspace | Dense coefficient matrices on master; H stays sharded | `dim * max_ss_vecs * nroots`, usually much smaller than H | Lower `max_ss_vecs`; use `tps_ci_direct_sharded` / stored-H selected-CI |
 | TPSCI matrix-free Davidson subspace | Sharded vectors, one full vector per subspace direction | Roughly `max_ss_vecs * nroots` sharded vector copies plus sigmas/residuals | Use only when stored H cannot fit; lower `max_ss_vecs` |
-| TPSCI/CEPA stored block-H | Worker-local dense blocks for connected Fock-sector pairs | `sum(n_bra * n_ket)` over connected block pairs | Use `h_storage=:auto`, set `max_mem_H`; selected-CI errors instead of silently using matrix-free |
+| TPSCI/CEPA stored block-H | Worker-local dense blocks for connected Fock-sector pairs | `sum(n_bra * n_ket)` over connected block pairs; **per worker**, only the rows it owns, which the config-count balancer does not equalize | Use `h_storage=:auto`, set `max_mem_H` (aggregate); `:auto` additionally gates on the live per-worker RAM probe and prints the feasibility table. Size nodes from `max_worker_gb`, not `gb` |
 | CEPA Q space | Sharded by Fock sector | FOIS threshold and `nbody` define Q-space size | Raise `thresh_foi`, reduce `nbody`, call `destroy!(qspace)` between thresholds |
 | SPT Path A FOIS/PT1/variational state | Master process | Gathered compressed Tucker state, plus local CI subspace copies | Switch to `subspace_product_tucker_sharded` when this reaches node memory |
 | SPT Path B FOIS/PT1/variational state | Sharded `DistributedSPTstate` | Tucker blocks per Fock sector and roots | Use `compress_sharded`, stable `:hash` ownership, and `destroy!` temporaries |

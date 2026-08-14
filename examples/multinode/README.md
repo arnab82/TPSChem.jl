@@ -113,6 +113,32 @@ and `tps_sharded_cepa_solve(...)`. The matrix-free `do_fois_cepa_sharded` /
 wrappers that call the same code path with `h_storage=:matrixfree`, so there is a
 single implementation for both the matrix-free and stored-block Hamiltonians.
 
+Where the time goes, and what the solver does about it: a sharded Q space is
+typically hundreds of small Fock sectors spread over the workers, so the cost is
+dominated by *how many* distributed round trips each step needs rather than by
+arithmetic. Four things keep that count down.
+
+- **Batched ket exchange.** The connected ket sectors a worker needs are a
+  property of the stored H, so they are recorded at build time and fetched with
+  one call per remote owner (as dense vectors), not one blocking round trip per
+  Fock sector.
+- **Fused vector algebra.** `sharded_fused_ops!` runs a whole batch of
+  axpy/scale/copy/dot operations in a single fan-out, so a MINRES iteration is
+  one `H*v` plus three fan-outs instead of roughly a dozen.
+- **Shift folded into the apply.** The stored-block operator evaluates
+  `(H_QQ - E·I)v` in one worker pass (`apply_sharded_H(op, v; eshift=...)`).
+- **Warm-started macro-iterations.** For `acpf`/`aqcc`/`cisd` the shift moves only
+  slightly between CEPA iterations, so each solve starts from the previous
+  amplitudes (`warm_start=true`, the default) and later solves take a few Krylov
+  steps. Convergence is measured against `‖b‖`, so the tolerance means the same
+  thing warm or cold.
+
+The stored-H build itself buckets the Hamiltonian terms by which clusters they
+act on, keyed by Fock transfer, so a matrix element only visits the handful of
+terms that can possibly contribute instead of testing all of them; blocks are
+filled in parallel across worker threads, and sector pairs no term can connect
+are not stored at all.
+
 ## Across-node variational diagonalization
 
 When the variational CI vector exceeds a single node's memory, there are two
