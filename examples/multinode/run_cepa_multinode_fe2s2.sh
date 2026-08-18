@@ -104,6 +104,7 @@ scontrol show hostnames "$SLURM_JOB_NODELIST" > "$TPSCHEM_MACHINE_FILE"
 cd "$TMPDIR"
 
 echo "Project: $JULIAENV"
+echo "SLURM cpus-per-task: ${SLURM_CPUS_PER_TASK:-unset}   nodes: ${SLURM_NNODES:-unset}"
 echo "Depot:   $JULIA_DEPOT_PATH"
 echo "Scratch: $TMPDIR"
 echo "Master threads: $JULIA_NUM_THREADS"
@@ -134,12 +135,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ -n "${TPSCHEM_DEVELOP_PATH:-}" ]; then
-    "${JULIA_RUN[@]}" --project="$JULIAENV" -e \
-        'import Pkg; Pkg.develop(path=ENV["TPSCHEM_DEVELOP_PATH"]); Pkg.instantiate(); Pkg.precompile(); Pkg.status()'
+# Precompilation forks one Julia process per package in parallel, and each
+# inherits JULIA_NUM_THREADS -- dozens of 32-thread processes at once, which is
+# how this step gets OOM-killed before the solve ever starts. It needs neither
+# the threads nor the parallelism, so pin both down here. The depot is shared
+# and persistent, so set TPSCHEM_SKIP_PRECOMPILE=1 once the environment is
+# warm and skip this entirely.
+if [ "${TPSCHEM_SKIP_PRECOMPILE:-0}" != "1" ]; then
+    echo "Precompiling (threads=1, ${JULIA_NUM_PRECOMPILE_TASKS:-4} parallel tasks)..."
+    export JULIA_NUM_PRECOMPILE_TASKS="${JULIA_NUM_PRECOMPILE_TASKS:-4}"
+    if [ -n "${TPSCHEM_DEVELOP_PATH:-}" ]; then
+        JULIA_NUM_THREADS=1 "${JULIA_RUN[@]}" --project="$JULIAENV" --threads=1 -e \
+            'import Pkg; Pkg.develop(path=ENV["TPSCHEM_DEVELOP_PATH"]); Pkg.instantiate(); Pkg.precompile(); Pkg.status()' \
+            || { echo "PRECOMPILE FAILED (see above; commonly OOM). Aborting." >&2; exit 1; }
+    else
+        JULIA_NUM_THREADS=1 "${JULIA_RUN[@]}" --project="$JULIAENV" --threads=1 -e \
+            'import Pkg; Pkg.instantiate(); Pkg.precompile(); Pkg.status()' \
+            || { echo "PRECOMPILE FAILED (see above; commonly OOM). Aborting." >&2; exit 1; }
+    fi
 else
-    "${JULIA_RUN[@]}" --project="$JULIAENV" -e \
-        'import Pkg; Pkg.instantiate(); Pkg.precompile(); Pkg.status()'
+    echo "Skipping precompile (TPSCHEM_SKIP_PRECOMPILE=1)"
 fi
 
 "${JULIA_RUN[@]}" --project="$JULIAENV" --threads="$JULIA_NUM_THREADS" \

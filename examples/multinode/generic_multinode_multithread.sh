@@ -22,7 +22,11 @@ set -euo pipefail
 # Useful overrides:
 #   JULIAENV=/path/to/project
 #   JULIA_DEPOT_PATH=/path/to/depot
-#   JULIA_EXE=julia
+#   # Precompilation forks a Julia process per package, each inheriting
+# JULIA_NUM_THREADS; that is how this step gets OOM-killed on a fat node.
+export JULIA_NUM_PRECOMPILE_TASKS="${JULIA_NUM_PRECOMPILE_TASKS:-4}"
+
+JULIA_EXE=julia
 #   JULIA_VERSION_ARG=+1.11       # set to an empty string for plain `julia`
 #   JULIA_NUM_THREADS=32          # master threads; defaults to 32
 #   TPSCHEM_WORKER_THREADS=64     # worker-only nodes; defaults to SLURM_CPUS_PER_TASK
@@ -155,10 +159,10 @@ cleanup() {
 trap cleanup EXIT
 
 if [ -n "${TPSCHEM_DEVELOP_PATH:-}" ]; then
-    "${JULIA_RUN[@]}" --project="$JULIAENV" -e \
+    JULIA_NUM_THREADS=1 "${JULIA_RUN[@]}" --project="$JULIAENV" --threads=1 -e \
         'import Pkg; Pkg.develop(path=ENV["TPSCHEM_DEVELOP_PATH"]); Pkg.instantiate(); Pkg.precompile(); Pkg.status()'
 else
-    "${JULIA_RUN[@]}" --project="$JULIAENV" -e \
+    JULIA_NUM_THREADS=1 "${JULIA_RUN[@]}" --project="$JULIAENV" --threads=1 -e \
         'import Pkg; Pkg.instantiate(); Pkg.precompile(); Pkg.status()'
 fi
 
