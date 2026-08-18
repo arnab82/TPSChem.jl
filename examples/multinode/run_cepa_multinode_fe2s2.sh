@@ -62,8 +62,18 @@ export TPSCHEM_CEPA_TOL="${TPSCHEM_CEPA_TOL:-1e-8}"
 # :blocks refuses up front when the stored H will not fit, instead of silently
 # dropping to :matrixfree, which does not finish at these dimensions.
 export TPSCHEM_H_STORAGE="${TPSCHEM_H_STORAGE:-blocks}"
-# Aggregate GB budget across ALL workers, not per worker.
-export TPSCHEM_MAX_MEM_H="${TPSCHEM_MAX_MEM_H:-800}"
+# Aggregate GB budget across ALL workers, not per worker. Derive it from what
+# SLURM actually granted rather than hardcoding: 80% of nodes x mem-per-node,
+# leaving room for the FOIS, Krylov vectors, cluster ops and GC headroom. The
+# per-worker feasibility check runs independently and is the one that catches a
+# worker sharing its node with the master.
+if [ -n "${SLURM_MEM_PER_NODE:-}" ] && [ "${SLURM_MEM_PER_NODE}" -gt 0 ] 2>/dev/null; then
+    _agg=$(( SLURM_MEM_PER_NODE / 1024 * ${SLURM_NNODES:-1} * 8 / 10 ))
+    export TPSCHEM_MAX_MEM_H="${TPSCHEM_MAX_MEM_H:-$_agg}"
+else
+    # --mem=0 reports 0 here; fall back and let the per-worker probe decide.
+    export TPSCHEM_MAX_MEM_H="${TPSCHEM_MAX_MEM_H:-800}"
+fi
 
 if [ "$#" -lt 2 ]; then
     echo "Usage: sbatch run_cepa_multinode_fe2s2.sh input_file.jl data_file.jld2 [extra files...]" >&2
@@ -113,7 +123,7 @@ scontrol show hostnames "$SLURM_JOB_NODELIST" > "$TPSCHEM_MACHINE_FILE"
 cd "$TMPDIR"
 
 echo "Project: $JULIAENV"
-echo "SLURM cpus-per-task: ${SLURM_CPUS_PER_TASK:-unset}   nodes: ${SLURM_NNODES:-unset}"
+echo "SLURM cpus-per-task: ${SLURM_CPUS_PER_TASK:-unset}   nodes: ${SLURM_NNODES:-unset}   mem/node: ${SLURM_MEM_PER_NODE:-unset} MB"
 echo "Depot:   $JULIA_DEPOT_PATH"
 echo "Scratch: $TMPDIR"
 echo "Master threads: $JULIA_NUM_THREADS"
