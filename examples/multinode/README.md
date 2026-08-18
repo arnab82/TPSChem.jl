@@ -101,6 +101,12 @@ far fewer contractions (~4x faster already on a tiny 79-config Q-space).
 ```bash
 export TPSCHEM_INPUT_JLD2=/path/to/problem_with_ref_vec.jld2
 export TPSCHEM_THRESH_FOI=1e-6
+export JULIA_NUM_THREADS=32       # threads for the master process
+export TPSCHEM_WORKER_THREADS=96  # threads per worker-only node
+                                  # the node that also runs the master gets
+                                  # TPSCHEM_MASTER_NODE_WORKER_THREADS, which the
+                                  # launchers default to CPUS_PER_TASK minus the
+                                  # master's threads so the pair is not oversubscribed
 export TPSCHEM_H_STORAGE=auto     # auto | blocks | matrixfree
 export TPSCHEM_MAX_MEM_H=200      # aggregate GB budget for the stored H_Q
 export TPSCHEM_SOLVER=pcg         # pcg (preconditioned CG) | minres | cg

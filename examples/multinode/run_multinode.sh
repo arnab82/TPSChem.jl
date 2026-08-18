@@ -28,7 +28,13 @@ export JULIAENV="${JULIAENV:-/N/u/abachhar/BigRed200/multinode-tpsci}"
 export MKL_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
-export JULIA_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
+export JULIA_NUM_THREADS="${JULIA_NUM_THREADS:-32}"
+export TPSCHEM_WORKER_THREADS="${TPSCHEM_WORKER_THREADS:-$SLURM_CPUS_PER_TASK}"
+# The node that also runs the master gets the cores the master is not using, so
+# the two fit in --cpus-per-task; worker-only nodes get the full allocation.
+_shared=$(( SLURM_CPUS_PER_TASK - JULIA_NUM_THREADS ))
+[ "$_shared" -lt 1 ] && _shared=1
+export TPSCHEM_MASTER_NODE_WORKER_THREADS="${TPSCHEM_MASTER_NODE_WORKER_THREADS:-$_shared}"
 export TPSCHEM_BLAS_THREADS="${TPSCHEM_BLAS_THREADS:-1}"
 
 if [ "$#" -lt 2 ]; then

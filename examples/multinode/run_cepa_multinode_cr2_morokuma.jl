@@ -48,11 +48,19 @@ function init_multinode_workers!()
         if env_bool("TPSCHEM_SKIP_MASTER_NODE", false) && length(hosts) > 1
             hosts = hosts[2:end]
         end
-        threads = env_int("TPSCHEM_WORKER_THREADS", Threads.nthreads())
-        threads > 0 || error("TPSCHEM_WORKER_THREADS must be positive")
-        worker_flags = `--project=$project --threads=$threads`
-        addprocs(hosts; exeflags=worker_flags,
-                 env=worker_env())
+        # Per-host thread counts: the node that also carries the master gets the
+        # cores the master is not using, worker-only nodes get the full count.
+        full_threads = env_int("TPSCHEM_WORKER_THREADS", Threads.nthreads())
+        full_threads > 0 || error("TPSCHEM_WORKER_THREADS must be positive")
+        shared_threads = env_int("TPSCHEM_MASTER_NODE_WORKER_THREADS", full_threads)
+        shared_threads > 0 || error("TPSCHEM_MASTER_NODE_WORKER_THREADS must be positive")
+        shortname(h) = String(first(split(h, '.')))
+        master_host = shortname(gethostname())
+        for host in hosts
+            t = shortname(host) == master_host ? shared_threads : full_threads
+            addprocs([host]; exeflags=`--project=$project --threads=$t`,
+                     env=worker_env())
+        end
     end
 
     @sync for pid in workers()

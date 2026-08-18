@@ -47,18 +47,25 @@ function init_multinode_workers!()
         if env_bool("TPSCHEM_SKIP_MASTER_NODE", false) && length(hosts) > 1
             hosts = hosts[2:end]
         end
-        # The launcher scripts export TPSCHEM_WORKER_THREADS for the workers and
-        # JULIA_NUM_THREADS for the master. Reading only the latter silently gives
-        # every worker the master's (usually smaller) thread count.
-        threads = get(ENV, "TPSCHEM_WORKER_THREADS",
-                      get(ENV, "JULIA_NUM_THREADS", string(Threads.nthreads())))
         worker_env = Pair{String,String}[]
         for name in ("JULIA_DEPOT_PATH", "PATH", "OPENBLAS_NUM_THREADS",
                      "OMP_NUM_THREADS", "MKL_NUM_THREADS")
             haskey(ENV, name) && push!(worker_env, name => ENV[name])
         end
-        addprocs(hosts; exeflags="--project=$(project_root()) --threads=$(threads)",
-                 env=worker_env)
+        # Per-host thread counts. addprocs applies one exeflags to every host, so
+        # spawn host by host: the node that also carries the master gets fewer
+        # worker threads (TPSCHEM_MASTER_NODE_WORKER_THREADS) so the pair fits in
+        # the cores SLURM granted, while worker-only nodes get the full count.
+        full_threads = get(ENV, "TPSCHEM_WORKER_THREADS",
+                           get(ENV, "JULIA_NUM_THREADS", string(Threads.nthreads())))
+        shared_threads = get(ENV, "TPSCHEM_MASTER_NODE_WORKER_THREADS", full_threads)
+        shortname(h) = String(first(split(h, '.')))
+        master_host = shortname(gethostname())
+        for host in hosts
+            t = shortname(host) == master_host ? shared_threads : full_threads
+            addprocs([host]; exeflags="--project=$(project_root()) --threads=$(t)",
+                     env=worker_env)
+        end
     end
     @sync for pid in workers()
         pid == myid() && continue
