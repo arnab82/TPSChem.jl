@@ -51,8 +51,20 @@ function init_multinode_workers!()
         hosts = filter(!isempty, strip.(readlines(ENV["TPSCHEM_MACHINE_FILE"])))
         isempty(hosts) && error("TPSCHEM_MACHINE_FILE is empty")
         env_bool("TPSCHEM_SKIP_MASTER_NODE", false) && length(hosts) > 1 && (hosts = hosts[2:end])
-        threads = get(ENV, "JULIA_NUM_THREADS", string(Threads.nthreads()))
-        addprocs(hosts; exeflags="--project=$project --threads=$threads", env=worker_env())
+        # Per-host thread counts. addprocs applies one exeflags to every host, so
+        # spawn host by host: the node that also carries the master gets fewer
+        # worker threads (TPSCHEM_MASTER_NODE_WORKER_THREADS) so the pair fits in
+        # the cores SLURM granted, while worker-only nodes get the full count.
+        full_threads = get(ENV, "TPSCHEM_WORKER_THREADS",
+                           get(ENV, "JULIA_NUM_THREADS", string(Threads.nthreads())))
+        shared_threads = get(ENV, "TPSCHEM_MASTER_NODE_WORKER_THREADS", full_threads)
+        shortname(h) = String(first(split(h, '.')))
+        master_host = shortname(gethostname())
+        for host in hosts
+            t = shortname(host) == master_host ? shared_threads : full_threads
+            addprocs([host]; exeflags="--project=$project --threads=$t",
+                     env=worker_env())
+        end
     end
     @sync for pid in workers()
         @async remotecall_fetch(Core.eval, pid, Main,

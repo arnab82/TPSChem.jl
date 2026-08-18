@@ -745,6 +745,9 @@ mutable struct ShardedBlockH{T,N}
     workers::Vector{Int}
     clusters::Vector{MOCluster}
     nnz::Float64
+    # Thread the per-apply GEMV across owned bra sectors. Carried on the operator
+    # so every apply inherits the same setting the build was given.
+    threaded::Bool
 end
 
 function _tpsci_sharded_store_block_h!(id::Symbol, data)
@@ -872,7 +875,7 @@ function build_block_h_sharded(ci_vector::DistributedTPSCIstate{T,N,R},
     end
     nnz = sum(values(nbyte_maps); init=0)
     return ShardedBlockH{T,N}(block_id, ci_vector.workers, ci_vector.clusters,
-                              Float64(nnz))
+                              Float64(nnz), threaded_worker)
 end
 
 function _update_block_h_chunk!(block_id::Symbol, ci_vector::DistributedTPSCIstate,
@@ -1116,26 +1119,53 @@ function _block_h_gather_kets(block::ShardedBlockData{T,N},
 end
 
 function _apply_block_h_chunk!(out_id::Symbol, block_id::Symbol,
-                               v::DistributedTPSCIstate, eshift)
+                               v::DistributedTPSCIstate, eshift,
+                               threaded::Bool=true)
     return _apply_block_h_chunk_typed!(out_id, _tpsci_sharded_get_block_h(block_id),
-                                       v, eshift)
+                                       v, eshift, threaded)
+end
+
+# One row block: sigma_F = sum_F' H[F,F'] v_F', with the diagonal shift folded in.
+# Split out of the chunk loop so the loop body is thread-safe -- it touches only
+# this bra sector's own output buffer and reads the shared (immutable) ket cache.
+function _apply_block_h_row(block::ShardedBlockData{T,N}, kets,
+                            fock_bra::FockConfig{N}, shift::T) where {T,N}
+    sig = zeros(T, length(block.bra_order[fock_bra]))
+    for fock_ket in block.connections[fock_bra]
+        mul!(sig, block.mats[(fock_bra, fock_ket)], kets[fock_ket], one(T), one(T))
+    end
+    # (H - eshift*I) v in the same pass: the CEPA/Davidson solvers always want
+    # the shifted operator, and doing it here saves a whole extra fan-out.
+    iszero(shift) || axpy!(-shift, kets[fock_bra], sig)
+    return sig
 end
 
 function _apply_block_h_chunk_typed!(out_id::Symbol, block::ShardedBlockData{T,N},
                                      v::DistributedTPSCIstate{Tv,N,1},
-                                     eshift) where {T,N,Tv}
+                                     eshift, threaded::Bool=true) where {T,N,Tv}
     kets = _block_h_gather_kets(block, v)
     shift = T(eshift)
-    out = TPSCIstate(v.clusters, T=T, R=1)
-    for fock_bra in block.owned_bras
-        bra_cfgs = block.bra_order[fock_bra]
-        sig = zeros(T, length(bra_cfgs))
-        for fock_ket in block.connections[fock_bra]
-            mul!(sig, block.mats[(fock_bra, fock_ket)], kets[fock_ket], one(T), one(T))
+    bras = block.owned_bras
+
+    # The GEMV is ~97% of a stored-H solve and every bra sector is independent,
+    # so thread across them. `out` is assembled serially afterwards: a TPSCIstate
+    # is a Dict of Dicts and cannot be grown safely from several threads, but
+    # that assembly is a pointer shuffle next to the GEMV it follows.
+    sigs = Vector{Vector{T}}(undef, length(bras))
+    if threaded && Threads.nthreads() > 1 && length(bras) > 1
+        Threads.@threads :dynamic for i in eachindex(bras)
+            sigs[i] = _apply_block_h_row(block, kets, bras[i], shift)
         end
-        # (H - eshift*I) v in the same pass: the CEPA/Davidson solvers always want
-        # the shifted operator, and doing it here saves a whole extra fan-out.
-        iszero(shift) || axpy!(-shift, kets[fock_bra], sig)
+    else
+        for i in eachindex(bras)
+            sigs[i] = _apply_block_h_row(block, kets, bras[i], shift)
+        end
+    end
+
+    out = TPSCIstate(v.clusters, T=T, R=1)
+    for (i, fock_bra) in enumerate(bras)
+        bra_cfgs = block.bra_order[fock_bra]
+        sig = sigs[i]
         add_fockconfig!(out, fock_bra)
         for (bi, config_bra) in enumerate(bra_cfgs)
             out[fock_bra][config_bra] = MVector{1,T}(sig[bi])
@@ -1159,7 +1189,7 @@ function apply_sharded_H(op::ShardedBlockH{T,N}, v::DistributedTPSCIstate{Tv,N,1
     @sync for pid in op.workers
         @async begin
             length_maps[pid] = Distributed.remotecall_fetch(
-                _apply_block_h_chunk!, pid, output_id, op.id, v, eshift)
+                _apply_block_h_chunk!, pid, output_id, op.id, v, eshift, op.threaded)
         end
     end
     return _tpsci_sharded_metadata_from_lengths(output_id, op.clusters, op.workers,

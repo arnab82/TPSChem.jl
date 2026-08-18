@@ -1,3 +1,21 @@
+# Sharded TPS-CEPA sweep over FOI thresholds for an Fe2S2 model.
+#
+# Launch (see generic_multinode_multithread.sh / run_multinode.sh):
+#   TPSCHEM_MACHINE_FILE=nodes.txt TPSCHEM_WORKER_THREADS=64 \
+#   julia --project=. examples/multinode/run_cepa_multinode_fe2s2.jl data_cmf_fe2s2.jld2
+#
+# Notes on the settings that matter for a large run:
+#   * solver=:pcg uses the Jacobi-preconditioned CG, which needs roughly a third
+#     of the Hamiltonian applies of plain MINRES. It falls back to MINRES by
+#     itself on any root whose shifted operator is not positive definite.
+#   * linsolve_tol loosens only the inner Krylov solve; `tol` still governs the
+#     macro-iteration (shift) convergence.
+#   * h_storage=:blocks refuses up front when the stored H will not fit rather
+#     than silently dropping to :matrixfree, which at these dimensions does not
+#     finish. The sweep catches that and moves to the next threshold.
+#   * Stored H grows as dim_Q^2, so the tight end of THRESH_FOI_LIST is where a
+#     threshold will stop fitting.
+
 using Distributed
 using LinearAlgebra
 using Printf
@@ -48,17 +66,18 @@ function init_multinode_workers!()
         if env_bool("TPSCHEM_SKIP_MASTER_NODE", false) && length(hosts) > 1
             hosts = hosts[2:end]
         end
-        # Per-host thread counts: the node that also carries the master gets the
-        # cores the master is not using, worker-only nodes get the full count.
-        full_threads = env_int("TPSCHEM_WORKER_THREADS", Threads.nthreads())
-        full_threads > 0 || error("TPSCHEM_WORKER_THREADS must be positive")
-        shared_threads = env_int("TPSCHEM_MASTER_NODE_WORKER_THREADS", full_threads)
-        shared_threads > 0 || error("TPSCHEM_MASTER_NODE_WORKER_THREADS must be positive")
+        # Per-host thread counts. addprocs applies one exeflags to every host, so
+        # spawn host by host: the node that also carries the master gets fewer
+        # worker threads (TPSCHEM_MASTER_NODE_WORKER_THREADS) so the pair fits in
+        # the cores SLURM granted, while worker-only nodes get the full count.
+        full_threads = get(ENV, "TPSCHEM_WORKER_THREADS",
+                           get(ENV, "JULIA_NUM_THREADS", string(Threads.nthreads())))
+        shared_threads = get(ENV, "TPSCHEM_MASTER_NODE_WORKER_THREADS", full_threads)
         shortname(h) = String(first(split(h, '.')))
         master_host = shortname(gethostname())
         for host in hosts
             t = shortname(host) == master_host ? shared_threads : full_threads
-            addprocs([host]; exeflags=`--project=$project --threads=$t`,
+            addprocs([host]; exeflags="--project=$project --threads=$t",
                      env=worker_env())
         end
     end
@@ -84,26 +103,28 @@ function init_multinode_workers!()
     return pids
 end
 
-const DATA_FILE = get(ARGS, 1, get(ENV, "TPSCHEM_INPUT_JLD2", "data_cmf_29_cr2.jld2"))
+const DATA_FILE = get(ARGS, 1, get(ENV, "TPSCHEM_INPUT_JLD2", "data_cmf_fe2s2.jld2"))
 const VERBOSE = env_int("TPSCHEM_VERBOSE", 1)
 const BLAS_THREADS = env_int("TPSCHEM_BLAS_THREADS", 1)
-const M = env_int("TPSCHEM_CLUSTER_MAX_ROOTS", 100)
-const CLUSTER_SPIN_ROOTS = env_int_vector("TPSCHEM_CLUSTER_SPIN_ROOTS", [3, 3, 3])
-const INIT_FSPACE = TPSChem.FockConfig([(6, 3), (4, 4), (3, 6)])
-const NROOTS = env_int("TPSCHEM_NROOTS", 4)
+const M = env_int("TPSCHEM_CLUSTER_MAX_ROOTS", 200)
+const CLUSTER_SPIN_ROOTS = env_int_vector("TPSCHEM_CLUSTER_SPIN_ROOTS", [3, 3, 3, 3])
+const INIT_FSPACE = TPSChem.FockConfig([(5, 0), (3, 3), (3, 3), (0, 5)])
+const NROOTS = env_int("TPSCHEM_NROOTS", 6)
 const THRESH_FOI_LIST = env_float_vector(
     "TPSCHEM_THRESH_FOI_LIST",
     [1e-4, 5e-5, 2e-5, 1e-5, 5e-6],
 )
+const CEPA_SHIFT = get(ENV, "TPSCHEM_CEPA_SHIFT", "aqcc")
 
 workers_ = init_multinode_workers!()
 
-@printf("\n================ Cr2 Morokuma sharded CEPA ================\n")
+@printf("\n================ Fe2S2 sharded CEPA ================\n")
 @printf("Data file:            %s\n", DATA_FILE)
 @printf("Cluster max roots:    %i\n", M)
 @printf("Cluster spin roots:   %s\n", CLUSTER_SPIN_ROOTS)
 @printf("Reference roots:      %i\n", NROOTS)
 @printf("FOI thresholds:       %s\n", THRESH_FOI_LIST)
+@printf("CEPA variant:         %s\n", CEPA_SHIFT)
 flush(stdout)
 
 data = JLD2.load(DATA_FILE)
@@ -158,40 +179,56 @@ TPSChem.add_cmf_operators_distributed!(
 @printf("Distributed cluster ops summary: %s\n", TPSChem.cluster_ops_summary(cluster_ops))
 flush(stdout)
 
+# The bases and integrals now live on the workers. Anything still referenced
+# here is charged against the budget of whichever node the master shares with a
+# worker, which is exactly the memory the stored H needs.
+cluster_bases = nothing
+ints = nothing
+d1 = nothing
+data = nothing
+GC.gc()
+
 max_mem_H_default = 200.0 * length(workers_)
 max_mem_H = env_float("TPSCHEM_MAX_MEM_H", max_mem_H_default)
 
 for thresh_foi_cepa in THRESH_FOI_LIST
-    @printf("\nRunning sharded CEPA-0 thresh_foi=%.3e ...\n", thresh_foi_cepa)
+    @printf("\nRunning sharded CEPA (%s) thresh_foi=%.3e ...\n", CEPA_SHIFT, thresh_foi_cepa)
     GC.gc()
-    result = @timed TPSChem.do_tps_sharded_cepa(
-        ref_vec,
-        cluster_ops,
-        clustered_ham;
-        e0=eci,
-        cepa_shift=get(ENV, "TPSCHEM_CEPA_SHIFT", "cepa"),
-        cepa_mit=env_int("TPSCHEM_CEPA_MIT", 30),
-        thresh_foi=thresh_foi_cepa,
-        nbody=env_int("TPSCHEM_NBODY", 4),
-        tol=env_float("TPSCHEM_CEPA_TOL", 1e-8),
-        thresh_sigma=env_float("TPSCHEM_THRESH_SIGMA", 1e-6),
-        thresh_clip=env_float("TPSCHEM_THRESH_CLIP", 1e-5),
-        compress=env_bool("TPSCHEM_COMPRESS_Q", false),
-        solver=Symbol(get(ENV, "TPSCHEM_SOLVER", "pcg")),
-        linsolve_tol=env_float("TPSCHEM_LINSOLVE_TOL", 1e-6),
-        h_storage=Symbol(get(ENV, "TPSCHEM_H_STORAGE", "auto")),
-        max_mem_H=max_mem_H,
-        cg_maxiter=env_int("TPSCHEM_MINRES_MAXITER", 300),
-        workers=workers_,
-        threaded_worker=true,
-        blas_threads=BLAS_THREADS,
-        verbose=VERBOSE,
-    )
-    e_cepa, qspace = result.value
-    @printf("thresh=%.0e  E(cepa) = %s   (%.1f s)\n",
-            thresh_foi_cepa, string(e_cepa), result.time)
+    try
+        result = @timed TPSChem.do_tps_sharded_cepa(
+            ref_vec,
+            cluster_ops,
+            clustered_ham;
+            e0=eci,
+            cepa_shift=CEPA_SHIFT,
+            cepa_mit=env_int("TPSCHEM_CEPA_MIT", 30),
+            thresh_foi=thresh_foi_cepa,
+            nbody=env_int("TPSCHEM_NBODY", 4),
+            tol=env_float("TPSCHEM_CEPA_TOL", 1e-8),
+            linsolve_tol=env_float("TPSCHEM_LINSOLVE_TOL", 1e-6),
+            thresh_sigma=env_float("TPSCHEM_THRESH_SIGMA", 1e-6),
+            thresh_clip=env_float("TPSCHEM_THRESH_CLIP", 1e-5),
+            compress=env_bool("TPSCHEM_COMPRESS_Q", false),
+            solver=Symbol(get(ENV, "TPSCHEM_SOLVER", "pcg")),
+            h_storage=Symbol(get(ENV, "TPSCHEM_H_STORAGE", "blocks")),
+            max_mem_H=max_mem_H,
+            cg_maxiter=env_int("TPSCHEM_MINRES_MAXITER", 300),
+            workers=workers_,
+            threaded_worker=true,
+            blas_threads=BLAS_THREADS,
+            verbose=VERBOSE,
+        )
+        e_cepa, qspace = result.value
+        @printf("thresh=%.0e  E(cepa) = %s   (%.1f s)\n",
+                thresh_foi_cepa, string(e_cepa), result.time)
+        TPSChem.destroy!(qspace)
+    catch err
+        # A threshold whose stored H does not fit should not end the sweep:
+        # report the deficit the feasibility check printed and carry on.
+        @printf("thresh=%.0e  SKIPPED: %s\n",
+                thresh_foi_cepa, sprint(showerror, err))
+    end
     flush(stdout)
-    TPSChem.destroy!(qspace)
 end
 
 TPSChem.destroy!(cluster_ops)

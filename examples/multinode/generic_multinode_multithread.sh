@@ -25,7 +25,9 @@ set -euo pipefail
 #   JULIA_EXE=julia
 #   JULIA_VERSION_ARG=+1.11       # set to an empty string for plain `julia`
 #   JULIA_NUM_THREADS=32          # master threads; defaults to 32
-#   TPSCHEM_WORKER_THREADS=64     # defaults to SLURM_CPUS_PER_TASK
+#   TPSCHEM_WORKER_THREADS=64     # worker-only nodes; defaults to SLURM_CPUS_PER_TASK
+#   TPSCHEM_MASTER_NODE_WORKER_THREADS=64   # the node that also runs the master;
+#                                 # defaults to SLURM_CPUS_PER_TASK - JULIA_NUM_THREADS
 #   TPSCHEM_SKIP_MASTER_NODE=true # omit the first node from the worker list
 #   TPSCHEM_SAVE_SCRATCH=0        # do not copy scratch back after success
 #   TPSCHEM_SCRATCH_ROOT=/path    # defaults to /N/scratch/$USER
@@ -47,6 +49,12 @@ export JULIAENV="${JULIAENV:-$SLURM_SUBMIT_DIR}"
 # threads than the workers by default. Each worker can use the full node.
 export JULIA_NUM_THREADS="${JULIA_NUM_THREADS:-32}"
 export TPSCHEM_WORKER_THREADS="${TPSCHEM_WORKER_THREADS:-$SLURM_CPUS_PER_TASK}"
+# One node runs the master as well as a worker. Give that node's worker the
+# cores the master is not using, so the pair fits in --cpus-per-task instead of
+# oversubscribing it, while every worker-only node gets the full allocation.
+_shared=$(( SLURM_CPUS_PER_TASK - JULIA_NUM_THREADS ))
+[ "$_shared" -lt 1 ] && _shared=1
+export TPSCHEM_MASTER_NODE_WORKER_THREADS="${TPSCHEM_MASTER_NODE_WORKER_THREADS:-$_shared}"
 export TPSCHEM_BLAS_THREADS="${TPSCHEM_BLAS_THREADS:-1}"
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
@@ -121,7 +129,7 @@ echo "Project:        $JULIAENV"
 echo "Depot:          $JULIA_DEPOT_PATH"
 echo "Scratch:        $JOB_SCRATCH"
 echo "Master threads: $JULIA_NUM_THREADS"
-echo "Worker threads: $TPSCHEM_WORKER_THREADS"
+echo "Worker threads: $TPSCHEM_WORKER_THREADS (master's node: $TPSCHEM_MASTER_NODE_WORKER_THREADS)"
 echo "BLAS threads:   $TPSCHEM_BLAS_THREADS"
 echo "Nodes:"
 cat "$TPSCHEM_MACHINE_FILE"
