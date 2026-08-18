@@ -34,6 +34,15 @@ export OPENBLAS_NUM_THREADS=1
 # and every worker-only node gets the full allocation. A single number for all
 # hosts is wrong either way: too low wastes cores on the worker-only nodes, too
 # high oversubscribes the master's node.
+#
+# The conservative default reserves JULIA_NUM_THREADS for the master across the
+# whole run, which leaves the co-located worker short -- and since every apply
+# ends at a barrier, the slowest worker paces the job. In practice the master is
+# busy only during setup (cluster bases, reference solve) while the workers idle,
+# and idle during the solve while the workers do everything, so the phases barely
+# overlap. If that holds for your input, give the shared node's worker the full
+# count and accept transient oversubscription during setup:
+#     export TPSCHEM_MASTER_NODE_WORKER_THREADS=$SLURM_CPUS_PER_TASK
 export JULIA_NUM_THREADS="${JULIA_NUM_THREADS:-32}"
 export TPSCHEM_WORKER_THREADS="${TPSCHEM_WORKER_THREADS:-$SLURM_CPUS_PER_TASK}"
 _shared=$(( SLURM_CPUS_PER_TASK - JULIA_NUM_THREADS ))
