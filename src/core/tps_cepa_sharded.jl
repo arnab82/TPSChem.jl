@@ -86,7 +86,7 @@ function tps_sharded_cepa_cg_linsolve(b::DistributedTPSCIstate{T,N,1}, op;
                                            sv_nrm2sq(T, IR)])[1]
 
         resid = sqrt(abs(rr_new))
-        if verbose > 1
+        if verbose > 2
             @printf("   TPS-CEPA CG iter %4i residual %12.4e\n", it, resid)
         end
         if resid <= threshold
@@ -226,7 +226,7 @@ function tps_sharded_cepa_minres_linsolve(b::DistributedTPSCIstate{T,N,1}, op;
         H[2] = H[4]
 
         resnorm = abs(rhs[2])
-        if verbose > 1
+        if verbose > 2
             @printf("   TPS-CEPA MINRES iter %4i residual %12.4e\n", it, resnorm)
         end
         if resnorm <= threshold
@@ -241,6 +241,131 @@ function tps_sharded_cepa_minres_linsolve(b::DistributedTPSCIstate{T,N,1}, op;
     return x, (iters=iters, residual=resnorm, converged=converged)
 end
 
+
+# Smallest entry of a sharded scalar field, reduced on the master. Used to test
+# whether the shifted operator is positive definite before trusting CG.
+function _tpsci_sharded_local_min(state_id::Symbol)
+    st = _tpsci_sharded_get_state(state_id)
+    m = Inf
+    for (_, cfgs) in st.data
+        for (_, c) in cfgs
+            m = min(m, Float64(c[1]))
+        end
+    end
+    return m
+end
+
+function sharded_state_min(s::DistributedTPSCIstate)
+    vals = Dict{Int,Float64}()
+    @sync for pid in s.workers
+        @async vals[pid] = Distributed.remotecall_fetch(_tpsci_sharded_local_min,
+                                                        pid, s.id)
+    end
+    return isempty(vals) ? Inf : minimum(values(vals))
+end
+
+"""
+    tps_sharded_cepa_pcg_linsolve(b, op, Hdiag; eshift, tol, maxiter, verbose, x0)
+
+Jacobi-preconditioned conjugate gradient for `(H_QQ - eshift*I) x = b`.
+
+`Hdiag` is the Q-space Hamiltonian diagonal (root independent, so it is built
+once per solve and reused for every root and macro-iteration). The
+preconditioner is `M = diag(H_QQ) - eshift`, applied through the existing
+sharded `precondition_sharded` kernel, which already floors near-zero
+denominators.
+
+CG assumes the shifted operator is positive definite; the caller is expected to
+have checked that with `sharded_state_min` and fallen back to MINRES otherwise.
+"""
+function tps_sharded_cepa_pcg_linsolve(b::DistributedTPSCIstate{T,N,1}, op,
+                                       Hdiag::DistributedTPSCIstate{T,N,1};
+                                       eshift,
+                                       tol=1e-5,
+                                       maxiter=300,
+                                       verbose=0,
+                                       x0=nothing) where {T,N}
+    x = x0 === nothing ? similar_sharded_state(b) : x0
+    r = copy_sharded_state(b)
+    Ap = similar_sharded_state(b)
+
+    # Measure convergence against ||b||, not against the starting residual: a
+    # warm start makes the latter small, which would silently tighten `tol` on
+    # every macro-iteration and cancel the benefit of warm starting.
+    bnorm = sqrt(abs(sharded_fused_ops!([r], [sv_nrm2sq(T, 1)])[1]))
+    threshold = tol * max(bnorm, one(T))
+
+    # Warm start: solve for the correction, r = b - A*x0.
+    if x0 !== nothing
+        Ax = _tps_sharded_apply_into!(op, x, eshift, Ap)
+        sharded_fused_ops!([r, Ax], [sv_axpy(T, 1, -one(T), 2)])
+        Ap = Ax
+    end
+
+    # z = r / (diag - eshift). precondition_sharded returns r/(eshift - diag),
+    # so the fused batch below flips the sign as it stages the vectors.
+    z = precondition_sharded(r, Hdiag, eshift)
+    p = copy_sharded_state(z)
+    vecs = [x, r, p, Ap, z]
+    IX, IR, IP, IAP, IZ = 1, 2, 3, 4, 5
+    sharded_fused_ops!(vecs, [sv_scale(T, IZ, -one(T)),
+                              sv_scale(T, IP, -one(T))])
+
+    rr = sharded_fused_ops!(vecs, [sv_nrm2sq(T, IR)])[1]
+    resid = sqrt(abs(rr))
+    rz = sharded_fused_ops!(vecs, [sv_dot(T, IR, IZ)])[1]
+    converged = resid <= threshold
+    pAp0 = zero(T)
+    iters = 0
+
+    for it in 1:maxiter
+        converged && break
+        iters = it
+        vecs[IAP] = _tps_sharded_apply_into!(op, vecs[IP], eshift, vecs[IAP])
+        pAp = sharded_fused_ops!(vecs, [sv_dot(T, IP, IAP)])[1]
+
+        # A genuinely indefinite operator gives pAp <= 0 and CG cannot proceed.
+        pAp > zero(T) ||
+            error("TPS-CEPA sharded PCG: shifted operator is not positive " *
+                  "definite (pAp = $pAp). Use solver=:minres for this root.")
+        it == 1 && (pAp0 = pAp)
+        # Near the solution p -> 0, so pAp underflows on its own. That is
+        # convergence stalling at the floating-point floor, not a breakdown:
+        # test it relative to the first iteration rather than against eps.
+        if pAp <= eps(T) * pAp0
+            verbose > 1 && @printf("   TPS-CEPA PCG stalled at fp precision (iter %i)\n", it)
+            break
+        end
+
+        alpha = rz / pAp
+        rr = sharded_fused_ops!(vecs, [sv_axpy(T, IX, alpha, IP),
+                                       sv_axpy(T, IR, -alpha, IAP),
+                                       sv_nrm2sq(T, IR)])[1]
+        resid = sqrt(abs(rr))
+        if verbose > 2
+            @printf("   TPS-CEPA PCG iter %4i residual %12.4e\n", it, resid)
+        end
+        if resid <= threshold
+            converged = true
+            break
+        end
+
+        vecs[IZ] = precondition_sharded(vecs[IR], Hdiag, eshift; id=vecs[IZ].id)
+        rz_new = sharded_fused_ops!(vecs, [sv_scale(T, IZ, -one(T)),
+                                           sv_dot(T, IR, IZ)])[1]
+        beta = rz_new / rz
+        # p .= z + beta*p
+        sharded_fused_ops!(vecs, [sv_axpby(T, IP, beta, one(T), IZ)])
+        rz = rz_new
+    end
+
+    destroy!(vecs[IR])
+    destroy!(vecs[IP])
+    destroy!(vecs[IAP])
+    destroy!(vecs[IZ])
+    return vecs[IX], (iters=iters, residual=resid, converged=converged)
+end
+
 # Build the reusable Q-space Hamiltonian operator (once) for a CEPA solve.
 function _tps_sharded_cepa_build_hq_op(cepa_vector::DistributedTPSCIstate,
                                        cluster_ops, clustered_ham;
@@ -248,15 +373,23 @@ function _tps_sharded_cepa_build_hq_op(cepa_vector::DistributedTPSCIstate,
                                        threaded_worker, blas_threads, verbose)
     tier = h_storage
     if tier == :auto
-        tier, _, _ = _sharded_H_auto_tier(cepa_vector, clustered_ham, workers,
-                                          max_mem_H; verbose=max(verbose, 1),
-                                          label="TPS-CEPA H_Q")
+        tier, rep, _ = _sharded_H_auto_tier(cepa_vector, clustered_ham, workers,
+                                            max_mem_H; verbose=verbose,
+                                            label="TPS-CEPA H_Q")
+        # verbose=0 silences the feasibility table, but a downgrade to matrix-free
+        # changes the cost of the run by orders of magnitude, so it is always
+        # announced. Silence should hide detail, never a decision like this one.
+        if tier == :matrixfree && verbose <= 0
+            @printf(" TPS-CEPA H_Q does not fit (%.2f GB aggregate); falling back to :matrixfree\n",
+                    rep.gb)
+            flush(stdout)
+        end
     elseif tier == :blocks
         # Explicit :blocks still gets a feasibility check — silently OOM-killing a
         # multi-node job hours in is far worse than refusing up front.
         rep = sharded_H_memory_report(cepa_vector, clustered_ham)
         fit = sharded_H_fit_report(rep, workers)
-        print_sharded_H_fit(rep, fit; label="TPS-CEPA H_Q")
+        verbose > 0 && print_sharded_H_fit(rep, fit; label="TPS-CEPA H_Q")
         fit.fits ||
             error("h_storage=:blocks needs $(round(rep.max_worker_gb; digits=2)) GB on " *
                   "worker $(rep.max_worker_pid), but worker $(fit.worst_pid) is short by " *
@@ -297,6 +430,7 @@ function tps_sharded_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
                                 nbody=4,
                                 thresh_sigma=1e-8,
                                 solver=:minres,
+                                linsolve_tol=nothing,
                                 warm_start=true,
                                 h_storage::Symbol=:auto,
                                 max_mem_H=50.0,
@@ -309,9 +443,11 @@ function tps_sharded_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
         error("tps_sharded_cepa_solve requires the CEPA vector on the requested workers")
     n_clusters = length(ref_vector.clusters)
 
-    @printf(" TPS-CEPA (stored-H) solver: dim_q=%i, R=%i, shift=%s\n",
-            length(cepa_vector), R, cepa_shift)
-    flush(stdout)
+    if verbose > 0
+        @printf(" TPS-CEPA (stored-H) solver: dim_q=%i, R=%i, shift=%s\n",
+                length(cepa_vector), R, cepa_shift)
+        flush(stdout)
+    end
 
     # Build the Q-space Hamiltonian operator ONCE and reuse it everywhere below.
     hq_op, is_block = _tps_sharded_cepa_build_hq_op(cepa_vector, cluster_ops,
@@ -323,10 +459,28 @@ function tps_sharded_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
                                                     blas_threads=blas_threads,
                                                     verbose=verbose)
 
+    # The Q-space diagonal is root independent, so build it once here and reuse
+    # it for every root and macro-iteration. Only the shift changes.
+    Hdiag = nothing
+    use_pcg = solver === :pcg
+    if use_pcg
+        if is_block
+            Hdiag = compute_diagonal_sharded(hq_op, cepa_vector)
+        else
+            @printf(" solver=:pcg needs a stored H for the diagonal; using :minres\n")
+            use_pcg = false
+        end
+    end
+
+    # Inner Krylov tolerance defaults to the outer one, but is worth loosening:
+    # solving to 1e-8 while the shift is still moving between macro-iterations is
+    # wasted work.
+    ltol = linsolve_tol === nothing ? tol : linsolve_tol
+
     Ec = zeros(T, R)
     try
         for i in 1:R
-            @printf(" Compute sharded coupling vector h for root %i\n", i)
+            verbose > 1 && @printf(" Compute sharded coupling vector h for root %i\n", i)
             ref_i = extract_chosen_root(ref_vector, i)
             dref_i = distribute_tpsci_state(ref_i; workers=worker_ids,
                                             strategy=:balanced,
@@ -339,7 +493,8 @@ function tps_sharded_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
                                         prescreen=false,
                                         workers=worker_ids,
                                         threaded_worker=threaded_worker,
-                                        blas_threads=blas_threads)
+                                        blas_threads=blas_threads,
+                                        verbose=(verbose > 1 ? 1 : 0))
             h_i = restrict_to_basis_sharded(sig_i, cepa_vector)
             destroy!(sig_i)
             destroy!(dref_i)
@@ -368,19 +523,36 @@ function tps_sharded_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
                     error("Unknown cepa_shift: $cepa_shift")
                 end
 
-                @printf(" CEPA Iter %3i  Root %i  Shift = %12.8f\n", it, i, shift)
-                if solver == :minres
+                verbose > 1 && @printf(" CEPA Iter %3i  Root %i  Shift = %12.8f\n", it, i, shift)
+                eshift_i = e0[i] + shift
+                # CG only converges for a positive-definite shifted operator. The
+                # cheapest sufficient check is the diagonal: if any Q-space state
+                # sits below the shift, fall back to MINRES for this solve.
+                pcg_ok = use_pcg
+                if pcg_ok
+                    dmin = sharded_state_min(Hdiag) - Float64(eshift_i)
+                    if dmin <= 0
+                        verbose > 0 && @printf("   shifted diagonal is not positive (min %.3e); using MINRES\n", dmin)
+                        pcg_ok = false
+                    end
+                end
+                if pcg_ok
+                    Cd_new, history = tps_sharded_cepa_pcg_linsolve(
+                        rhs, hq_op, Hdiag;
+                        eshift=eshift_i, tol=ltol, maxiter=cg_maxiter,
+                        verbose=verbose, x0=warm_start ? Cd_i : nothing)
+                elseif solver == :minres || solver == :pcg
                     # Successive macro-iterations move the shift by only a small
                     # amount, so the previous amplitudes are an excellent guess
                     # and later solves converge in a few Krylov steps.
                     Cd_new, history = tps_sharded_cepa_minres_linsolve(
                         rhs, hq_op;
-                        eshift=e0[i] + shift, tol=tol, maxiter=cg_maxiter,
+                        eshift=eshift_i, tol=ltol, maxiter=cg_maxiter,
                         verbose=verbose, x0=warm_start ? Cd_i : nothing)
                 elseif solver == :cg || solver == :krylov
                     Cd_new, history = tps_sharded_cepa_cg_linsolve(
                         rhs, hq_op;
-                        eshift=e0[i] + shift, tol=tol, maxiter=cg_maxiter,
+                        eshift=eshift_i, tol=ltol, maxiter=cg_maxiter,
                         verbose=verbose)
                 else
                     error("Unknown TPS-CEPA solver: $solver")
@@ -407,6 +579,7 @@ function tps_sharded_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
             destroy!(h_i)
         end
     finally
+        Hdiag === nothing || destroy!(Hdiag)
         is_block && destroy!(hq_op)
     end
     return Ec, e0 .+ Ec
@@ -414,6 +587,12 @@ end
 
 """
     do_tps_sharded_cepa(ref, cluster_ops, clustered_ham; h_storage=:auto, ...)
+
+Verbosity: `verbose=0` is silent apart from warnings that change behaviour
+(a storage-tier fallback, a solver fallback); `1` (default) prints the run
+banner, the H-storage feasibility decision, space dimensions, one line per
+macro-iteration and the final energies; `2` adds per-root and per-shift detail
+plus timings; `3` adds every Krylov iteration's residual.
 
 Build the TPS-CEPA FOIS/Q-space as a sharded `DistributedTPSCIstate`, then solve
 CEPA with the Q-space Hamiltonian built once and reused (`h_storage=:blocks`, or
@@ -431,6 +610,7 @@ function do_tps_sharded_cepa(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
                              compress=false,
                              reference_solver=:sharded_davidson,
                              solver=:minres,
+                             linsolve_tol=nothing,
                              warm_start=true,
                              h_storage::Symbol=:auto,
                              max_mem_H=50.0,
@@ -445,30 +625,32 @@ function do_tps_sharded_cepa(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
                              blas_threads=1,
                              verbose=1) where {T,N,R}
     worker_ids = ensure_tpsci_multinode_workers!(workers=workers)
-    @printf("\n-------------------------------------------------------\n")
-    @printf(" Do TPS-CEPA (stored-H, across nodes)\n")
-    @printf("   thresh_foi              = %-8.1e\n", thresh_foi)
-    @printf("   nbody                   = %-i\n", nbody)
-    @printf("   Length of Reference     = %-i\n", length(ref))
-    @printf("   Calculation type        = %s\n", cepa_shift)
-    @printf("   H storage               = %s\n", h_storage)
-    @printf("   Workers                 = %s\n", worker_ids)
-    @printf("\n-------------------------------------------------------\n")
-    flush(stdout)
+    if verbose > 0
+        @printf("\n-------------------------------------------------------\n")
+        @printf(" Do TPS-CEPA (stored-H, across nodes)\n")
+        @printf("   thresh_foi              = %-8.1e\n", thresh_foi)
+        @printf("   nbody                   = %-i\n", nbody)
+        @printf("   Length of Reference     = %-i\n", length(ref))
+        @printf("   Calculation type        = %s\n", cepa_shift)
+        @printf("   H storage               = %s\n", h_storage)
+        @printf("   Workers                 = %s\n", worker_ids)
+        @printf("\n-------------------------------------------------------\n")
+        flush(stdout)
+    end
 
     ref_vec = deepcopy(ref)
     if e0 === nothing
-        @printf(" Solve zeroth-order problem. Dimension = %10i\n", length(ref_vec))
+        verbose > 0 && @printf(" Solve zeroth-order problem. Dimension = %10i\n", length(ref_vec))
         if reference_solver == :direct
             cluster_ops isa DistributedClusterOps &&
                 error("reference_solver=:direct needs a local Vector{ClusterOps}; use :sharded_davidson with DistributedClusterOps, or pass e0")
-            @time e0, ref_vec = tps_ci_direct(ref_vec, cluster_ops, clustered_ham,
+            e0, ref_vec = tps_ci_direct(ref_vec, cluster_ops, clustered_ham,
                                               conv_thresh=tol)
         elseif reference_solver == :distributed_davidson
             cluster_ops isa DistributedClusterOps &&
                 error("reference_solver=:distributed_davidson needs a local Vector{ClusterOps}; use :sharded_davidson, or pass e0")
             orthonormalize!(ref_vec)
-            @time e0, ref_vec = tps_ci_davidson_distributed(
+            e0, ref_vec = tps_ci_davidson_distributed(
                 ref_vec, cluster_ops, clustered_ham;
                 conv_thresh=tol, max_iter=ci_max_iter, max_ss_vecs=ci_max_ss_vecs,
                 lindep_thresh=ci_lindep_thresh, workers=worker_ids,
@@ -494,43 +676,55 @@ function do_tps_sharded_cepa(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
         e0 = Vector{T}(e0)
     end
 
-    println()
-    println(" Compute sharded FOIS. Reference space dim = ", length(ref_vec))
+    if verbose > 0
+        println()
+        println(" Compute sharded FOIS. Reference space dim = ", length(ref_vec))
+    end
     dref = distribute_tpsci_state(ref_vec; workers=worker_ids,
                                   strategy=:balanced, blas_threads=blas_threads)
     pt1_vec = open_matvec_sharded(dref, cluster_ops, clustered_ham;
                                   nbody=nbody, thresh=thresh_foi, prescreen=false,
                                   workers=worker_ids, threaded_worker=threaded_worker,
-                                  blas_threads=blas_threads)
+                                  blas_threads=blas_threads,
+                                  verbose=(verbose > 0 ? 1 : 0))
     project_out!(pt1_vec, dref)
 
     if compress
         dim1 = length(pt1_vec)
         clip!(pt1_vec, thresh=thresh_clip)
         dim2 = length(pt1_vec)
-        @printf(" %-50s%10i -> %-10i (thresh = %8.1e)\n",
+        verbose > 0 && @printf(" %-50s%10i -> %-10i (thresh = %8.1e)\n",
                 "FOIS Compressed from: ", dim1, dim2, thresh_clip)
     end
 
     S10 = overlap(pt1_vec, dref)
-    for i in 1:R
-        @printf(" %-50s%10.6f\n", "Overlap between <1|0>: ", S10[i, i])
+    if verbose > 0
+        for i in 1:R
+            @printf(" %-50s%10.6f\n", "Overlap between <1|0>: ", S10[i, i])
+        end
     end
     destroy!(dref)
 
-    println()
-    println(" Do TPS-CEPA (stored-H): shared FOIS dim = ", length(pt1_vec))
-    @time Ec, e_cepa = tps_sharded_cepa_solve(
+    if verbose > 0
+        println()
+        println(" Do TPS-CEPA (stored-H): shared FOIS dim = ", length(pt1_vec))
+    end
+    _t_cepa = time()
+    Ec, e_cepa = tps_sharded_cepa_solve(
         ref_vec, e0, pt1_vec, cluster_ops, clustered_ham, cepa_shift, cepa_mit;
         tol=tol, cg_maxiter=cg_maxiter, nbody=nbody, thresh_sigma=thresh_sigma,
-        solver=solver, warm_start=warm_start, h_storage=h_storage,
+        solver=solver, linsolve_tol=linsolve_tol,
+        warm_start=warm_start, h_storage=h_storage,
         max_mem_H=max_mem_H,
         workers=worker_ids, threaded_worker=threaded_worker,
         blas_threads=blas_threads, verbose=verbose)
+    verbose > 1 && @printf(" TPS-CEPA solve: %.2f s\n", time() - _t_cepa)
 
-    for i in 1:R
-        @printf(" E(cepa) root %i  corr= %12.8f  total= %12.8f\n",
-                i, Ec[i], e_cepa[i])
+    if verbose > 0
+        for i in 1:R
+            @printf(" E(cepa) root %i  corr= %12.8f  total= %12.8f\n",
+                    i, Ec[i], e_cepa[i])
+        end
     end
 
     return e_cepa, pt1_vec

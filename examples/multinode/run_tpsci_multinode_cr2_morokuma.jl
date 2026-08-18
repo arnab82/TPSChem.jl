@@ -51,7 +51,11 @@ function init_multinode_workers!()
         hosts = filter(!isempty, strip.(readlines(ENV["TPSCHEM_MACHINE_FILE"])))
         isempty(hosts) && error("TPSCHEM_MACHINE_FILE is empty")
         env_bool("TPSCHEM_SKIP_MASTER_NODE", false) && length(hosts) > 1 && (hosts = hosts[2:end])
-        threads = get(ENV, "JULIA_NUM_THREADS", string(Threads.nthreads()))
+        # The launcher scripts export TPSCHEM_WORKER_THREADS for the workers and
+        # JULIA_NUM_THREADS for the master. Reading only the latter silently gives
+        # every worker the master's (usually smaller) thread count.
+        threads = get(ENV, "TPSCHEM_WORKER_THREADS",
+                      get(ENV, "JULIA_NUM_THREADS", string(Threads.nthreads())))
         addprocs(hosts; exeflags="--project=$project --threads=$threads", env=worker_env())
     end
     @sync for pid in workers()

@@ -102,7 +102,9 @@ far fewer contractions (~4x faster already on a tiny 79-config Q-space).
 export TPSCHEM_INPUT_JLD2=/path/to/problem_with_ref_vec.jld2
 export TPSCHEM_THRESH_FOI=1e-6
 export TPSCHEM_H_STORAGE=auto     # auto | blocks | matrixfree
-export TPSCHEM_MAX_MEM_H=200      # GB budget for the stored block-sparse H_Q
+export TPSCHEM_MAX_MEM_H=200      # aggregate GB budget for the stored H_Q
+export TPSCHEM_SOLVER=pcg         # pcg (preconditioned CG) | minres | cg
+export TPSCHEM_LINSOLVE_TOL=1e-6  # inner Krylov tol; TPSCHEM_CEPA_TOL drives the macro loop
 sbatch examples/multinode/run_cepa_sharded_minres_4nodes.slurm \
     # ...or run tps_cepa_stored_h_driver.jl directly with the same env vars
 ```
@@ -113,10 +115,12 @@ and `tps_sharded_cepa_solve(...)`. The matrix-free `do_fois_cepa_sharded` /
 wrappers that call the same code path with `h_storage=:matrixfree`, so there is a
 single implementation for both the matrix-free and stored-block Hamiltonians.
 
-Where the time goes, and what the solver does about it: a sharded Q space is
-typically hundreds of small Fock sectors spread over the workers, so the cost is
-dominated by *how many* distributed round trips each step needs rather than by
-arithmetic. Four things keep that count down.
+Where the time goes, and what the solver does about it. Distributed round trips
+*were* the bottleneck — before the batching below they were roughly 91% of an
+apply. They are now about 3%: a measured apply (dim_Q 32865, 2 workers) spends
+2.5 ms gathering kets and 78 ms in the block GEMV, streaming stored H at
+~11 GB/s. So the apply is now **memory-bandwidth bound**, and stored-H size sets
+both the memory ceiling and the time per iteration. Six things matter.
 
 - **Batched ket exchange.** The connected ket sectors a worker needs are a
   property of the stored H, so they are recorded at build time and fetched with
@@ -132,6 +136,16 @@ arithmetic. Four things keep that count down.
   amplitudes (`warm_start=true`, the default) and later solves take a few Krylov
   steps. Convergence is measured against `‖b‖`, so the tolerance means the same
   thing warm or cold.
+- **Threaded apply.** The per-apply GEMV is threaded across the bra sectors a
+  worker owns (`threaded_worker=true`), which matters most on fat nodes: a
+  single thread streaming tens of GB of stored H is the common way to leave a
+  96-core node idle.
+- **Preconditioned CG.** `solver=:pcg` runs Jacobi-preconditioned CG using the
+  Q-space diagonal (built once, reused across every root and macro-iteration).
+  It needs roughly a third of the applies of plain MINRES, and falls back to
+  MINRES by itself on any root whose shifted operator is not positive definite.
+  `linsolve_tol` sets the inner Krylov tolerance separately from `tol`, which
+  keeps governing macro-iteration convergence.
 
 The stored-H build itself buckets the Hamiltonian terms by which clusters they
 act on, keyed by Fock transfer, so a matrix element only visits the handful of

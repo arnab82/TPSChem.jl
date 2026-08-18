@@ -47,7 +47,11 @@ function init_multinode_workers!()
         if env_bool("TPSCHEM_SKIP_MASTER_NODE", false) && length(hosts) > 1
             hosts = hosts[2:end]
         end
-        threads = get(ENV, "JULIA_NUM_THREADS", string(Threads.nthreads()))
+        # The launcher scripts export TPSCHEM_WORKER_THREADS for the workers and
+        # JULIA_NUM_THREADS for the master. Reading only the latter silently gives
+        # every worker the master's (usually smaller) thread count.
+        threads = get(ENV, "TPSCHEM_WORKER_THREADS",
+                      get(ENV, "JULIA_NUM_THREADS", string(Threads.nthreads())))
         worker_env = Pair{String,String}[]
         for name in ("JULIA_DEPOT_PATH", "PATH", "OPENBLAS_NUM_THREADS",
                      "OMP_NUM_THREADS", "MKL_NUM_THREADS")

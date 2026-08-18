@@ -374,7 +374,11 @@ Then `E_corr = ⟨x|h⟩` (one reduction), update the shift, repeat until
 `|ΔE_corr| < tol`. Each macro-iteration warm starts from the previous
 amplitudes (`warm_start=true`), which for `acpf`/`aqcc`/`cisd` cuts the later
 solves to a few Krylov steps; convergence is measured against `‖b‖` so the
-tolerance means the same thing warm or cold. The matrix-free names
+tolerance means the same thing warm or cold. `solver=:pcg` swaps MINRES for
+Jacobi-preconditioned CG, using the Q-space diagonal pulled straight off the
+stored H (`compute_diagonal_sharded`) — root independent, so it is built once
+and reused; it cuts the applies by roughly 3x and falls back to MINRES on any
+root whose shifted operator is not positive definite. The matrix-free names
 (`do_fois_cepa_sharded`, `tpsci_cepa_solve_sharded`) run the same solver with
 the apply replaced by a full re-contraction — same answers (tested to 1e-7),
 many times the work.
