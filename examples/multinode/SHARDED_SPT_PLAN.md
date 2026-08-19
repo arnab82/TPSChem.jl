@@ -230,27 +230,50 @@ At h12 this is invisible (2.4 MB/worker). At the sizes this design exists for it
 is fatal: a 100M-determinant FOIS at R=4 is roughly 7 GB of cores plus factors,
 so every worker would pull ~7 GB per matvec *and* need room to hold it.
 
-**The design change: partition by contribution, not by destination sector.**
-Instead of "worker `p` owns bra sector `F` and fetches whatever kets feed it",
-assign each worker a set of *(bra sector, ket sector)* pairs whose ket blocks it
-already holds, compute partial σ contributions locally, and reduce the partials
-into the owning worker at the end. Ket blocks then never move; only partial σ
-blocks do, and those are bounded by the destination sizes actually touched.
-Sketch:
+**Measured 2026-08-19 — "partition by contribution" does NOT help.** The
+obvious alternative (assign each `(bra, ket, terms)` triple to the worker that
+already owns the ket sector, accumulate partial sigma locally, reduce into the
+bra owner) moves **exactly the same volume**, 1.00x at every P tested. The two
+schemes are duals: H's Fock transitions come in +/- pairs, so "kets my bras
+need" and "bras my kets feed" have the same structure. On the h12 FOIS the
+coupling density is 6.8% with mean bra in-degree 142 of 2090 sectors, so any
+1/P slice of sectors already touches essentially every sector. Do not build it.
 
-1. Keep the existing `:hash` ownership for storage.
-2. Build the job list as (bra, ket, terms) triples as now, but assign each
-   triple to the worker that **already owns the ket sector**.
-3. Each worker accumulates partial σ into a local buffer keyed by bra sector.
-4. Reduce: each bra sector's owner sums the partials from the workers that
-   contributed to it (one round trip per (owner, contributor) pair, batched as
-   in §10.1).
+**What the measurement says to build instead** (h12 FOIS, 3.6 MB of cores,
+volume per matvec summed over all workers):
 
-Trade-off: this moves partial σ blocks instead of ket blocks. It wins when the
-σ blocks touched per worker are smaller than the whole ket state, which is the
-case exactly when the Fock-space coupling is sparse — worth measuring the
-coupling density before building it, since a dense coupling graph makes both
-schemes O(P × |state|).
+| P | destination | 2D grid | ring | peak/worker, destination | peak/worker, ring |
+| --- | --- | --- | --- | --- | --- |
+| 4 | 5.4 MB | 7.2 MB | 7.2 MB | 1.4 MB | 0.5 MB |
+| 9 | 14.4 MB | **10.8 MB** | 16.2 MB | 1.6 MB | 0.2 MB |
+| 16 | 27.0 MB | **14.4 MB** | 28.8 MB | 1.7 MB | 0.1 MB |
+| 25 | 43.2 MB | **18.0 MB** | 45.1 MB | 1.7 MB | **0.1 MB** |
+
+Two independent problems, two different fixes:
+
+- **Volume — use a 2D (grid) partition.** Put the P workers on a q x q grid
+  (P = q^2). Worker (i,j) handles contributions whose bra is in row-group i and
+  whose ket is in column-group j: it pulls only column j's kets and pushes
+  partial sigma only for row i's bras, both O(|state|/q) = O(|state|/sqrt(P)).
+  Total traffic drops from O(P |state|) to O(sqrt(P) |state|) — confirmed above,
+  the grid column grows exactly as q (1.5x, 1.33x, 1.25x). It wins from P >= 9
+  and the margin widens; at P = 25 it is 2.4x less traffic.
+  Per-worker transient memory also falls to O(|state|/sqrt(P)).
+- **Memory — rotate the ket shards (ring / systolic).** Each worker holds one
+  ket shard at a time and passes it on, so peak per-worker memory is
+  O(|state|/P) — the `peak/worker, ring` column, 17x below destination
+  partitioning at P = 25 and improving with P. Total volume is unchanged from
+  destination partitioning, so this buys memory, not bandwidth.
+
+Note the `peak/worker, destination` column is flat at ~1.7 MB (about half the
+state) no matter how many workers are added: that is the O(|state|)-regardless-of-P
+behaviour, made concrete.
+
+For a 100M-determinant FOIS at R=4 (~7 GB) with 25 workers: destination
+partitioning pulls ~3.5 GB per worker and must hold it; the 2D grid pulls and
+holds ~1.4 GB; a ring holds ~0.28 GB at a time. The 2D grid is the recommended
+target since it fixes both axes at once, with the ring as the fallback if
+memory rather than bandwidth is binding.
 
 Related open items: the remaining 51% overhead is serialization and load
 imbalance (`:hash` balances sector *count*, not work), and the gated driver test
