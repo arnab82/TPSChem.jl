@@ -864,6 +864,219 @@ function _spt_build_sigma_into(bra::DistributedSPTstate{T,N,R},
                                               T, Val(R), Val(N))
 end
 
+# ---------------------------------------------------------------------------
+# 2D (grid) partitioned matvec.
+#
+# The default sharded matvec partitions by *destination* Fock sector, so every
+# worker needs essentially the whole ket state: traffic is O(P |state|) and each
+# worker's transient memory stays O(|state|) however many workers are added.
+# Measured on the h12 FOIS the Fock coupling is 6.8% dense with mean bra
+# in-degree 142 of 2090 sectors, i.e. any 1/P slice already touches nearly
+# everything, so re-partitioning by contribution moves exactly the same volume
+# (it is the dual of the same cut).
+#
+# A 2D partition does change the asymptotics.  Put the workers on a qr x qc grid
+# and give every Fock sector a row group and a column group.  Worker (i,j)
+# handles contributions whose bra is in row group i and whose ket is in column
+# group j, so it touches only column j's kets and only row i's bras -- both
+# O(|state|/q).  Traffic becomes O(sqrt(P) |state|) and per-worker memory
+# O(|state|/sqrt(P)).  Measured totals per matvec on h12 (destination vs grid):
+# P=9 14.4 vs 10.8 MB, P=16 27.0 vs 14.4 MB, P=25 43.2 vs 18.0 MB.
+#
+# Each bra sector is then summed from the qc partials in its row and reduced
+# onto its owner, so the result is an ordinary DistributedSPTstate with the same
+# ownership as `bra` and is a drop-in for build_sigma_sharded's output.
+# ---------------------------------------------------------------------------
+
+"""
+    _spt_grid_shape(P) -> (qr, qc)
+
+Factor `P` workers into the most square grid possible.  A prime `P` gives
+`qr == 1`, which degenerates to the destination partition (every worker holds
+every bra row); callers fall back in that case.
+"""
+function _spt_grid_shape(P::Int)
+    qr = isqrt(P)
+    while qr > 1 && P % qr != 0
+        qr -= 1
+    end
+    return qr, P ÷ qr
+end
+
+# Deterministic group assignment: every worker must agree without communicating.
+_spt_grid_group(fock, ngroups::Int) = Int(mod(hash(fock), UInt(ngroups))) + 1
+
+# Fetch a set of Fock blocks, one round trip per owning worker (see
+# _spt_sharded_local_copy_fock_blocks).
+function _spt_gather_blocks!(dest, state::DistributedSPTstate{T,N,R}, focks) where {T,N,R}
+    myid = Distributed.myid()
+    local_state = _spt_sharded_get_state(state.id)
+    by_owner = Dict{Int,Vector{FockConfig{N}}}()
+    for f in focks
+        owner = state.owners[f]
+        if owner == myid
+            dest[f] = _spt_copy_fock_block(local_state.data[f])
+        else
+            push!(get!(() -> FockConfig{N}[], by_owner, owner), f)
+        end
+    end
+    @sync for (owner, fs) in by_owner
+        @async begin
+            blocks = Distributed.remotecall_fetch(_spt_sharded_local_copy_fock_blocks,
+                                                  owner, state.id, fs)
+            for (i, f) in enumerate(fs)
+                blocks[i] === nothing || (dest[f] = blocks[i])
+            end
+        end
+    end
+    return dest
+end
+
+# Phase A: partial sigma for every bra in row group `row`, from the kets in
+# column group `col`.  Stored locally under `part_id`; nothing is reduced yet.
+function _spt_sigma_2d_partial!(part_id::Symbol, bra::DistributedSPTstate{T,N,R},
+                                ket::DistributedSPTstate{T,N,R}, row::Int, col::Int,
+                                qr::Int, qc::Int, nbody, blas_threads,
+                                cache::Bool) where {T,N,R}
+    blas_threads === nothing || BLAS.set_num_threads(blas_threads)
+    cluster_ops = _TPSCI_MULTINODE_CLUSTER_OPS[]
+    clustered_ham = _TPSCI_MULTINODE_CLUSTERED_HAM[]
+    cluster_ops === nothing && error("SPT sharded cluster-ops cache is empty")
+    clustered_ham === nothing && error("SPT sharded Hamiltonian cache is empty")
+    if cluster_ops isa DistributedClusterOps
+        cluster_ops = _materialize_cluster_ops_for_indices(
+            cluster_ops, [c.idx for c in bra.clusters])
+    end
+
+    my_bras = [f for f in keys(bra.owners) if _spt_grid_group(f, qr) == row]
+    my_kets = [f for f in keys(ket.owners) if _spt_grid_group(f, qc) == col]
+
+    # only the kets in my column that actually feed a bra in my row
+    needed = FockConfig{N}[]
+    for fk in my_kets
+        any(fb -> haskey(clustered_ham, fb - fk), my_bras) && push!(needed, fk)
+    end
+    isempty(needed) && (_spt_sharded_store_state!(part_id,
+        _spt_empty_local_state(T, Val(R), bra.clusters, bra.p_spaces, bra.q_spaces, Val(N)));
+        return _spt_sharded_local_fock_lengths(part_id))
+
+    ketl = _spt_empty_local_state(T, Val(R), ket.clusters, ket.p_spaces, ket.q_spaces, Val(N))
+    _spt_gather_blocks!(ketl.data, ket, needed)
+
+    # the destination basis: bras in my row that some needed ket reaches
+    live = FockConfig{N}[]
+    for fb in my_bras
+        any(fk -> haskey(clustered_ham, fb - fk), keys(ketl.data)) && push!(live, fb)
+    end
+    sig = _spt_empty_local_state(T, Val(R), bra.clusters, bra.p_spaces, bra.q_spaces, Val(N))
+    _spt_gather_blocks!(sig.data, bra, live)
+    zero!(sig)
+
+    if cache
+        hid = objectid(clustered_ham)
+        if !(hid in _SPT_SHARDED_PRECACHED)
+            cache_hamiltonian(sig, ketl, cluster_ops, clustered_ham; nbody=nbody)
+            push!(_SPT_SHARDED_PRECACHED, hid)
+        end
+    end
+    build_sigma!(sig, ketl, cluster_ops, clustered_ham; nbody=nbody, cache=cache,
+                 verbose=0)
+    _spt_sharded_store_state!(part_id, sig)
+    return _spt_sharded_local_fock_lengths(part_id)
+end
+
+# Phase B: an owner sums the partials for its own Fock sectors, one round trip
+# per contributing worker.
+function _spt_sigma_2d_reduce!(out_id::Symbol, part_id::Symbol,
+                               bra::DistributedSPTstate{T,N,R}, owned,
+                               contributors) where {T,N,R}
+    sig = _spt_empty_local_state(T, Val(R), bra.clusters, bra.p_spaces, bra.q_spaces, Val(N))
+    local_bra = _spt_sharded_get_state(bra.id)
+    for f in owned
+        sig.data[f] = _spt_copy_fock_block(local_bra.data[f])
+    end
+    zero!(sig)
+
+    myid = Distributed.myid()
+    parts = Dict{Int,Any}()
+    @sync for w in contributors
+        @async begin
+            parts[w] = w == myid ?
+                _spt_sharded_local_copy_fock_blocks(part_id, owned) :
+                Distributed.remotecall_fetch(_spt_sharded_local_copy_fock_blocks,
+                                             w, part_id, owned)
+        end
+    end
+    for w in contributors, (i, f) in enumerate(owned)
+        blk = parts[w][i]
+        blk === nothing && continue
+        for (tc, tuck) in blk
+            haskey(sig.data[f], tc) || continue
+            add!(sig.data[f][tc].core, tuck.core)
+        end
+    end
+    _spt_sharded_store_state!(out_id, sig)
+    return _spt_sharded_local_fock_lengths(out_id)
+end
+
+"""
+    build_sigma_sharded_2d(v, cluster_ops, clustered_ham; nbody, workers, ...)
+
+Never-gather SPT matvec on a 2D worker grid.  Same result and same ownership as
+[`build_sigma_sharded`](@ref), but communication scales as `O(sqrt(P)|state|)`
+rather than `O(P|state|)` and each worker's transient memory as
+`O(|state|/sqrt(P))` rather than `O(|state|)`.  Falls back to the destination
+partition when the worker count is prime (the grid would be 1 x P, which is the
+destination partition with extra steps).
+"""
+function build_sigma_sharded_2d(v::DistributedSPTstate{T,N,R}, cluster_ops,
+                                clustered_ham; nbody=4, workers=v.workers,
+                                blas_threads=1, id=nothing,
+                                cache::Bool=true) where {T,N,R}
+    P = length(workers)
+    qr, qc = _spt_grid_shape(P)
+    if qr == 1
+        @warn "build_sigma_sharded_2d: $P workers do not form a useful grid; using the destination partition" maxlog=1
+        return build_sigma_sharded(v, cluster_ops, clustered_ham; nbody=nbody,
+                                   workers=workers, blas_threads=blas_threads,
+                                   id=id, cache=cache)
+    end
+
+    part_id = gensym(:spt_shard_sigma2d_part)
+    out_id  = id === nothing ? gensym(:spt_shard_sigma2d) : Symbol(id)
+    grid = [workers[(i-1)*qc + j] for i in 1:qr, j in 1:qc]
+
+    @sync for i in 1:qr, j in 1:qc
+        @async Distributed.remotecall_fetch(_spt_sigma_2d_partial!, grid[i,j],
+                                            part_id, v, v, i, j, qr, qc, nbody,
+                                            blas_threads, cache)
+    end
+
+    owned = Dict(pid => FockConfig{N}[] for pid in workers)
+    for (fock, owner) in v.owners
+        push!(owned[owner], fock)
+    end
+    length_maps = Dict{Int,Any}()
+    @sync for pid in workers
+        @async begin
+            # only the row that produced partials for these sectors matters, but
+            # a worker can own sectors from several rows, so ask every worker
+            # that holds a partial: one batched round trip each.
+            length_maps[pid] = Distributed.remotecall_fetch(
+                _spt_sigma_2d_reduce!, pid, out_id, part_id, v, owned[pid],
+                collect(vec(grid)))
+        end
+    end
+    @sync for pid in workers
+        @async Distributed.remotecall_fetch(_spt_sharded_delete_state!, pid, part_id)
+    end
+    return _spt_sharded_metadata_from_lengths(out_id, v.clusters, v.p_spaces,
+                                              v.q_spaces, workers, length_maps,
+                                              collect(keys(v.owners)),
+                                              T, Val(R), Val(N))
+end
+
+
 """
     build_sigma_sharded(v, cluster_ops, clustered_ham; nbody, ...) -> DistributedSPTstate
 

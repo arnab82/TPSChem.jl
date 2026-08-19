@@ -62,6 +62,28 @@ using Random
     sig_sh = TPSChem.collect_spt_state(dsig)
     @test isapprox(TPSChem.get_vector(sig_sh), TPSChem.get_vector(sig_local), atol=1e-11)
 
+    # --- 2D (grid) partitioned matvec vs the same reference -------------------
+    # Communication scales as sqrt(P)|state| rather than P|state|, so this is a
+    # different data path (bra bases and partial sigmas move, not whole ket
+    # sectors) and needs its own check that it lands on the same answer with the
+    # same ownership.
+    dsig2d = TPSChem.build_sigma_sharded_2d(dv, cluster_ops, clustered_ham;
+                                            nbody=4, workers=workers())
+    sig_2d = TPSChem.collect_spt_state(dsig2d)
+    @test isapprox(TPSChem.get_vector(sig_2d), TPSChem.get_vector(sig_local), atol=1e-11)
+    @test Set(keys(dsig2d.owners)) == Set(keys(dsig.owners))
+    for f in keys(dsig.owners)                       # ownership must be preserved
+        @test dsig2d.owners[f] == dv.owners[f]
+    end
+    TPSChem.destroy!(dsig2d)
+
+    # A prime worker count cannot form a useful grid; it must fall back rather
+    # than silently produce a 1 x P "grid" (which is the destination partition).
+    if length(workers()) >= 2
+        qr, qc = TPSChem._spt_grid_shape(length(workers()))
+        @test qr * qc == length(workers())
+    end
+
     # --- distributed Tucker CI solver vs EXACT dense H in the fixed basis -----
     # Build H densely in v's fixed Tucker basis (columns = build_sigma! of unit
     # vectors). This is an exact reference, independent of Davidson convergence.

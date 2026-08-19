@@ -275,6 +275,42 @@ holds ~1.4 GB; a ring holds ~0.28 GB at a time. The 2D grid is the recommended
 target since it fixes both axes at once, with the ring as the fallback if
 memory rather than bandwidth is binding.
 
+### 10.3 Implemented: `build_sigma_sharded_2d`
+
+The 2D grid matvec is in `src/core/spt_sharded.jl`, alongside (not replacing)
+`build_sigma_sharded`, and covered by `test/test_spt_sharded.jl`.
+
+Workers form a `qr x qc` grid; every Fock sector gets a row group and a column
+group from a deterministic hash, so no coordination is needed. Worker `(i,j)`
+handles contributions whose bra is in row `i` and whose ket is in column `j`,
+touching only column `j`'s kets and row `i`'s bras. Partials are then reduced
+onto each bra's owner, so the output is an ordinary `DistributedSPTstate` with
+unchanged ownership -- a drop-in for `build_sigma_sharded`. Both phases batch by
+owner (§10.1). A prime worker count falls back to the destination partition,
+since a `1 x P` grid *is* the destination partition with extra steps.
+
+Measured (h12 FOIS, dim 56317, one machine):
+
+| P | single-node | sharded 1D | sharded 2D | 2D vs 1D | 2D vs single-node |
+| --- | --- | --- | --- | --- | --- |
+| 4 | 14.0 s | 13.1 s | 9.4 s | 1.38x | 1.49x |
+| 9 | 13.2 s | 6.7 s | **3.9 s** | **1.71x** | **3.37x** |
+
+The margin widens with P as the sqrt(P) model predicts. Note at P=4 the model
+predicts 2D should be slightly *worse* on volume (7.2 vs 5.4 MB) yet it is
+already faster, so at small P the gain comes from balancing the fetches rather
+than from reduced volume; P>=9 is where the predicted mechanism dominates.
+Agreement with single-node on the full vector: 2.4e-13 absolute, 7.2e-16
+relative.
+
+Caveats: these are processes on one machine, so real interconnect latency will
+change the constants (the volume scaling should hold); and only the *matvec* is
+2D -- the FOIS builder, PT1 and the Davidson solver still partition by
+destination, so an end-to-end run gets the matvec gain only. Extending the grid
+to those is the natural next step. `coupling.jl` (in the optimization notes) will
+re-measure the coupling density for any state, which is what decides whether the
+grid pays off at all.
+
 Related open items: the remaining 51% overhead is serialization and load
 imbalance (`:hash` balances sector *count*, not work), and the gated driver test
 reports "did not converge in 6 iterations" — it passes only because the
