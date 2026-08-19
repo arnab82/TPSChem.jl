@@ -454,10 +454,21 @@ function calc_bound(term::ClusteredTerm1B,
                             coeffs_ket::Tucker{T,N,R};
                             prescreen=1e-4) where {T,N,R}
     c1 = term.clusters[1]
-    
-    bound1 = norm(term.ints)*norm(coeffs_ket.core)
+
+    # `term.ints` is a placeholder for a 1-body term: build_dense_H_term never
+    # reads it (the operator lives entirely in cluster_ops), and for the 1-body
+    # "H" term it is literally zeros(T,1).  Bounding with it therefore gave
+    # bound == 0 and rejected EVERY 1-body term at any positive prescreen,
+    # silently dropping the whole local Hamiltonian.
+    #
+    # Bound on the actual contribution instead.  The projection
+    # U_bra' * op * U_ket has norm <= norm(op) because the Tucker factors have
+    # orthonormal columns, so norm(op) * norm(core) is a genuine upper bound.
+    op1 = cluster_ops[c1.idx][term.ops[1]][(fock_bra[c1.idx], fock_ket[c1.idx])]
+    @views g = op1[bra[c1.idx], ket[c1.idx]]
+    bound1 = norm(g) * norm(coeffs_ket.core)
     if bound1 < prescreen
-        return false 
+        return false
     end
     return true
 end

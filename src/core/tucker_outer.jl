@@ -63,6 +63,34 @@ Solve for ground state in the space spanned by `ci_vector`'s compression vectors
 - `precond`: use preconditioner? Only applied to Davidson and not yet working,
 - `verbose`: print level
 - `solver`: Which solver to use. Options = ["davidson", "krylovkit"]
+- `cache`: build and hold the dense-H cache (default true).  It is the largest
+    resident allocation in a big multi-root solve and it also raises the GC's
+    collection threshold, so peak live heap in a matvec is ~4.1 GB with it
+    against ~0.37 GB without, for about 2x the time.
+- `cache_min_nbody`: only cache terms of at least this body order.  Skipped
+    terms are recomputed (`form_sigma_block!` builds on a miss), so results are
+    unchanged.  Measured on h12, dim 56317: all(1-4) 2.250 GB / 15.7 s,
+    3-4 1.822 GB / 22.3 s, 4-only 0.782 GB / 30.9 s, none 0 GB / 34.7 s.
+    Caching more is always more efficient per GB, so this is a memory-ceiling
+    tool rather than a speed/memory optimum.
+There is deliberately no magnitude-screening option on the matvec.  Screening
+truncates the *operator* rather than the *space*, so unlike `thresh_var` /
+`thresh_foi` / `thresh_pt` -- and unlike the FOIS builder's `prescreen`, which
+decides which blocks enter the space -- it does not preserve the variational
+principle.  Measured on h12, screened roots land BELOW the exact energy by
+9.7e-5 Eh at a 1e-6 threshold and 1.0e-2 Eh at 1e-4.  It also breaks
+Hermiticity, since `calc_bound` depends only on the ket side and so screens
+(bra,ket) and (ket,bra) differently: |<b|Hs|a> - <a|Hs|b>| grows from 3.6e-12
+(roundoff) to 3.5e-7 at 1e-6 and 1.2e-4 at 1e-4, while `ci_solve` declares the
+operator symmetric to Davidson.
+
+It does not pay for itself either.  At a threshold accurate enough to be
+harmless (1e-8, max|dE| 2.3e-10) the matvec speedup is 1.02x, because
+evaluating the bound costs about what the skipped contribution would.  The
+error is driven by the *number* of drops rather than their size -- at 1e-6
+about 807,000 of 2.0M contributions go, each individually below 1e-6 but
+accumulating -- so any threshold loose enough to save real work is loose
+enough to matter.
 """
 function ci_solve(ci_vector_in::SPTstate{T,N,R}, cluster_ops, clustered_ham; 
                          conv_thresh    = 1e-5,

@@ -153,10 +153,20 @@ end
     display("ept")
     display(ept)
     ept = TPSChem.compute_pt2_energy(v_var, cluster_ops, clustered_ham, thresh_foi=1e-6, prescreen=true, compress_twice=true)
-    
-    e_ref = [ -14.05028332737144
-              -14.021647707434596
-              -14.006025343356061]
+
+    # These moved when calc_bound was fixed for 1-body terms.  It had bounded
+    # them with norm(term.ints), but `ints` is a placeholder there (the operator
+    # lives in cluster_ops, and for the 1-body "H" term it is zeros(1)), so the
+    # bound was identically zero and EVERY 1-body contribution was screened out
+    # at any positive threshold.  The old values encoded that.
+    #
+    # The check that matters is against the unscreened result directly above:
+    # prescreen=true now differs from prescreen=false by 2.6e-12 / 8.3e-12 /
+    # 5.7e-12, where it used to differ by 6.2e-7 / 2.2e-7 / 4.8e-6.  At
+    # thresh_foi=1e-6 screening should be nearly exact, and now it is.
+    e_ref = [ -14.050283945926
+              -14.021647926243
+              -14.006030118453]
     
     @test all(isapprox(e_ref, ept, atol=1e-8)) 
     # v, ept = TPSChem.compute_pt1_wavefunction(v_var, cluster_ops, clustered_ham, thresh=1e-6)
