@@ -726,6 +726,21 @@ function _spt_sharded_local_copy_fock_block(id::Symbol, fock)
     return _spt_copy_fock_block(state.data[fock])
 end
 
+"""
+    _spt_sharded_local_copy_fock_blocks(id, focks)
+
+Copy several Fock blocks in one call.  The matvec needs most of the ket state on
+every worker, and fetching a sector at a time costs one round trip each -- with a
+few thousand sectors that is thousands of `remotecall_fetch`es per matvec, which
+made the sharded matvec latency-bound (and slower than running on one node).
+Grouping by owner turns it into one round trip per remote worker.
+"""
+function _spt_sharded_local_copy_fock_blocks(id::Symbol, focks)
+    state = _spt_sharded_get_state(id)
+    return Any[haskey(state.data, f) ? _spt_copy_fock_block(state.data[f]) : nothing
+               for f in focks]
+end
+
 function _spt_sharded_get_ket_block(v::DistributedSPTstate{T,N,R}, fock, ket_cache) where {T,N,R}
     haskey(ket_cache, fock) && return ket_cache[fock]
     owner = v.owners[fock]
@@ -787,13 +802,20 @@ function _spt_build_sigma_into_chunk!(out_id::Symbol, bra::DistributedSPTstate{T
             push!(remote, fock_ket)
         end
     end
-    @sync for fock_ket in remote
+    # one round trip per remote owner, not per Fock sector
+    by_owner = Dict{Int,Vector{FockConfig{N}}}()
+    for fock_ket in remote
+        push!(get!(() -> FockConfig{N}[], by_owner, ket.owners[fock_ket]), fock_ket)
+    end
+    @sync for (owner, focks) in by_owner
         @async begin
-            owner = ket.owners[fock_ket]
-            block = Distributed.remotecall_fetch(_spt_sharded_local_copy_fock_block,
-                                                 owner, ket.id, fock_ket)
-            block === nothing && error("Missing sharded ket Fock block $fock_ket on owner $owner")
-            ketl.data[fock_ket] = block
+            blocks = Distributed.remotecall_fetch(_spt_sharded_local_copy_fock_blocks,
+                                                  owner, ket.id, focks)
+            for (i, fock_ket) in enumerate(focks)
+                blocks[i] === nothing &&
+                    error("Missing sharded ket Fock block $fock_ket on owner $owner")
+                ketl.data[fock_ket] = blocks[i]
+            end
         end
     end
 
@@ -907,6 +929,33 @@ function _spt_fois_sharded_chunk!(out_id::Symbol, ref::DistributedSPTstate{T,N,R
     σ = _spt_empty_local_state(T, Val(R), ref.clusters, ref.p_spaces, ref.q_spaces, Val(N))
     ket_cache = Dict{FockConfig{N},Any}()
     scr_v = [zeros(T, 1000) for _ in 1:N]
+
+    # Prime the ket cache with one round trip per remote owner.  Left to
+    # _spt_sharded_get_ket_block this costs a round trip per distinct sector,
+    # which is what made the sharded matvec latency-bound; the FOIS builder
+    # reaches just as many sectors.
+    let needed = Set{FockConfig{N}}(), myid = Distributed.myid()
+        for (fock_bra, fock_kets) in assignments
+            _spt_has_cluster_space(fock_bra, ref.clusters, cluster_ops) || continue
+            for fock_ket in fock_kets
+                haskey(clustered_ham, fock_bra - fock_ket) || continue
+                ref.owners[fock_ket] == myid || push!(needed, fock_ket)
+            end
+        end
+        by_owner = Dict{Int,Vector{FockConfig{N}}}()
+        for fock_ket in needed
+            push!(get!(() -> FockConfig{N}[], by_owner, ref.owners[fock_ket]), fock_ket)
+        end
+        @sync for (owner, focks) in by_owner
+            @async begin
+                blocks = Distributed.remotecall_fetch(
+                    _spt_sharded_local_copy_fock_blocks, owner, ref.id, focks)
+                for (i, fock_ket) in enumerate(focks)
+                    blocks[i] === nothing || (ket_cache[fock_ket] = blocks[i])
+                end
+            end
+        end
+    end
 
     for (fock_bra, fock_kets) in assignments
         _spt_has_cluster_space(fock_bra, ref.clusters, cluster_ops) || continue
