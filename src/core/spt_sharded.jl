@@ -1029,51 +1029,87 @@ rather than `O(P|state|)` and each worker's transient memory as
 partition when the worker count is prime (the grid would be 1 x P, which is the
 destination partition with extra steps).
 """
-function build_sigma_sharded_2d(v::DistributedSPTstate{T,N,R}, cluster_ops,
-                                clustered_ham; nbody=4, workers=v.workers,
-                                blas_threads=1, id=nothing,
-                                cache::Bool=true) where {T,N,R}
+function _spt_build_sigma_into_2d(bra::DistributedSPTstate{T,N,R},
+                                  ket::DistributedSPTstate{T,N,R}, nbody,
+                                  blas_threads, id, cache::Bool, workers) where {T,N,R}
     P = length(workers)
     qr, qc = _spt_grid_shape(P)
-    if qr == 1
-        @warn "build_sigma_sharded_2d: $P workers do not form a useful grid; using the destination partition" maxlog=1
-        return build_sigma_sharded(v, cluster_ops, clustered_ham; nbody=nbody,
-                                   workers=workers, blas_threads=blas_threads,
-                                   id=id, cache=cache)
-    end
-
     part_id = gensym(:spt_shard_sigma2d_part)
     out_id  = id === nothing ? gensym(:spt_shard_sigma2d) : Symbol(id)
     grid = [workers[(i-1)*qc + j] for i in 1:qr, j in 1:qc]
 
     @sync for i in 1:qr, j in 1:qc
         @async Distributed.remotecall_fetch(_spt_sigma_2d_partial!, grid[i,j],
-                                            part_id, v, v, i, j, qr, qc, nbody,
+                                            part_id, bra, ket, i, j, qr, qc, nbody,
                                             blas_threads, cache)
     end
 
     owned = Dict(pid => FockConfig{N}[] for pid in workers)
-    for (fock, owner) in v.owners
+    for (fock, owner) in bra.owners
         push!(owned[owner], fock)
     end
     length_maps = Dict{Int,Any}()
     @sync for pid in workers
         @async begin
-            # only the row that produced partials for these sectors matters, but
             # a worker can own sectors from several rows, so ask every worker
             # that holds a partial: one batched round trip each.
             length_maps[pid] = Distributed.remotecall_fetch(
-                _spt_sigma_2d_reduce!, pid, out_id, part_id, v, owned[pid],
+                _spt_sigma_2d_reduce!, pid, out_id, part_id, bra, owned[pid],
                 collect(vec(grid)))
         end
     end
     @sync for pid in workers
         @async Distributed.remotecall_fetch(_spt_sharded_delete_state!, pid, part_id)
     end
-    return _spt_sharded_metadata_from_lengths(out_id, v.clusters, v.p_spaces,
-                                              v.q_spaces, workers, length_maps,
-                                              collect(keys(v.owners)),
+    return _spt_sharded_metadata_from_lengths(out_id, bra.clusters, bra.p_spaces,
+                                              bra.q_spaces, workers, length_maps,
+                                              collect(keys(bra.owners)),
                                               T, Val(R), Val(N))
+end
+
+function build_sigma_sharded_2d(v::DistributedSPTstate{T,N,R}, cluster_ops,
+                                clustered_ham; nbody=4, workers=v.workers,
+                                blas_threads=1, id=nothing,
+                                cache::Bool=true) where {T,N,R}
+    if _spt_grid_shape(length(workers))[1] == 1
+        @warn "build_sigma_sharded_2d: $(length(workers)) workers do not form a useful grid; using the destination partition" maxlog=1
+        return build_sigma_sharded(v, cluster_ops, clustered_ham; nbody=nbody,
+                                   workers=workers, blas_threads=blas_threads,
+                                   id=id, cache=cache)
+    end
+    return _spt_build_sigma_into_2d(v, v, nbody, blas_threads, id, cache, workers)
+end
+
+"""
+    build_sigma_into_sharded_2d(bra_basis, ket, cluster_ops, clustered_ham; ...)
+
+Grid-partitioned `<bra_basis|H|ket>`; the 2D counterpart of
+[`build_sigma_into_sharded`](@ref).  Same output and ownership, but traffic
+scales as `O(sqrt(P)|state|)` instead of `O(P|state|)`.  This is the form PT1
+uses for `<X|H|0>` and `<X|F|0>`, where `bra_basis` is the FOIS and `ket` the
+reference.  Falls back to the destination partition for a prime worker count.
+
+**Measured caveat.** The grid trades ket traffic for bra traffic: a worker
+fetches the bra bases for its whole row (`|bra|/qr`) rather than only its owned
+sectors (`|bra|/P`).  It therefore pays when bra and ket are both large -- the CI
+matvec, where `bra === ket` -- and is a wash when the bra dominates.  PT1 is the
+latter case: on h12 the FOIS bra is dim 56317 against a dim-121 reference, and
+`partition=:grid` measured 0.77 s vs 0.77 s; with a dim-2261 reference, 2.70 s
+vs 2.82 s.  Use `:grid` here only if your reference is comparable in size to the
+FOIS.
+"""
+function build_sigma_into_sharded_2d(bra_basis::DistributedSPTstate{T,N,R},
+                                     ket::DistributedSPTstate{T,N,R}, cluster_ops,
+                                     clustered_ham; nbody=4,
+                                     workers=bra_basis.workers, blas_threads=1,
+                                     id=nothing, cache::Bool=false) where {T,N,R}
+    _tpsci_sharded_cache_operator_problem!(cluster_ops, clustered_ham;
+                                           workers=workers, blas_threads=blas_threads)
+    if _spt_grid_shape(length(workers))[1] == 1
+        @warn "build_sigma_into_sharded_2d: $(length(workers)) workers do not form a useful grid; using the destination partition" maxlog=1
+        return _spt_build_sigma_into(bra_basis, ket, nbody, blas_threads, id; cache=cache)
+    end
+    return _spt_build_sigma_into_2d(bra_basis, ket, nbody, blas_threads, id, cache, workers)
 end
 
 
@@ -1566,6 +1602,7 @@ function compute_pt1_wavefunction_sharded(fois::DistributedSPTstate{T,N,R},
                                           cluster_ops, clustered_ham;
                                           H0="Hcmf", nbody=4,
                                           workers=fois.workers, blas_threads=1,
+                                          partition::Symbol=:dest,
                                           verbose=1) where {T,N,R}
     worker_ids = ensure_tpsci_multinode_workers!(workers=workers)
     clustered_ham_0 = extract_1body_operator(clustered_ham, op_string=H0)
@@ -1584,11 +1621,20 @@ function compute_pt1_wavefunction_sharded(fois::DistributedSPTstate{T,N,R},
     # Sx = psi0 projected into the (rotated) FOIS basis.
     Sx = project_into_new_basis_sharded(psi0, sigma)
 
-    # <X|H|0> and <X|F|0> in the FOIS basis.
-    XH0 = build_sigma_into_sharded(sigma, psi0, cluster_ops, clustered_ham;
-                                   nbody=nbody, workers=worker_ids, blas_threads=blas_threads)
-    XF0 = build_sigma_into_sharded(sigma, psi0, cluster_ops, clustered_ham_0;
-                                   nbody=1, workers=worker_ids, blas_threads=blas_threads)
+    # <X|H|0> and <X|F|0> in the FOIS basis.  `partition=:grid` routes these
+    # through the 2D worker grid; :dest (the default) keeps the destination
+    # partition.  Measured, :grid does NOT help here -- the grid saves ket
+    # traffic but costs bra traffic, and in PT1 the FOIS bra dwarfs the
+    # reference ket (0.77 vs 0.77 s with a dim-121 reference, 2.70 vs 2.82 s
+    # with dim 2261).  The option exists for the case where the reference is
+    # comparable in size to the FOIS; see build_sigma_into_sharded_2d.
+    partition in (:dest, :grid) ||
+        error("compute_pt1_wavefunction_sharded: partition must be :dest or :grid, got $partition")
+    _into = partition === :grid ? build_sigma_into_sharded_2d : build_sigma_into_sharded
+    XH0 = _into(sigma, psi0, cluster_ops, clustered_ham;
+                nbody=nbody, workers=worker_ids, blas_threads=blas_threads)
+    XF0 = _into(sigma, psi0, cluster_ops, clustered_ham_0;
+                nbody=1, workers=worker_ids, blas_threads=blas_threads)
 
     # res = <X|H|0> - <X|F|0> - Sx (E0 - F0)
     coef = E0 .- F0
