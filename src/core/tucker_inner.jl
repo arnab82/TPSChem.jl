@@ -87,7 +87,7 @@ function cache_hamiltonian_old(sigma_vector::SPTstate, ci_vector::SPTstate, clus
     #=}}}=#
 end
 
-function cache_hamiltonian(bra::SPTstate{T,N,R}, ket::SPTstate{T,N,R}, cluster_ops, clustered_ham; nbody=4, verbose=0, blas=false) where {T,N,R}
+function cache_hamiltonian(bra::SPTstate{T,N,R}, ket::SPTstate{T,N,R}, cluster_ops, clustered_ham; nbody=4, min_nbody=1, verbose=0, blas=false) where {T,N,R}
 #={{{=#
     
     # it seems like this is quite a bit faster when turned off:
@@ -99,10 +99,13 @@ function cache_hamiltonian(bra::SPTstate{T,N,R}, ket::SPTstate{T,N,R}, cluster_o
 
     keys_to_loop = [keys(clustered_ham.trans)...]
 
-    # set up scratch arrays — safe with :static scheduler (no task migration)
+    # set up scratch arrays — safe with :static scheduler (no task migration).
+    # Size by the default pool, not maxthreadid(): `@threads :static` only runs
+    # on default-pool threads, and each slot here is 10 x 100000 elements, so
+    # counting interactive threads wastes ~8 MB per phantom slot on every call.
     nscr = 10
     scr_f = Vector{Vector{Vector{T}} }()
-    for tid in 1:Threads.maxthreadid()
+    for tid in 1:Threads.nthreads(:default)
         tmp = Vector{Vector{T}}()
         [push!(tmp, zeros(T,100000)) for i in 1:nscr]
         push!(scr_f, tmp)
@@ -119,6 +122,13 @@ function cache_hamiltonian(bra::SPTstate{T,N,R}, ket::SPTstate{T,N,R}, cluster_o
         for term in terms
                
             length(term.clusters) <= nbody || continue
+            # `min_nbody` skips the cheap, numerous low-body terms.  They are a
+            # small share of the cached *data* but a large share of the cached
+            # *entries*, and each entry carries a 200-byte OperatorConfig key
+            # plus an array header -- so skipping them buys back per-entry
+            # overhead disproportionately, at the cost of recomputing the
+            # cheapest terms.  form_sigma_block! recomputes anything missing.
+            length(term.clusters) >= min_nbody || continue
 
             for (fock_ket, configs_ket) in ket
                 #fock_bra = [fock_ket.config...]
@@ -167,12 +177,10 @@ function build_sigma!(sigma_vector::SPTstate{T,N,R}, ci_vector::SPTstate{T,N,R},
     verbose < 2 || @printf(" in build_sigma!")
     verbose < 2 || println(" length of sigma vector: ", length(sigma_vector))
     flush(stdout)
-    jobs = []
-    output_lock = ReentrantLock()
-    output = []
+    jobs = Tuple{FockConfig{N},TuckerConfig{N}}[]
     for (fock_bra, configs_bra) in sigma_vector
         for (config_bra, tuck_bra) in configs_bra
-            push!(jobs, [fock_bra, config_bra])
+            push!(jobs, (fock_bra, config_bra))
         end
     end
 
@@ -181,12 +189,20 @@ function build_sigma!(sigma_vector::SPTstate{T,N,R}, ci_vector::SPTstate{T,N,R},
     # Per-task scratch (allocated per job) to avoid races with Julia's dynamic
     # scheduler -- same pattern as build_sigma_cepa!. Indexing scratch by
     # threadid() is unsafe when tasks can migrate between threads.
+    #
+    # There is exactly one job per destination block, so each task is the only
+    # writer for its own `sigma_vector` entry and no lock is needed.  The
+    # contributions are summed into a task-local accumulator and written back
+    # once at the end: `form_sigma_block!` returns `bra core + contribution`,
+    # so the destination has to stay untouched while the task is still calling
+    # it.  Buffering every contribution for the whole state first (the previous
+    # approach) made the peak scale with the total number of term contributions
+    # rather than with one block, which is what limited multi-root runs.
     function do_job(job, scr_f)
 
-        fock_bra = job[1]
-        config_bra = job[2]
+        fock_bra, config_bra = job
         coeff_bra = sigma_vector[fock_bra][config_bra]
-        task_output = []
+        acc = ntuple(r -> zeros(T, size(coeff_bra.core[r])), R)
 
         for (fock_ket, configs_ket) in ci_vector
             fock_trans = fock_bra - fock_ket
@@ -210,15 +226,13 @@ function build_sigma!(sigma_vector::SPTstate{T,N,R}, ci_vector::SPTstate{T,N,R},
                                                   scr_f,
                                                   cache=cache)
 
-                    push!(task_output, (fock_bra, config_bra, out))
+                    add!(acc, out)
 
 
                 end
             end
         end
-        lock(output_lock) do
-            append!(output, task_output)
-        end
+        add!(coeff_bra.core, acc)
     end
 
     Threads.@threads for job in jobs
@@ -228,12 +242,6 @@ function build_sigma!(sigma_vector::SPTstate{T,N,R}, ci_vector::SPTstate{T,N,R},
 
     flush(stdout)
 
-    for out in output
-        fock_bra = out[1]
-        config_bra = out[2]
-        core = out[3]
-        add!(sigma_vector[fock_bra][config_bra].core, core)
-    end
     return
     #=}}}=#
 end
@@ -247,24 +255,27 @@ Uses per-task scratch allocation to avoid races with Julia's dynamic scheduler.
 """
 function build_sigma_cepa!(sigma_vector::SPTstate{T,N,R}, ci_vector::SPTstate{T,N,R}, cluster_ops, clustered_ham; nbody=4, cache=false, verbose=1) where {T,N,R}
     #={{{=#
-    jobs = []
+    jobs = Tuple{FockConfig{N},TuckerConfig{N}}[]
     for (fock_bra, configs_bra) in sigma_vector
         for (config_bra, tuck_bra) in configs_bra
-            push!(jobs, [fock_bra, config_bra])
+            push!(jobs, (fock_bra, config_bra))
         end
     end
 
     nscr = 10
-    output_lock = ReentrantLock()
-    output = []
 
+    # One job per destination block, so each task owns its `sigma_vector` entry
+    # outright.  Sum the contributions into a task-local accumulator and write
+    # back once -- `form_sigma_block!` returns `bra core + contribution`, so the
+    # destination must stay untouched until the task is done with it.  See
+    # build_sigma! above: buffering every contribution across all blocks made
+    # the peak scale with the number of term contributions instead of one block.
     Threads.@threads for job in jobs
         scr = [zeros(T, 1000) for _ in 1:nscr]   # per-task, no sharing
-        task_output = []
 
-        fock_bra   = job[1]
-        config_bra = job[2]
+        fock_bra, config_bra = job
         coeff_bra  = sigma_vector[fock_bra][config_bra]
+        acc = ntuple(r -> zeros(T, size(coeff_bra.core[r])), R)
 
         for (fock_ket, configs_ket) in ci_vector
             fock_trans = fock_bra - fock_ket
@@ -279,18 +290,12 @@ function build_sigma_cepa!(sigma_vector::SPTstate{T,N,R}, ci_vector::SPTstate{T,
                                            fock_ket, config_ket,
                                            coeff_bra, coeff_ket,
                                            scr, cache=cache)
-                    push!(task_output, (fock_bra, config_bra, out))
+                    add!(acc, out)
                 end
             end
         end
 
-        lock(output_lock) do
-            push!(output, task_output...)
-        end
-    end
-
-    for out in output
-        add!(sigma_vector[out[1]][out[2]].core, out[3])
+        add!(coeff_bra.core, acc)
     end
     return
     #=}}}=#
@@ -317,20 +322,15 @@ function form_sigma_block!(term::C,
 
     # todo: add in 2e integral tucker decomposition and compress gamma along 1st index first
 
+    # A cache miss falls back to building the term rather than throwing, so a
+    # partially populated cache (see `cache_hamiltonian`'s `min_nbody`) works:
+    # the cached body orders are read, the rest are recomputed.  `get` does one
+    # hash lookup instead of haskey+getindex.
+    cached = cache ? get(term.cache, OperatorConfig((fock_bra, fock_ket, bra, ket)), nothing) : nothing
     op = Array{T}[]
-    cache_key = OperatorConfig((fock_bra, fock_ket, bra, ket))
-    #if cache && haskey(term.cache, cache_key)
-    if cache 
-       
-
-        #
-        # read the dense H term
-        op = term.cache[cache_key]
-    
+    if cached !== nothing
+        op = cached
     else
-
-        #cache == false || println(" couldn't find:", cache_key)
-
         #
         # build the dense H term
         op = build_dense_H_term(term, cluster_ops, fock_bra, bra, coeffs_bra, fock_ket, ket, coeffs_ket, scr_f)
@@ -376,20 +376,12 @@ function form_sigma_block!(term::C,
 
     # todo: add in 2e integral tucker decomposition and compress gamma along 1st index first
 
+    # see the method above: a miss recomputes instead of throwing
+    cached = cache ? get(term.cache, OperatorConfig((fock_bra, fock_ket, bra, ket)), nothing) : nothing
     op = Array{T}[]
-    cache_key = OperatorConfig((fock_bra, fock_ket, bra, ket))
-    #if cache && haskey(term.cache, cache_key)
-    if cache 
-       
-
-        #
-        # read the dense H term
-        op = term.cache[cache_key]
-    
+    if cached !== nothing
+        op = cached
     else
-
-        #cache == false || println(" couldn't find:", cache_key)
-
         #
         # build the dense H term
         op = build_dense_H_term(term, cluster_ops, fock_bra, bra, coeffs_bra, fock_ket, ket, coeffs_ket)

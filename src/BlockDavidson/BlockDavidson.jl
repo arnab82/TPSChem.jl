@@ -216,7 +216,9 @@ function iteration(solver::Davidson; Adiag=nothing, iprint=0, precond_start_thre
         end
         if Adiag !== nothing && solver.status[s] == false && solver.resid[s] < precond_start_thresh
         # if Adiag != nothing && solver.status[s] == false
-            tmp = deepcopy(res)
+            # (a `tmp = deepcopy(res)` used to sit here, assigned and never read.
+            #  It copied the whole dim x nroots residual once per root per
+            #  iteration -- 1.3 GB of garbage per iteration at dim 1e7, R=4.)
             for i in 1:length(Adiag)
                 res[i, s] = res[i, s] / (solver.ritz_e[s] - Adiag[i] + 1e-12)
                 # if abs(solver.ritz_e[s] - Adiag[i]) < solver.tol

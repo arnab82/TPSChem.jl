@@ -73,6 +73,8 @@ function ci_solve(ci_vector_in::SPTstate{T,N,R}, cluster_ops, clustered_ham;
                          precond        = true,
                          verbose        = 0,
                          nbody          = 4,
+                         cache          = true,
+                         cache_min_nbody = 1,
                          solver         = "davidson") where {T,N,R}
 #={{{=#
     @printf(" |== SPT CI ========================================================\n")
@@ -97,13 +99,20 @@ function ci_solve(ci_vector_in::SPTstate{T,N,R}, cluster_ops, clustered_ham;
     #Hmap = get_map(vec, cluster_ops, clustered_ham, cache=true)
     iters = 0
     
+    # The matvec input and output states have the same block structure on every
+    # Davidson iteration, so build them once per block width and reuse them.
+    # Allocating them per call meant two full SPTstates (and a deepcopy of one,
+    # whose cores were immediately zeroed) for every iteration.
+    matvec_scr = Dict{Int,Any}()
+    _matvec_states(n::Int) = get!(() -> (SPTstate(vec, R=n), SPTstate(vec, R=n)),
+                                  matvec_scr, n)
+
     function matvec(v::Matrix{T}) where T
         iters += 1
         #all(size(vec) .== size(v)) || error(DimensionMismatch)
-        vec_i = SPTstate(vec, R=size(v,2))
+        vec_i, sig = _matvec_states(size(v, 2))
         set_vector!(vec_i, v)
 
-        sig = deepcopy(vec_i)
         zero!(sig)
         build_sigma!(sig, vec_i, cluster_ops, clustered_ham, cache=cache, nbody=nbody)
 
@@ -112,10 +121,9 @@ function ci_solve(ci_vector_in::SPTstate{T,N,R}, cluster_ops, clustered_ham;
     function matvec(v::Vector{T}) where T
         iters += 1
         #all(size(vec) .== size(v)) || error(DimensionMismatch)
-        vec_i = SPTstate(vec, R=1)
+        vec_i, sig = _matvec_states(1)
         set_vector!(vec_i, v)
 
-        sig = deepcopy(vec_i)
         zero!(sig)
         build_sigma!(sig, vec_i, cluster_ops, clustered_ham, cache=cache, nbody=nbody)
 
@@ -127,11 +135,15 @@ function ci_solve(ci_vector_in::SPTstate{T,N,R}, cluster_ops, clustered_ham;
 
     v0 = get_vector(vec)
 
-    cache=true
+    # `cache` used to be forced on here, so the dense-H cache was always built
+    # and held for the whole solve regardless of what the caller asked for.
+    # It is the single largest resident allocation in a big multi-root solve,
+    # so let the caller trade it back for memory.
     if cache
         @printf(" %-50s", "Cache Hamiltonian: ")
         flush(stdout)
-        @time cache_hamiltonian(vec, vec, cluster_ops, clustered_ham)
+        @time cache_hamiltonian(vec, vec, cluster_ops, clustered_ham, nbody=nbody,
+                                min_nbody=cache_min_nbody)
         flush(stdout)
     end
 

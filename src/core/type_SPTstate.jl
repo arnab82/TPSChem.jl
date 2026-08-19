@@ -124,6 +124,27 @@ end
 
 
 """
+    zeros_like(v::SPTstate{T,N,R}) where {T,N,R}
+
+A state with the same blocks and the same Tucker factors as `v`, but with zero
+cores.  Equivalent to `w = deepcopy(v); zero!(w)` without copying core data that
+is immediately overwritten.
+"""
+function zeros_like(v::SPTstate{T,N,R}) where {T,N,R}
+    data = OrderedDict{FockConfig{N},OrderedDict{TuckerConfig{N},Tucker{T,N,R}}}()
+    w = SPTstate{T,N,R}(v.clusters, data, v.p_spaces, v.q_spaces)
+    for (fock, tconfigs) in v.data
+        add_fockconfig!(w, fock)
+        for (tconfig, tuck) in tconfigs
+            w[fock][tconfig] = Tucker{T,N,R}(
+                ntuple(r -> zeros(T, size(tuck.core[r])), R), deepcopy(tuck.factors))
+        end
+    end
+    return w
+end
+
+
+"""
 
 Constructor - create copy, changing T and R optionally 
 # Arguments
@@ -506,7 +527,9 @@ function get_vector(ts::SPTstate{T,N,R}) where {T,N,R}
 
             dim1 = prod(dims)
             for r in 1:R
-                v[idx:idx+dim1-1,r] .= copy(reshape(tuck.core[r],dim1))
+                # reshape is a lazy view; an intermediate copy() here just
+                # allocates a full block that the broadcast immediately re-copies
+                v[idx:idx+dim1-1,r] .= reshape(tuck.core[r],dim1)
             end
             idx += dim1
         end
@@ -531,7 +554,7 @@ function get_vector(ts::SPTstate{T,N,R}, root::Integer) where {T,N,R}
             dims = size(tuck.core[root])
 
             dim1 = prod(dims)
-            v[idx:idx+dim1-1,:] = copy(reshape(tuck.core[root],dim1))
+            v[idx:idx+dim1-1,1] .= reshape(tuck.core[root],dim1)
             idx += dim1
         end
     end
@@ -554,7 +577,8 @@ function set_vector!(ts::SPTstate{T,N,R}, v::Vector{T}; root=1) where {T,N,R}
             dims = size(tuck)
 
             dim1 = prod(dims)
-            ts[fock][tconfig].core[root] .= reshape(v[idx:idx+dim1-1], size(tuck.core[1]))
+            # @view: slicing v allocates a copy of the block on every call
+            ts[fock][tconfig].core[root] .= reshape(@view(v[idx:idx+dim1-1]), size(tuck.core[1]))
             idx += dim1
         end
     end
@@ -581,7 +605,7 @@ function set_vector!(ts::SPTstate{T,N,R}, v::Matrix{T}) where {T,N,R}
 
             dim1 = prod(dims)
             for r in 1:R
-                ts[fock][tconfig].core[r] .= reshape(v[idx:idx+dim1-1,r], size(tuck.core[r]))
+                ts[fock][tconfig].core[r] .= reshape(@view(v[idx:idx+dim1-1,r]), size(tuck.core[r]))
             end
             idx += dim1
         end
@@ -952,8 +976,8 @@ Project state `v1`  into the basis defined by `v2`
 function project_into_new_basis(v1::SPTstate{T,N,R}, v2::SPTstate{T,N,R}) where {T,N,R}
     #
     flush(stdout)
-    out = deepcopy(v2)
-    zero!(out)
+    # zeros_like: deepcopy would copy every core only to have zero! overwrite it
+    out = zeros_like(v2)
     for (fock, tconfigs) in v2 
         haskey(v1, fock) || continue
         for (tconfig, tuck) in tconfigs

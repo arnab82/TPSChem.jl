@@ -383,6 +383,8 @@ function subspace_product_tucker(input_vec::SPTstate{T,N,R}, cluster_ops, cluste
     do_pt=true,
     tol_tucker=1e-6,
     solver="davidson",
+    ci_cache=true,
+    ci_cache_min_nbody=1,
     verbose=1) where {T,N,R}
     
     
@@ -450,6 +452,8 @@ function subspace_product_tucker(input_vec::SPTstate{T,N,R}, cluster_ops, cluste
                 max_ss_vecs=ci_max_ss_vecs,
                 nbody=nbody,
                 lindep_thresh=ci_lindep_thresh,
+                cache=ci_cache,
+                cache_min_nbody=ci_cache_min_nbody,
                 solver=solver)
             push!(e_projected_list, e0)
             push!(dim_projected_list, length(ref_vec))
@@ -568,15 +572,15 @@ function subspace_product_tucker(input_vec::SPTstate{T,N,R}, cluster_ops, cluste
                                                         max_iter=ci_max_iter,
                                                         max_ss_vecs=ci_max_ss_vecs,
                                                         lindep_thresh=ci_lindep_thresh,
+                                                        nbody=nbody,
+                                                        cache=ci_cache,
+                                                        cache_min_nbody=ci_cache_min_nbody,
                                                         solver=solver)
-
-        var_vec_old = deepcopy(var_vec)
-
-        
 
         push!(e_variational_list, e_var)
         push!(dim_variational_list, length(var_vec))
 
+        # kept for next iteration's project_into_new_basis initial guess
         var_vec_old = deepcopy(var_vec)
         
         @printf(" %-20s", "E(Reference): ")
