@@ -69,6 +69,59 @@ Measured on h12 (dim 56317, 2090 Fock sectors), processes on one machine:
   fresh and fetches only the (smaller) reference, so there is no bra traffic to
   trade.
 
+## What these runs are actually asking
+
+Every number below was taken with processes on one 11-core machine, so each is a
+hypothesis, not a result. The point of running on the cluster is to confirm or
+kill them. Each question says what to look at and what each outcome means.
+
+**Q1. Does the 2D grid's advantage grow with P, as sqrt(P) predicts?**
+Look at `2D vs destination` across `--nodes=4,9,16`. Loopback gave 1.38x at P=4
+and 1.71x at P=9. If the margin keeps widening, the volume model holds. If it
+flattens, the win was fetch balancing rather than reduced volume and the grid
+stops paying beyond some P. *Real interconnect should make the grid look
+better, not worse* — loopback has far more bandwidth and far less latency than
+any network, so communication is under-weighted here.
+
+**Q2. Does per-worker memory actually scale down?**
+This is the claim the grid exists for. Look at `peak/worker` for the two
+matvecs as P grows. Prediction: destination stays roughly flat (~O(|state|)
+however many workers you add), grid falls as 1/sqrt(P). If destination's
+peak/worker does *not* stay flat, the O(P|state|) diagnosis is wrong and the
+whole motivation needs revisiting.
+
+**Q3. Where does the missing ~50% go?**
+Sharded matvec runs at ~49% parallel efficiency and I have not attributed the
+loss — it could be serialization, Distributed's own overhead, load imbalance,
+or genuine parallel loss. Profile on the real machine before optimizing; four
+plausible fixes were already killed by measurement (contribution partitioning,
+PT1 grid, FOIS grid, load re-weighting) and a fifth guess is not worth building.
+
+**Q4. Is your coupling graph sparse enough for the grid at all?**
+From the diagnostics run. h12 is 6.8% dense with mean bra in-degree 142 of 2090.
+If yours is much denser, every worker touches everything under any partitioning
+and the grid cannot help. If it is much sparser, the grid should beat the
+loopback numbers.
+
+**Q5. Does the `length(kets)` load proxy still hold?**
+From the diagnostics run: `current` vs `work-weighted`. On h12 these are within
+1.03-1.12x, so re-weighting buys nothing. A larger gap on your system makes a
+work-weighted assignment worth implementing — the weighting machinery already
+exists in `_spt_pt2_job_weight`.
+
+**Q6. Does the single-node speedup carry over?**
+The node-local work got ~2.4x faster this pass (R-fused contraction, the
+transform_basis rewrite, dropping the global contribution buffer). Those are
+node-local, so each worker should inherit them; `single-node build_sigma!` in
+the scaling output is the check. If it does not, the worker processes are not
+picking up the same code path.
+
+**Q7. At what P does the destination partition actually fall over?**
+Run it until it does. The prediction is that per-worker transient memory stays
+~O(|state|), so it fails when |state| approaches one node's RAM regardless of
+node count — that is the whole reason the grid was written. Knowing the real
+crossover for your system sizes tells you which partitioning to use by default.
+
 ## Numbers to treat with suspicion
 
 Everything above was measured with processes on a single 11-core machine, so

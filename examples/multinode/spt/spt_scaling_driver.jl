@@ -34,6 +34,20 @@ const NBODY = env_int("TPSCHEM_NBODY", 4)
 const FOIS_THRESH = env_float("TPSCHEM_FOIS_THRESH", 1e-4)
 
 pids = init_multinode_workers!()
+
+# Peak resident memory per worker.  This is the claim the 2D grid exists to
+# test: destination partitioning leaves every worker holding ~O(|state|) no
+# matter how many workers you add, while the grid should scale it down as
+# 1/sqrt(P).  Timings alone cannot show that.
+worker_peak_gb() = Dict(p => Distributed.remotecall_fetch(() -> Sys.maxrss()*1e-9, p)
+                        for p in pids)
+function report_peak(label, before)
+    after = worker_peak_gb()
+    d = [after[p] - before[p] for p in pids]
+    @printf("%-34s peak/worker: max %.3f GB  mean %.3f GB  (spread %.2fx)\n",
+            label, maximum(d), sum(d)/length(d),
+            maximum(d)/max(minimum(d), 1e-9))
+end
 data = load_problem_data()
 ch, co = spt_operators(data)
 v = spt_reference_state(data)
@@ -67,12 +81,14 @@ for (label, fn) in (("sharded matvec (destination)", TPSChem.build_sigma_sharded
                                                    blas_threads=BLAS_THREADS)
     d = fn(dv, co, ch; nbody=NBODY, workers=pids, blas_threads=BLAS_THREADS)
     TPSChem.destroy!(d)                                           # warm
+    GC.gc(); mem0 = worker_peak_gb()
     t = @elapsed d = fn(dv, co, ch; nbody=NBODY, workers=pids, blas_threads=BLAS_THREADS)
     n = sum(LinearAlgebra.diag(TPSChem.overlap(d, d)))
     TPSChem.destroy!(d)
     push!(results, (label, t, n))
     @printf("%-34s %8.2f s   |sig|=%.10f%s\n", label, t, n,
             isnan(ref_norm) ? "" : @sprintf("   rel=%.2e", abs(n-ref_norm)/abs(ref_norm)))
+    report_peak("  " * label, mem0)
     flush(stdout)
 end
 
