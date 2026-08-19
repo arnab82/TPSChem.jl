@@ -106,6 +106,26 @@ function _spt_job_chunks(jobs_vec::Vector{Tuple{FockConfig{N},Vector{Tuple}}},
     return chunks
 end
 
+
+function _spt_pt2_job_chunks(jobs_vec::Vector{Tuple{FockConfig{N},Vector{Tuple}}},
+                             pids, ref::SPTstate, nbody;
+                             strategy::Symbol=:balanced) where {N}
+    strategy == :balanced || return _spt_job_chunks(jobs_vec, pids;
+                                                     strategy=strategy)
+    chunks = Dict(pid => Tuple{FockConfig{N},Vector{Tuple}}[] for pid in pids)
+    loads = Dict(pid => 0.0 for pid in pids)
+    weighted_jobs = [(job, _spt_pt2_job_weight(job, ref, nbody))
+                     for job in jobs_vec]
+    sort!(weighted_jobs; by=last, rev=true)
+    for (job, weight) in weighted_jobs
+        pid = _spt_least_loaded_pid(loads, pids)
+        push!(chunks[pid], job)
+        loads[pid] += weight
+    end
+    return chunks
+end
+
+
 function _spt_needed_cluster_indices_from_jobs(jobs_chunk)
     needed = Set{Int}()
     for (_, jobs) in jobs_chunk
@@ -195,7 +215,7 @@ function _spt_fois_worker_chunk(psi::SPTstate{T,N,R}, jobs_chunk, cluster_ops,
     local_ops = _spt_materialize_cluster_ops(
         cluster_ops, _spt_needed_cluster_indices_from_jobs(jobs_chunk))
 
-    nt = threaded_worker ? Threads.maxthreadid() : 1
+    nt = threaded_worker ? Threads.nthreads(:default) : 1
     partial = [_spt_empty_state_like(psi) for _ in 1:nt]
     scr_v = [[zeros(T, 1000) for _ in 1:N] for _ in 1:nt]
 
@@ -406,18 +426,41 @@ function compute_pt1_wavefunction_distributed(sigma_in::SPTstate{T,N,R},
         workers=workers, blas_threads=blas_threads, strategy=strategy)
     verbose < 1 || @printf(" %-50s%10.6f seconds\n", "Compute <X|F|0>: ", time)
 
-    sigma = sigma - XF0 - scale(Sx, E0 .- F0)
-
-    psi1 = deepcopy(sigma)
-    Fv = get_vector(Fdiag, 1)
-    for r in 1:R
-        psi1r = get_vector(psi1, r)
-        denom = F0[r] .- Fv .+ 1e-12
-        psi1r ./= denom
-        set_vector!(psi1, psi1r[:, 1], root=r)
+    #
+    # sigma <- <X|H|0> - <X|F|0> - (E0-F0)<X|0>, then psi1 = sigma / (F0 - Fdiag).
+    #
+    # Everything here is keyed by (fock, tconfig) on purpose.  `Sx` and `Fdiag`
+    # carry the Fock ordering of `sigma_in`, whereas `build_sigma_distributed`
+    # rebuilds its output by merging worker shards and hands back a *different*
+    # ordering.  SPTstate `-` and `get_vector` are positional, so combining them
+    # that way silently pairs up unrelated blocks.  Indexing by key also removes
+    # the three whole-FOIS temporaries this used to allocate on the master.
+    dE = E0 .- F0
+    ecorr = zeros(T, R)
+    for (fock, configs) in sigma
+        xf0_f   = XF0[fock]
+        sx_f    = Sx[fock]
+        fdiag_f = Fdiag[fock]
+        for (config, tuck) in configs
+            xf0   = xf0_f[config].core
+            sx    = sx_f[config].core
+            fdiag = fdiag_f[config].core[1]
+            for r in 1:R
+                c = tuck.core[r]
+                acc = zero(T)
+                @inbounds for i in eachindex(c)
+                    num  = c[i] - xf0[r][i] - dE[r] * sx[r][i]
+                    c[i] = num / (F0[r] - fdiag[i] + 1e-12)
+                    acc += num * c[i]
+                end
+                ecorr[r] += acc
+            end
+        end
     end
+    empty!(XF0.data)
+    empty!(Sx.data)
+    psi1 = sigma
 
-    ecorr = orth_dot(sigma, psi1)
     E2 = zeros(T, R)
     for r in 1:R
         E2[r] = E0[r] + ecorr[r]
@@ -482,8 +525,10 @@ function _spt_pt2_worker_chunk(jobs_chunk, kernel::Symbol,
     local_ops = _spt_materialize_cluster_ops(
         cluster_ops, _spt_needed_cluster_indices_from_jobs(jobs_chunk))
 
-    nt = threaded_worker ? Threads.maxthreadid() : 1
+    nt = threaded_worker ? Threads.nthreads(:default) : 1
     e2_thread = [zeros(T, R) for _ in 1:nt]
+    pt2_scratch = kernel == :blockwise ?
+        [[zeros(T, 1000) for _ in 1:10] for _ in 1:nt] : nothing
 
     function run_job!(tid, fock_sig, job)
         if kernel == :standard
@@ -497,20 +542,23 @@ function _spt_pt2_worker_chunk(jobs_chunk, kernel::Symbol,
                 clustered_ham_0, nbody, verbose, thresh, max_number, E0, F0,
                 prescreen, compress_twice)
         elseif kernel == :blockwise
-            e2_thread[tid] .+= _pt2_job_blockwise(
-                fock_sig, job, ref_vec, local_ops, clustered_ham,
+            _pt2_job_blockwise!(
+                e2_thread[tid], pt2_scratch[tid], fock_sig, job, ref_vec,
+                local_ops, clustered_ham,
                 clustered_ham_0, nbody, thresh, max_number, E0, F0,
-                prescreen, H0)
+                prescreen, H0, compress_twice=compress_twice)
         else
             error("Unknown SPT-PT2 multinode kernel: $kernel")
         end
     end
 
-    elapsed = @elapsed begin
+    allocated = @allocated elapsed = @elapsed begin
         if threaded_worker
-            Threads.@threads :static for idx in eachindex(jobs_chunk)
-                fock_sig, job = jobs_chunk[idx]
-                run_job!(Threads.threadid(), fock_sig, job)
+            buckets = _spt_pt2_thread_buckets(jobs_chunk, ref_vec, nbody, nt)
+            Threads.@threads :static for slot in 1:nt
+                for (fock_sig, job) in buckets[slot]
+                    run_job!(slot, fock_sig, job)
+                end
             end
         else
             for (fock_sig, job) in jobs_chunk
@@ -518,7 +566,8 @@ function _spt_pt2_worker_chunk(jobs_chunk, kernel::Symbol,
             end
         end
     end
-    return (ecorr=sum(e2_thread), seconds=elapsed, njobs=length(jobs_chunk))
+    return (ecorr=sum(e2_thread), seconds=elapsed, bytes=allocated,
+            njobs=length(jobs_chunk))
 end
 
 """
@@ -591,7 +640,8 @@ function compute_pt2_energy_distributed(ref::SPTstate{T,N,R}, cluster_ops,
 
     jobs_vec = _spt_make_fock_jobs(ref_vec, cluster_ops, clustered_ham,
                                    require_cluster_space=false)
-    chunks = _spt_job_chunks(jobs_vec, pids; strategy=strategy)
+    chunks = _spt_pt2_job_chunks(jobs_vec, pids, ref_vec, nbody;
+                                 strategy=strategy)
 
     println(" Number of jobs:    ", length(jobs_vec))
     println(" Number of workers: ", length(pids))
@@ -619,8 +669,9 @@ function compute_pt2_energy_distributed(ref::SPTstate{T,N,R}, cluster_ops,
     @printf(" %-48s%10.1f s\n", "Wall time spent computing E2: ", t_total)
     if verbose > 0
         for pid in pids
-            @printf(" Worker %5i: %8i jobs  %10.1f s\n",
-                    pid, results[pid].njobs, results[pid].seconds)
+            @printf(" Worker %5i: %8i jobs  %10.1f s  %8.3f GB allocated\n",
+                    pid, results[pid].njobs, results[pid].seconds,
+                    results[pid].bytes * 1e-9)
         end
     end
 

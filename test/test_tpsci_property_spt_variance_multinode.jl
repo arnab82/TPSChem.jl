@@ -109,6 +109,41 @@ try
                            TPSChem.nonorth_dot(hfois, hfois),
                            rtol=1e-10, atol=1e-10)
 
+            # The blockwise PT2 path uses a scratch-reusing one-block H0
+            # contraction instead of invoking the general threaded matvec for
+            # every FOIS block.  Check the specialized contraction directly on
+            # representative blocks so its allocation optimization cannot
+            # silently change the PT2 numerator.
+            ham0 = TPSChem.extract_1body_operator(clustered_ham;
+                                                  op_string="Hcmf")
+            scratch = [zeros(Float64, 1000) for _ in 1:10]
+            nchecked = 0
+            for (fock, blocks) in fois
+                for (tconfig, tuck) in blocks
+                    dims = size(tuck.core[1])
+                    general_tuck = TPSChem.Tucker{Float64,4,1}(
+                        (zeros(Float64, dims),), tuck.factors)
+                    direct_tuck = TPSChem.Tucker{Float64,4,1}(
+                        (zeros(Float64, dims),), tuck.factors)
+                    general = TPSChem.SPTstate(
+                        spt_ref.clusters, spt_ref.p_spaces, spt_ref.q_spaces;
+                        T=Float64, R=1)
+                    TPSChem.add_fockconfig!(general, fock)
+                    general[fock][tconfig] = general_tuck
+                    TPSChem.build_sigma!(general, spt_ref, cluster_ops, ham0;
+                                         nbody=1, verbose=0)
+                    TPSChem._pt2_build_f0_block!(
+                        direct_tuck, fock, tconfig, spt_ref, cluster_ops,
+                        ham0, scratch)
+                    @test isapprox(general_tuck.core[1], direct_tuck.core[1];
+                                   atol=1e-12)
+                    nchecked += 1
+                    nchecked == 3 && break
+                end
+                nchecked == 3 && break
+            end
+            @test nchecked == 3
+
             e2 = TPSChem.compute_pt2_energy_blockwise(
                 spt_ref, cluster_ops, clustered_ham; nbody=2, thresh_foi=1e-3,
                 opt_ref=false, verbose=0)
@@ -117,6 +152,34 @@ try
                 opt_ref=false, verbose=0, workers=workers(),
                 threaded_worker=false, blas_threads=1, strategy=:hash)
             @test isapprox(e2, e2_d, rtol=1e-10, atol=1e-10)
+
+            # The distributed PT1 wavefunction combines <X|H|0>, <X|F|0>, the
+            # overlap and the Fock diagonal.  build_sigma_distributed returns
+            # its blocks in worker-merge order rather than the input order, so
+            # this has to be matched by (fock, tconfig) key; a positional
+            # combination silently pairs unrelated blocks.
+            E0_spt = TPSChem.compute_expectation_value(spt_ref, cluster_ops,
+                                                       clustered_ham)
+            F0_spt = TPSChem.compute_expectation_value(spt_ref, cluster_ops, ham0)
+            p1_s, E2_s, ec_s = TPSChem.compute_pt1_wavefunction(
+                fois, spt_ref, cluster_ops, clustered_ham, ham0, E0_spt, F0_spt;
+                verbose=0)
+            p1_d, E2_d, ec_d = TPSChem.compute_pt1_wavefunction_distributed(
+                fois, spt_ref, cluster_ops, clustered_ham, ham0, E0_spt, F0_spt;
+                verbose=0, workers=workers(), blas_threads=1, strategy=:hash)
+            @test isapprox(ec_s, ec_d, rtol=1e-10, atol=1e-10)
+            @test isapprox(E2_s, E2_d, rtol=1e-10, atol=1e-10)
+            @test length(p1_s) == length(p1_d)
+            for (fock, blocks) in p1_s
+                @test haskey(p1_d, fock)
+                for (tconfig, tuck) in blocks
+                    @test haskey(p1_d[fock], tconfig)
+                    for r in 1:length(tuck.core)
+                        @test isapprox(tuck.core[r], p1_d[fock][tconfig].core[r];
+                                       atol=1e-10)
+                    end
+                end
+            end
 
             sigma2 = TPSChem.compute_spt_sigma_norm_blockwise(
                 spt_ref, cluster_ops, clustered_ham; nbody=2, thresh_foi=1e-3,
