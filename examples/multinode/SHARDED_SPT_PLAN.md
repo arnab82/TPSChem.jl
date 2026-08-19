@@ -182,3 +182,78 @@ Replace each gather in `subspace_product_tucker_multinode`:
    CI solver" the request names.**
 3. Never-gather FOIS + PT1 + `subspace_product_tucker_sharded`, tested vs
    single-node. Tier A stored Tucker-H and S² extension deferred.
+
+---
+
+## 10. Status after the 2026-08 optimization pass
+
+Stages 1–3 are implemented and validated (`test/test_spt_sharded.jl`, 15/15;
+the end-to-end driver test is gated behind `TPSCHEM_TEST_HEAVY_MULTINODE=1` and
+reproduces the single-node energy to ten digits).
+
+### 10.1 Fixed: the matvec was latency-bound
+
+Measured on h12 (dim 56317, 2090 Fock sectors, R=4), three workers × 2 threads:
+
+| | before | after |
+| --- | --- | --- |
+| single-node `build_sigma!` | 8.9 s | 8.9 s |
+| `build_sigma_sharded` | **24.1 s** | **6.1 s** |
+| vs single node | 2.7× *slower* | 1.46× faster |
+| parallel efficiency | 12% | 49% |
+| sharded FOIS | — | 1.58× (53%) |
+
+Each worker needs every ket Fock sector connected by `H` to one of its owned bra
+sectors, and it fetched them **one `remotecall_fetch` per sector** — about 1400
+round trips per worker per matvec. The payload is only ~2.4 MB per worker, so
+this was latency, not bandwidth. Grouping the needed sectors by owner
+(`_spt_sharded_local_copy_fock_blocks`) and prefetching the FOIS builder's
+`ket_cache` the same way fixed it.
+
+Note the existing tests compare numbers to ~1e-15 but never compare *time*, so a
+path that was correct and 2.7× slower than the single-node code it exists to
+replace passed cleanly for a long time. **A coarse performance assertion —
+even "sharded matvec is not slower than single-node" — belongs in the test.**
+
+### 10.2 Open: communication is O(P × |state|), not O(|state|)
+
+This is the blocker for the target scale and batching does **not** address it.
+
+Ownership is by *destination* Fock sector. A worker computes σ only for its own
+bra sectors, but `H` couples nearly every ket sector to nearly every bra sector,
+so each worker must pull essentially the **whole** ket state every matvec.
+Communication therefore grows with worker count instead of shrinking with it,
+and each worker's transient memory is O(|state|) regardless of P — which also
+defeats the point of sharding for memory.
+
+At h12 this is invisible (2.4 MB/worker). At the sizes this design exists for it
+is fatal: a 100M-determinant FOIS at R=4 is roughly 7 GB of cores plus factors,
+so every worker would pull ~7 GB per matvec *and* need room to hold it.
+
+**The design change: partition by contribution, not by destination sector.**
+Instead of "worker `p` owns bra sector `F` and fetches whatever kets feed it",
+assign each worker a set of *(bra sector, ket sector)* pairs whose ket blocks it
+already holds, compute partial σ contributions locally, and reduce the partials
+into the owning worker at the end. Ket blocks then never move; only partial σ
+blocks do, and those are bounded by the destination sizes actually touched.
+Sketch:
+
+1. Keep the existing `:hash` ownership for storage.
+2. Build the job list as (bra, ket, terms) triples as now, but assign each
+   triple to the worker that **already owns the ket sector**.
+3. Each worker accumulates partial σ into a local buffer keyed by bra sector.
+4. Reduce: each bra sector's owner sums the partials from the workers that
+   contributed to it (one round trip per (owner, contributor) pair, batched as
+   in §10.1).
+
+Trade-off: this moves partial σ blocks instead of ket blocks. It wins when the
+σ blocks touched per worker are smaller than the whole ket state, which is the
+case exactly when the Fock-space coupling is sparse — worth measuring the
+coupling density before building it, since a dense coupling graph makes both
+schemes O(P × |state|).
+
+Related open items: the remaining 51% overhead is serialization and load
+imbalance (`:hash` balances sector *count*, not work), and the gated driver test
+reports "did not converge in 6 iterations" — it passes only because the
+single-node reference is equally unconverged at `atol=1e-6`, so its iteration
+budget should be raised before it is trusted as an end-to-end check.
