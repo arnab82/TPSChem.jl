@@ -127,5 +127,32 @@ using LinearAlgebra
     println(norm(tuckC))
     println(norm(tuckD))
     @test abs(norm(tuckC) - norm(tuckD)) < 1e-12
+
+    #
+    # transform_basis: the Dict method (partial mode list) must agree with the
+    # NTuple method (all modes) when the missing modes are filled with identities,
+    # for both trans=false and trans=true.
+    dims = (3, 4, 2, 5)
+    v = rand(dims...)
+    for modes in ([1], [2, 4], [1, 2, 3, 4])
+        d = Dict{Int,Matrix{Float64}}(i => Matrix(qr(rand(dims[i], dims[i])).Q)
+                                      for i in modes)
+        full = ntuple(i -> get(d, i, Matrix{Float64}(I, dims[i], dims[i])), 4)
+        for trans in (false, true)
+            @test isapprox(TPSChem.transform_basis(v, d, trans=trans),
+                           TPSChem.transform_basis(v, full, trans=trans), atol=1e-12)
+        end
+    end
+
+    # A Tucker block may legitimately have a zero-length mode; transform_basis
+    # must handle it rather than dividing by the leading dimension.
+    for zdims in ((0, 3, 2, 4), (3, 0, 2, 4), (3, 4, 2, 0))
+        vz = zeros(zdims...)
+        dz = Dict{Int,Matrix{Float64}}(3 => Matrix(qr(rand(2, 2)).Q))
+        for trans in (false, true)
+            outz = TPSChem.transform_basis(vz, dz, trans=trans)
+            @test size(outz) == zdims
+        end
+    end
 end
 
