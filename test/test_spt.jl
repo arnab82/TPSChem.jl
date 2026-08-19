@@ -2,6 +2,7 @@ using TPSChem
 using Printf
 using Test
 using JLD2 
+using LinearAlgebra
 
 #@testset "SPTstate" begin
 if false 
@@ -88,11 +89,52 @@ end
     # @test isapprox(e_var[1], -18.32945552731658, atol=1e-8)
     
 
+    #
+    # A partial Hamiltonian cache must be numerically transparent:
+    # form_sigma_block! recomputes any (term, block-pair) the cache does not
+    # hold, so restricting cache_hamiltonian to a body-order window is allowed
+    # to change speed and memory but never the result.
+    let ket = v_var
+        function sigma_with(min_nbody, usecache)
+            TPSChem.flush_cache(clustered_ham)
+            usecache && TPSChem.cache_hamiltonian(ket, ket, cluster_ops,
+                                                  clustered_ham; min_nbody=min_nbody)
+            sg = deepcopy(ket)
+            TPSChem.zero!(sg)
+            TPSChem.build_sigma!(sg, ket, cluster_ops, clustered_ham,
+                                 cache=usecache, verbose=0)
+            TPSChem.flush_cache(clustered_ham)
+            return TPSChem.get_vector(sg)
+        end
+        sig_ref = sigma_with(1, true)
+        @test norm(sig_ref) > 1e-8            # guard against a trivially zero check
+        for mn in (2, 3, 4, 5)
+            @test isapprox(sig_ref, sigma_with(mn, true), atol=1e-12)
+        end
+        @test isapprox(sig_ref, sigma_with(1, false), atol=1e-12)
+    end
+
     e_cepa, v_cepa = TPSChem.do_fois_cepa(v, cluster_ops, clustered_ham, thresh_foi=1e-3, max_iter=50, tol=1e-8, prescreen=false)
     display(e_cepa)
     @test isapprox(e_cepa[1], -18.329789530070542, atol=1e-8)
     
     e_pt = TPSChem.compute_pt2_energy(v, cluster_ops, clustered_ham, thresh_foi=1e-3)
+
+    #
+    # The blockwise PT2 kernel picks the same retained FOIS basis as the
+    # standard kernel and then rebuilds <X|H|0> exactly in that basis, so the
+    # two must agree to machine precision -- at every threshold, not just as
+    # thresh_foi -> 0.  Check the loose end of the range, where reusing the
+    # individually truncated form_sigma_block_expand contributions as the
+    # numerator used to leak error into E2.
+    for tf in (1e-2, 1e-3, 1e-5), pre in (false, true), ct in (false, true)
+        kw = (nbody=4, thresh_foi=tf, opt_ref=false, verbose=0,
+              prescreen=pre, compress_twice=ct)
+        @test isapprox(
+            TPSChem.compute_pt2_energy(v, cluster_ops, clustered_ham; kw...),
+            TPSChem.compute_pt2_energy_blockwise(v, cluster_ops, clustered_ham; kw...),
+            atol=1e-10)
+    end
     
     e_pt, v_pt = TPSChem.do_fois_pt2(v, cluster_ops, clustered_ham, thresh_foi=1e-3, max_iter=50, tol=1e-8)
     display(e_pt)

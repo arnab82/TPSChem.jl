@@ -132,24 +132,52 @@ function compute_pt1_wavefunction(σ_in::SPTstate{T,N,R}, ψ0::SPTstate{T,N,R}, 
 
     verbose < 2 || @printf(" compute correction... \n")
     flush(stdout)
-    
-    σ = σ - XF0 - scale(Sx, E0 .- F0)
-    
-    ψ1 = deepcopy(σ)
-    Fv = get_vector(Fdiag, 1)
-    for r in 1:R
-        ψ1r = get_vector(ψ1, r)
-        sr = get_vector(Sx, r)
-        
-        denom = F0[r] .- Fv .+ 1e-12  # this shift just protects against exact/accidental zeros
-        
-        ψ1r ./= denom
-        
-        set_vector!(ψ1, ψ1r[:,1], root=r)
+
+    #
+    # σ ← <X|H|0> - <X|F|0> - (E0-F0)<X|0>
+    #
+    # XF0 and Sx were both built from σ, so all three carry the same blocks and
+    # the same Tucker factors.  That makes this a pure core-wise update, exactly
+    # equal to `σ - XF0 - scale(Sx, E0 .- F0)` but without allocating three more
+    # copies of the FOIS -- the peak that limits multi-root runs.
+    dE = E0 .- F0
+    for (fock, configs) in σ
+        for (config, tuck) in configs
+            xf0 = XF0[fock][config].core
+            sx  = Sx[fock][config].core
+            for r in 1:R
+                @. tuck.core[r] -= xf0[r] + dE[r] * sx[r]
+            end
+        end
+    end
+    empty!(XF0.data)   # release the <X|F|0> and overlap copies before forming ψ1
+    empty!(Sx.data)
+
+    #
+    # ψ1 = σ / (F0 - Fdiag) and ecorr = <σ|ψ1>, formed in one pass.
+    #
+    # σ is not needed once ψ1 exists, so divide in place and reuse its storage
+    # rather than taking a further deepcopy and round-tripping every root
+    # through a dense get_vector/set_vector pair.
+    ψ1 = σ
+    ecorr = zeros(T, R)
+    for (fock, configs) in ψ1
+        for (config, tuck) in configs
+            fdiag = Fdiag[fock][config].core[1]
+            for r in 1:R
+                c = tuck.core[r]
+                acc = zero(T)
+                # the 1e-12 shift just protects against exact/accidental zeros
+                @inbounds for i in eachindex(c)
+                    num  = c[i]
+                    c[i] = num / (F0[r] - fdiag[i] + 1e-12)
+                    acc += num * c[i]
+                end
+                ecorr[r] += acc
+            end
+        end
     end
 
-    ecorr = orth_dot(σ, ψ1)
-  
     E2 = zeros(R)
     for r in 1:R
         E2[r] = E0[r] + ecorr[r]
@@ -1218,32 +1246,36 @@ end
 # =============================================================================
 # NEW PT2: block-by-block processing with Tucker rotation
 #
-# Key ideas vs _pt2_job / _pt2_job2:
+# Produces exactly the same E2 as _pt2_job (the reference kernel), for every
+# threshold and option combination -- see the parity test in test/test_spt.jl.
+# It gets there with a much smaller footprint:
 #
 #   1. Metadata-only Phase 1: groups (term, ket_fock, ket_tconfig) by sig_tconfig
 #      without storing any Tucker data (same as _pt2_job2 Phase 1).
 #
 #   2. Collect-then-add Phase 2: for each sig_tconfig, calls form_sigma_block_expand
 #      once per contributing (term, ket_fock, ket_tconfig), collects into a Vector,
-#      then calls nonorth_add ONCE — no O(K²) iterative SVD merging.
+#      then spans them ONCE — no O(K²) iterative SVD merging.  This selects the
+#      retained Tucker basis, exactly as _pt2_job does.
 #
-#   3. Tucker rotation: after building curr_tuck_H (= <X|H|0> in original Tucker
-#      basis), computes the pseudo-canonical rotation V by diagonalising the
-#      projected Fock matrix F_proj = U' * F_cluster * U for each cluster.
-#      Rotates the core tensors via transform_basis(core, V_rot) — equivalent to
-#      what build_sigma!(σ_canonical, ψ0, H) would return, but WITHOUT an
-#      additional full sweep over all reference blocks and H terms.
-#      Eliminates one build_sigma!(H) call per sig_tconfig.
+#   3. Only the factors of that basis are kept (nonorth_basis): the numerator
+#      <X|H|0> is then rebuilt in it term by term with form_sigma_block!, which
+#      is what build_sigma! does in the reference path.  It must be rebuilt
+#      rather than assembled from the Phase-2 expansions -- those are each
+#      truncated in their own Tucker basis, and the discarded pieces are not
+#      orthogonal to the retained basis, so reusing them biases E2 by O(thresh).
 #
-#   4. Lightweight F0: creates a minimal single-block SPTstate with canonical
-#      Tucker factors (zero cores) and calls build_sigma! with clustered_ham_0
-#      (1-body only, N terms instead of all H terms).
+#   4. Pseudo-canonical rotation V per cluster, from diagonalising the projected
+#      Fock matrix F_proj = U' * F_cluster * U.  Gives the PT denominators
+#      without materialising a Fdiag state.
 #
-#   5. Inline ecorr: computes E² contribution without materialising ψ₁.
+#   5. Lightweight F0 and overlap: single-block contractions against ψ0 reusing
+#      the calling thread's scratch, instead of the general threaded matvec.
+#
+#   6. Inline ecorr: computes E² contribution without materialising ψ₁.
 #
 # Memory vs _pt2_job: never holds the full FOIS SPTstate; peak per thread ≈
 #   metadata + one Tucker block at a time (instead of 4-6× full FOIS).
-# Speed vs _pt2_job2: replaces K_sig × build_sigma!(H) with K_sig × cheap F0.
 # =============================================================================
 
 """
@@ -1253,44 +1285,161 @@ end
 Compute the PT2 energy correction for one Fock sector using the Tucker-rotation
 approach. See module comment above for algorithm details.
 """
-function _pt2_job_blockwise(sig_fock, job, ket::SPTstate{T,N,R}, cluster_ops,
+@inline function _pt2_available_spaces(ket::SPTstate, sig_fock, ci)
+    pspace = ket.p_spaces[ci.idx]
+    qspace = ket.q_spaces[ci.idx]
+    p = haskey(pspace, sig_fock[ci.idx]) ? pspace[sig_fock[ci.idx]] : nothing
+    q = haskey(qspace, sig_fock[ci.idx]) ? qspace[sig_fock[ci.idx]] : nothing
+    p === nothing && return q === nothing ? () : (q,)
+    q === nothing && return (p,)
+    return (p, q)
+end
+
+@inline function _pt2_target_tconfig(ket_tconfig::TuckerConfig{N}, clusters,
+                                     prod) where {N}
+    config = ntuple(Val(N)) do i
+        @inbounds for j in eachindex(clusters)
+            clusters[j].idx == i && return prod[j]
+        end
+        return ket_tconfig.config[i]
+    end
+    return TuckerConfig{N}(config)
+end
+
+function _spt_pt2_job_weight(job_item, ref::SPTstate, nbody)
+    sig_fock, jobs = job_item
+    weight = 0.0
+    for (terms, _, configs_ket) in jobs
+        ket_size = sum(length(tuck) for (_, tuck) in configs_ket; init=0)
+        for term in terms
+            length(term.clusters) <= nbody || continue
+            ntargets = 1
+            for ci in term.clusters
+                npq = Int(haskey(ref.p_spaces[ci.idx], sig_fock[ci.idx])) +
+                      Int(haskey(ref.q_spaces[ci.idx], sig_fock[ci.idx]))
+                ntargets *= npq
+            end
+            ntargets == 0 && continue
+            # Contraction cost grows with the ket Tucker rank, the number of P/Q
+            # destinations, and the integral tensor carried by the term.
+            weight += float(max(ket_size, 1)) * ntargets *
+                      max(length(term.ints), 1)
+        end
+    end
+    return max(weight, 1.0)
+end
+
+function _spt_pt2_thread_buckets(jobs_chunk, ref, nbody, nt)
+    buckets = [similar(jobs_chunk, 0) for _ in 1:nt]
+    loads = zeros(Float64, nt)
+    weighted_jobs = [(job, _spt_pt2_job_weight(job, ref, nbody))
+                     for job in jobs_chunk]
+    sort!(weighted_jobs; by=last, rev=true)
+    for (job, weight) in weighted_jobs
+        slot = argmin(loads)
+        push!(buckets[slot], job)
+        loads[slot] += weight
+    end
+    return buckets
+end
+
+"""
+    _pt2_accumulate_block!(bra_tuck, sig_fock, sig_tconfig, contributions,
+                           cluster_ops, scratch)
+
+Accumulate `Σ_k <X|term_k|ket_k>` into `bra_tuck.core`, where `X` is the block
+`(sig_fock, sig_tconfig)` spanned by `bra_tuck.factors` and `contributions` is a
+list of `(term, ket_fock, ket_tconfig, ket_tuck)` tuples that have already been
+checked with `check_term`.
+
+`form_sigma_block!` returns `bra core + contribution`, so the bra it is handed
+must have a zero core; the returned cores are accumulated separately.  This is
+the same term-by-term construction `build_sigma!` performs, restricted to a
+single destination block.
+"""
+function _pt2_accumulate_block!(bra_tuck::Tucker{T,N,R}, sig_fock, sig_tconfig,
+                                contributions, cluster_ops, scratch) where {T,N,R}
+    zero_cores = ntuple(r -> zeros(T, size(bra_tuck.core[r])), R)
+    bra_basis  = Tucker{T,N,R}(zero_cores, bra_tuck.factors)
+    for (term, ket_fock, ket_tconfig, ket_tuck) in contributions
+        add!(bra_tuck.core,
+             form_sigma_block!(term, cluster_ops, sig_fock, sig_tconfig,
+                               ket_fock, ket_tconfig, bra_basis, ket_tuck,
+                               scratch))
+    end
+    return bra_tuck
+end
+
+
+function _pt2_build_f0_block!(bra_tuck::Tucker{T,N,R}, sig_fock,
+                              sig_tconfig, ket::SPTstate{T,N,R}, cluster_ops,
+                              clustered_ham_0, scratch) where {T,N,R}
+    # form_sigma_block! treats the bra core as an initial value.  Keep an
+    # immutable zero-core basis object for each contribution and accumulate the
+    # returned cores separately in bra_tuck.
+    zero_cores = ntuple(r -> zeros(T, size(bra_tuck.core[r])), R)
+    bra_basis = Tucker{T,N,R}(zero_cores, bra_tuck.factors)
+    for (ket_fock, ket_tconfigs) in ket
+        ftrans = sig_fock - ket_fock
+        haskey(clustered_ham_0, ftrans) || continue
+        for (ket_tconfig, ket_tuck) in ket_tconfigs
+            for term in clustered_ham_0[ftrans]
+                check_term(term, sig_fock, sig_tconfig, ket_fock,
+                           ket_tconfig) || continue
+                contribution = form_sigma_block!(
+                    term, cluster_ops, sig_fock, sig_tconfig, ket_fock,
+                    ket_tconfig, bra_basis, ket_tuck, scratch)
+                add!(bra_tuck.core, contribution)
+            end
+        end
+    end
+    return bra_tuck
+end
+
+function _pt2_overlap_cores(ket::SPTstate{T,N,R}, sig_fock, sig_tconfig,
+                            factors) where {T,N,R}
+    haskey(ket, sig_fock) || return nothing
+    haskey(ket[sig_fock], sig_tconfig) || return nothing
+    ref_tuck = ket[sig_fock][sig_tconfig]
+    overlaps = ntuple(i -> ref_tuck.factors[i]' * factors[i], N)
+    return ntuple(r -> transform_basis(ref_tuck.core[r], overlaps), R)
+end
+
+function _pt2_job_blockwise!(ecorr::Vector{T}, scratch, sig_fock, job,
+                        ket::SPTstate{T,N,R}, cluster_ops,
                         clustered_ham, clustered_ham_0::ClusteredOperator{N},
                         nbody, thresh, max_number, E0::Vector{T}, F0::Vector{T},
-                        prescreen::Bool, H0::String) where {T,N,R}
+                        prescreen::Bool, H0::String;
+                        compress_twice::Bool=false) where {T,N,R}
 
     # ------------------------------------------------------------------
     # Phase 1: group (term, ket_fock, ket_tconfig) metadata by sig_tconfig.
     # No Tucker data stored — just lightweight tuples.
+    #
+    # Note there is deliberately no `nbody` filter here.  `nbody` selects which
+    # terms may *generate* FOIS blocks, but the PT2 numerator in each retained
+    # block is the exact <X|H|0> over the whole Hamiltonian -- that is what the
+    # reference path does, since its `build_sigma!` call takes the default
+    # nbody=4 (all terms, 4-body being the highest) regardless of the `nbody`
+    # passed to compute_pt2_energy.  The filter is applied in phase 2a, where
+    # the basis is chosen.
     # ------------------------------------------------------------------
-    tconfigs_to_process = Dict{TuckerConfig{N}, Vector{Vector{Any}}}()
+    Contribution = Tuple{ClusteredTerm{T},FockConfig{N},TuckerConfig{N},Tucker{T,N,R}}
+    tconfigs_to_process = Dict{TuckerConfig{N},Vector{Contribution}}()
 
     for jobi in job
         terms, ket_fock, ket_tconfigs = jobi
         for term in terms
-            length(term.clusters) <= nbody || continue
-            for (ket_tconfig, _) in ket_tconfigs
-                available = []
-                for ci in term.clusters
-                    tmp = []
-                    haskey(ket.p_spaces[ci.idx], sig_fock[ci.idx]) &&
-                        push!(tmp, ket.p_spaces[ci.idx][sig_fock[ci.idx]])
-                    haskey(ket.q_spaces[ci.idx], sig_fock[ci.idx]) &&
-                        push!(tmp, ket.q_spaces[ci.idx][sig_fock[ci.idx]])
-                    push!(available, tmp)
-                end
+            available = map(ci -> _pt2_available_spaces(ket, sig_fock, ci), term.clusters)
+            any(isempty, available) && continue
+            for (ket_tconfig, ket_tuck) in ket_tconfigs
                 for prod in Iterators.product(available...)
-                    sig_tconfig_arr = [ket_tconfig.config...]
-                    for cidx in 1:length(term.clusters)
-                        ci = term.clusters[cidx]
-                        sig_tconfig_arr[ci.idx] = prod[cidx]
-                    end
-                    sig_tconfig = TuckerConfig(sig_tconfig_arr)
-                    entry = [term, ket_fock, ket_tconfig]
-                    if haskey(tconfigs_to_process, sig_tconfig)
-                        push!(tconfigs_to_process[sig_tconfig], entry)
-                    else
-                        tconfigs_to_process[sig_tconfig] = [entry]
-                    end
+                    sig_tconfig = _pt2_target_tconfig(ket_tconfig, term.clusters, prod)
+                    check_term(term, sig_fock, sig_tconfig, ket_fock,
+                               ket_tconfig) || continue
+                    entry = (term, ket_fock, ket_tconfig, ket_tuck)
+                    push!(get!(() -> Contribution[], tconfigs_to_process,
+                               sig_tconfig), entry)
                 end
             end
         end
@@ -1299,18 +1448,20 @@ function _pt2_job_blockwise(sig_fock, job, ket::SPTstate{T,N,R}, cluster_ops,
     # ------------------------------------------------------------------
     # Phase 2: per sig_tconfig — build H Tucker, rotate, compute ecorr
     # ------------------------------------------------------------------
-    ecorr    = zeros(T, R)
     clusters = ket.clusters
 
     for (sig_tconfig, contributions) in tconfigs_to_process
 
-        # -- 2a. Call form_sigma_block_expand for each contribution; collect Tucker blocks --
-        tucks_H = Tucker{T,N,R}[]
-        for entry in contributions
-            term, ket_fock, ket_tconfig = entry[1], entry[2], entry[3]
-            ket_tuck = ket[ket_fock][ket_tconfig]
+        # -- 2a. Build the retained Tucker basis exactly as _pt2_job does:
+        #        compress every term contribution, then combine once.  Only the
+        #        compressed blocks are kept; each raw expansion is released as
+        #        soon as it has been compressed.
+        basis_tucks = Tucker{T,N,R}[]
+        for (term, ket_fock, ket_tconfig, ket_tuck) in contributions
 
-            check_term(term, sig_fock, sig_tconfig, ket_fock, ket_tconfig) || continue
+            # `nbody` restricts which terms may generate a FOIS block; the
+            # numerator built in 2e still uses every term.
+            length(term.clusters) <= nbody || continue
 
             if prescreen
                 bound = calc_bound(term, cluster_ops,
@@ -1328,26 +1479,44 @@ function _pt2_job_blockwise(sig_fock, job, ket::SPTstate{T,N,R}, cluster_ops,
             length(sig_tuck) == 0 && continue
             norm(sig_tuck)   <  thresh && continue
 
-            push!(tucks_H, sig_tuck)
+            # _pt2_job compresses each term contribution before contributions to
+            # the same destination block are combined.  Compressing only after
+            # the sum selects a different retained basis (the operations do not
+            # commute), so keep the reference order.
+            sig_tuck = compress(sig_tuck, thresh=thresh)
+            length(sig_tuck) == 0 && continue
+
+            push!(basis_tucks, sig_tuck)
         end
 
-        isempty(tucks_H) && continue
+        isempty(basis_tucks) && continue
 
-        # -- 2b. Combine H Tucker blocks (collect-then-add — no iterative SVD).
-        #        No compression here: compressing <X|H|0> before the Tucker rotation
-        #        introduces truncation error in H that the reference (build_sigma!) avoids.
-        curr_tuck_H = length(tucks_H) == 1 ? only(tucks_H) : nonorth_add(tucks_H)
-        norm(curr_tuck_H) < thresh && continue
+        # -- 2b. The retained basis for this block.  Only the Tucker *factors*
+        #        are needed from here on — every core is rebuilt exactly below —
+        #        so in the common case take the factors-only path and skip
+        #        accumulating a core that would immediately be discarded.
+        basis_factors = if length(basis_tucks) == 1
+            # _pt2_job stores a lone contribution directly, without the extra
+            # compression, so do the same here.
+            collect(only(basis_tucks).factors)
+        elseif compress_twice
+            # compress() truncates on the core, so this branch has to build it.
+            collect(compress(nonorth_add(basis_tucks), thresh=thresh).factors)
+        else
+            nonorth_basis(basis_tucks)
+        end
+        empty!(basis_tucks)
+        core_dims = ntuple(i -> size(basis_factors[i], 2), N)
+        any(iszero, core_dims) && continue
 
         # -- 2c. Pseudo-canonical rotations V: diagonalise U'*F*U for each cluster.
         #        V_rot[ci.idx] is the ki×ki orthogonal rotation matrix.
         #        Fdiag_core[i1,...,iN] = Σ_ci λ_ci[i_ci]  (sum of cluster eigenvalues)
-        core_dims  = size(curr_tuck_H.core[1])
         V_rot      = Vector{Matrix{T}}(undef, N)
         Fdiag_core = zeros(T, core_dims)
 
         for ci in clusters
-            Ui = curr_tuck_H.factors[ci.idx]
+            Ui = basis_factors[ci.idx]
             ki = size(Ui, 2)
             F_ci   = cluster_ops[ci.idx][H0][(sig_fock[ci.idx], sig_fock[ci.idx])][sig_tconfig[ci.idx], sig_tconfig[ci.idx]]
             F_proj = Ui' * F_ci * Ui
@@ -1363,25 +1532,40 @@ function _pt2_job_blockwise(sig_fock, job, ket::SPTstate{T,N,R}, cluster_ops,
             end
         end
 
-        # -- 2d. Tucker rotation: rotate H cores into canonical basis.
-        #        transform_basis(core, V_rot) applies rotations along each cluster
-        #        dimension — equivalent to build_sigma!(σ_canon, ψ0, H) by linearity.
-        H_cores_rot = ntuple(r -> transform_basis(curr_tuck_H.core[r], V_rot), R)
+        # -- 2d. Canonical Tucker factors for this block.
+        U_canon = ntuple(i -> basis_factors[i] * V_rot[i], N)
 
-        # -- 2e. Minimal single-block SPTstate with canonical Tucker factors (zero cores)
-        #        for F0 and overlap Sx computation.
-        U_canon    = ntuple(i -> curr_tuck_H.factors[i] * V_rot[i], N)
-        core_zeros = ntuple(_ -> zeros(T, core_dims), R)
+        # -- 2e. <X|H|0> in the canonical basis.
+        #
+        #        This has to be the *exact* matrix element, not the sum of the
+        #        truncated expansions that selected the basis above.  Projection
+        #        onto the retained basis is linear, so Σ_k P(H_k|0>) is equal to
+        #        P(Σ_k H_k|0>) — but only for untruncated H_k|0>.
+        #        form_sigma_block_expand discards singular vectors below
+        #        `prescreen` in each contribution's own Tucker basis, and those
+        #        discarded pieces are not orthogonal to the retained basis, so
+        #        reusing them here leaks a truncation error into the numerator
+        #        that the standard kernel does not have.  Rebuilding with
+        #        form_sigma_block! costs one small dense contraction per
+        #        contribution and reproduces build_sigma! term for term.
+        H_block = Tucker{T,N,R}(ntuple(_ -> zeros(T, core_dims), R), U_canon)
+        _pt2_accumulate_block!(H_block, sig_fock, sig_tconfig, contributions,
+                               cluster_ops, scratch)
+        H_cores_rot = H_block.core
 
-        sig_f0 = SPTstate(ket.clusters, ket.p_spaces, ket.q_spaces, T=T, R=R)
-        add_fockconfig!(sig_f0, sig_fock)
-        sig_f0[sig_fock][sig_tconfig] = Tucker{T,N,R}(core_zeros, U_canon)
+        # -- 2f. Overlap Sx = <ψ0 | X_canonical>.  Compute just this block;
+        #        constructing and deep-copying a temporary SPTstate per block is
+        #        unnecessary and dominates allocations for many small sectors.
+        Sx_cores = _pt2_overlap_cores(ket, sig_fock, sig_tconfig, U_canon)
 
-        # -- 2f. Overlap Sx = <ψ0 | X_canonical> (computed before filling F0 cores) --
-        Sx = project_into_new_basis(ket, sig_f0)
-
-        # -- 2g. F0 in canonical basis — only 1-body operator, cheap --
-        build_sigma!(sig_f0, ket, cluster_ops, clustered_ham_0)
+        # -- 2g. <X|F|0> in the canonical basis — contract this one block
+        #        serially using the scratch buffers owned by the outer PT2
+        #        thread.  Calling the general threaded build_sigma! here
+        #        allocated ten fresh buffers and scheduling/output containers
+        #        for every FOIS block.
+        F0_block = Tucker{T,N,R}(ntuple(_ -> zeros(T, core_dims), R), U_canon)
+        _pt2_build_f0_block!(F0_block, sig_fock, sig_tconfig, ket, cluster_ops,
+                             clustered_ham_0, scratch)
 
         # -- 2h. Compute ecorr inline (no ψ₁ materialisation, no deepcopy) --
         #        ecorr[r] += Σ_i  num[r,i]² / (F0[r] − Fdiag_core[i] + ε)
@@ -1390,14 +1574,12 @@ function _pt2_job_blockwise(sig_fock, job, ket::SPTstate{T,N,R}, cluster_ops,
         nFOIS = length(Fv)
 
         # Read Sx cores (may be zero if ψ0 doesn't overlap with sig_f0)
-        has_Sx = haskey(Sx, sig_fock) && haskey(Sx[sig_fock], sig_tconfig)
-        F0_block = sig_f0[sig_fock][sig_tconfig]
-        Sx_block = has_Sx ? Sx[sig_fock][sig_tconfig] : nothing
+        has_Sx = Sx_cores !== nothing
 
         for r in 1:R
             H_r  = vec(H_cores_rot[r])
             F0_r = vec(F0_block.core[r])
-            Sx_r = has_Sx ? vec(Sx_block.core[r]) : nothing
+            Sx_r = has_Sx ? vec(Sx_cores[r]) : nothing
 
             e_corr_r = zero(T)
             dE       = E0[r] - F0[r]
@@ -1413,18 +1595,31 @@ function _pt2_job_blockwise(sig_fock, job, ket::SPTstate{T,N,R}, cluster_ops,
     return ecorr
 end
 
+function _pt2_job_blockwise(sig_fock, job, ket::SPTstate{T,N,R}, cluster_ops,
+                        clustered_ham, clustered_ham_0::ClusteredOperator{N},
+                        nbody, thresh, max_number, E0::Vector{T}, F0::Vector{T},
+                        prescreen::Bool, H0::String;
+                        compress_twice::Bool=false) where {T,N,R}
+    scratch = [zeros(T, 1000) for _ in 1:10]
+    return _pt2_job_blockwise!(zeros(T, R), scratch, sig_fock, job, ket, cluster_ops,
+                               clustered_ham, clustered_ham_0, nbody, thresh,
+                               max_number, E0, F0, prescreen, H0,
+                               compress_twice=compress_twice)
+end
+
 
 """
     compute_pt2_energy_blockwise(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
                                   H0="Hcmf", nbody=4, thresh_foi=1e-6,
                                   max_number=nothing, opt_ref=true, ci_tol=1e-6,
-                                  verbose=1, prescreen=false) -> E2
+                                  verbose=1, prescreen=false,
+                                  compress_twice=false) -> E2
 
 Compute PT2 energy using the block-by-block Tucker-rotation approach
-(`_pt2_job_blockwise`). Numerically equivalent to `compute_pt2_energy` /
-`compute_pt2_energy2` but with lower peak memory (no full FOIS SPTstate per
-thread) and faster for many-block Fock sectors (no redundant build_sigma!(H)
-per FOIS block).
+(`_pt2_job_blockwise`). Agrees with `compute_pt2_energy` to machine precision
+for every `thresh_foi`, `prescreen` and `compress_twice` setting -- it selects
+the same retained FOIS basis and rebuilds the same exact numerator in it -- but
+never materialises a full FOIS `SPTstate` per thread.
 """
 function compute_pt2_energy_blockwise(ref::SPTstate{T,N,R}, cluster_ops, clustered_ham;
                                   H0         = "Hcmf",
@@ -1434,7 +1629,8 @@ function compute_pt2_energy_blockwise(ref::SPTstate{T,N,R}, cluster_ops, cluster
                                   opt_ref    = true,
                                   ci_tol     = 1e-6,
                                   verbose    = 1,
-                                  prescreen  = false) where {T,N,R}
+                                  prescreen  = false,
+                                  compress_twice = false) where {T,N,R}
     println()
     println(" |...................................SPT-PT2 (fast).......................................")
     verbose < 1 || println(" H0          : ", H0        )
@@ -1474,32 +1670,18 @@ function compute_pt2_energy_blockwise(ref::SPTstate{T,N,R}, cluster_ops, cluster
         end
     end
 
-    # Build job list (identical logic to compute_pt2_energy)
-    clusters = ref_vec.clusters
-    jobs = Dict{FockConfig{N}, Vector{Tuple}}()
-    for (fock_ket, configs_ket) in ref_vec.data
-        for (ftrans, terms) in clustered_ham
-            fock_x = ftrans + fock_ket
-            all(f[1] >= 0 for f in fock_x) || continue
-            all(f[2] >= 0 for f in fock_x) || continue
-            all(f[1] <= length(clusters[fi]) for (fi, f) in enumerate(fock_x)) || continue
-            all(f[2] <= length(clusters[fi]) for (fi, f) in enumerate(fock_x)) || continue
-            job_input = (terms, fock_ket, configs_ket)
-            if haskey(jobs, fock_x)
-                push!(jobs[fock_x], job_input)
-            else
-                jobs[fock_x] = [job_input]
-            end
-        end
-    end
-
-    jobs_vec = collect(pairs(jobs))
+    jobs_vec = _spt_make_fock_jobs(ref_vec, cluster_ops, clustered_ham;
+                                   require_cluster_space=false)
     println(" Number of jobs:    ", length(jobs_vec))
     println(" Number of threads: ", Threads.nthreads())
     BLAS.set_num_threads(1)
     flush(stdout)
 
-    e2_thread = [zeros(T, R) for _ in 1:Threads.maxthreadid()]
+    nt = Threads.nthreads(:default)
+    e2_thread = [zeros(T, R) for _ in 1:nt]
+    pt2_scratch = [[zeros(T, 1000) for _ in 1:10]
+                   for _ in 1:nt]
+    thread_jobs = _spt_pt2_thread_buckets(jobs_vec, ref_vec, nbody, nt)
 
     tmp = max(1, Int(round(length(jobs_vec) / 100)))
     verbose < 2 || println(" |----------------------------------------------------------------------------------------------------|")
@@ -1507,20 +1689,25 @@ function compute_pt2_energy_blockwise(ref::SPTstate{T,N,R}, cluster_ops, cluster
     verbose < 2 || print(" |")
 
     nprinted = 0
+    njobs_done = 0
     alloc = @allocated t = @elapsed begin
-        @Threads.threads :static for (jobi, (fock_sig, job)) in collect(enumerate(jobs_vec))
-            tid = Threads.threadid()
-            e2_thread[tid] .+= _pt2_job_blockwise(fock_sig, job, ref_vec,
-                                               cluster_ops, clustered_ham,
-                                               clustered_ham_0,
-                                               nbody, thresh_foi, max_number,
-                                               E0, F0, prescreen, H0)
-            if verbose > 1 && jobi % tmp == 0
-                lock(lk)
-                try
-                    print("-"); nprinted += 1; flush(stdout)
-                finally
-                    unlock(lk)
+        @Threads.threads :static for slot in 1:nt
+            for (fock_sig, job) in thread_jobs[slot]
+                _pt2_job_blockwise!(e2_thread[slot], pt2_scratch[slot], fock_sig,
+                                    job, ref_vec, cluster_ops, clustered_ham,
+                                    clustered_ham_0, nbody, thresh_foi,
+                                    max_number, E0, F0, prescreen, H0,
+                                    compress_twice=compress_twice)
+                if verbose > 1
+                    lock(lk)
+                    try
+                        njobs_done += 1
+                        if njobs_done % tmp == 0
+                            print("-"); nprinted += 1; flush(stdout)
+                        end
+                    finally
+                        unlock(lk)
+                    end
                 end
             end
         end
