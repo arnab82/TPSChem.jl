@@ -156,15 +156,23 @@ using Random
     @test isapprox(sort(e2_sh), sort(e2_loc), atol=1e-8)
 
     # --- end-to-end never-gather driver vs single-node subspace_product_tucker
-    # The full 6-iteration loop (run twice) dominates this file's runtime; its
-    # components (solver, FOIS, PT1) are already tested above at machine
-    # precision. Gate it behind the heavy-multinode flag to keep default CI fast.
+    # The full loop (run twice) dominates this file's runtime; its components
+    # (solver, FOIS, PT1) are already tested above at machine precision. Gate it
+    # behind the heavy-multinode flag to keep default CI fast.
+    #
+    # max_iter is 10, not 6.  Neither run reaches tol_tucker=1e-7 even at 10
+    # (the energy is still descending: -10.18493244 at 6 iterations,
+    # -10.18495302 at 10), so this cannot assert convergence.  What it can
+    # assert -- and what actually matters -- is that the sharded driver follows
+    # the *same trajectory* as the single-node one: after 10 identical
+    # iterations the energies agree to 8.9e-15, so the tolerance below is 1e-10
+    # rather than the old 1e-6, which was loose enough to hide real drift.
     run_heavy = lowercase(strip(get(ENV, "TPSCHEM_TEST_HEAVY_MULTINODE", "0"))) in
         ("1", "true", "yes", "on")
     dref_out = nothing
     if run_heavy
     v0 = TPSChem.SPTstate(clusters, FockConfig(init_fspace), cluster_bases)   # R=1 CMF start
-    common = (max_iter=6, nbody=4, H0="Hcmf", thresh_var=1e-3, thresh_foi=1e-4,
+    common = (max_iter=10, nbody=4, H0="Hcmf", thresh_var=1e-3, thresh_foi=1e-4,
               thresh_pt=1e-3, ci_conv=1e-7, do_pt=true, resolve_ss=false,
               tol_tucker=1e-7)
     e_loc, _ = TPSChem.subspace_product_tucker(deepcopy(v0), cluster_ops, clustered_ham;
@@ -172,8 +180,9 @@ using Random
     e_drv, dref_out = TPSChem.subspace_product_tucker_sharded(deepcopy(v0), cluster_ops,
                                             clustered_ham; common..., workers=workers(),
                                             verbose=0)
-    @printf("    sharded SPT driver vs single-node: E=%.10f vs %.10f\n", e_drv[1], e_loc[1])
-    @test isapprox(e_drv[1], e_loc[1], atol=1e-6)
+    @printf("    sharded SPT driver vs single-node: E=%.10f vs %.10f  (dE=%.2e)\n",
+            e_drv[1], e_loc[1], abs(e_drv[1]-e_loc[1]))
+    @test isapprox(e_drv[1], e_loc[1], atol=1e-10)
     else
         @info "Skipping heavy end-to-end sharded SPT driver test (set TPSCHEM_TEST_HEAVY_MULTINODE=1 to run)"
     end
