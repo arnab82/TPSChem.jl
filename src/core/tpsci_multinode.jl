@@ -157,20 +157,60 @@ function _get_cluster_ops_chunk(id::Symbol)
     return _TPSCI_SHARDED_CLUSTER_OPS[id]
 end
 
+"""
+    _ops_build_blas_threads(; core_budget)
+
+BLAS thread count to use *while building cluster operators*, chosen so that
+`Threads.nthreads() * blas_threads` stays within `core_budget` (the worker's
+core count by default, overridable with `TPSCHEM_OPS_CORE_BUDGET`).
+
+The builders are Julia-threaded over fock-space transitions (`_tdm_thread_map`),
+so both dimensions are live at once: 96 Julia threads gives BLAS 1, 8 Julia
+threads gives BLAS 12, a single Julia thread hands BLAS the whole node.  That
+last case is what the serial `compute_cluster_ops` does by inheriting the
+process default, and it is why the serial build is fast.
+
+What this must not do is what the distributed path did before -- clamp BLAS to 1
+unconditionally while providing no Julia threading, so each worker built its
+operators on one core.  That is the whole reason the distributed build ran
+orders of magnitude slower than the identical serial one.
+
+The clamp is still correct for the *solver* phases that share the `blas_threads`
+setting -- those are Julia-threaded already -- so the caller restores it once the
+build is done.
+"""
+function _ops_build_blas_threads(; core_budget::Int = _ops_core_budget())
+    jt = max(Threads.nthreads(), 1)
+    return max(1, core_budget ÷ jt)
+end
+
+function _ops_core_budget()
+    v = get(ENV, "TPSCHEM_OPS_CORE_BUDGET", "")
+    n = tryparse(Int, v)
+    return (n === nothing || n < 1) ? Sys.CPU_THREADS : n
+end
+
+
 function _compute_cluster_ops_chunk!(id::Symbol, assigned_bases, ints;
                                      verbose=1, blas_threads=1)
-    blas_threads === nothing || BLAS.set_num_threads(blas_threads)
-    local_ops = Dict{Int,ClusterOps{typeof(ints.h0)}}()
-    nbytes = OrderedDict{Int,Int}()
-    h_sectors = OrderedDict{Int,Set{Tuple{Int16,Int16}}}()
-    for cb in assigned_bases
-        ops_i = _compute_cluster_ops_for_cluster(cb, ints, verbose=verbose)
-        local_ops[cb.cluster.idx] = ops_i
-        nbytes[cb.cluster.idx] = _cluster_ops_nbytes(ops_i)
-        h_sectors[cb.cluster.idx] = _cluster_ops_h_sectors(ops_i)
+    prev_blas = BLAS.get_num_threads()
+    BLAS.set_num_threads(_ops_build_blas_threads())
+    try
+        local_ops = Dict{Int,ClusterOps{typeof(ints.h0)}}()
+        nbytes = OrderedDict{Int,Int}()
+        h_sectors = OrderedDict{Int,Set{Tuple{Int16,Int16}}}()
+        for cb in assigned_bases
+            ops_i = _compute_cluster_ops_for_cluster(cb, ints, verbose=verbose)
+            local_ops[cb.cluster.idx] = ops_i
+            nbytes[cb.cluster.idx] = _cluster_ops_nbytes(ops_i)
+            h_sectors[cb.cluster.idx] = _cluster_ops_h_sectors(ops_i)
+        end
+        _store_cluster_ops_chunk!(id, local_ops)
+        return (nbytes=nbytes, h_sectors=h_sectors)
+    finally
+        # Leave the worker set up for the solver phases, which want BLAS at 1.
+        BLAS.set_num_threads(blas_threads === nothing ? prev_blas : blas_threads)
     end
-    _store_cluster_ops_chunk!(id, local_ops)
-    return (nbytes=nbytes, h_sectors=h_sectors)
 end
 
 function _cluster_ops_local_summary(id::Symbol)
@@ -354,18 +394,23 @@ end
 
 function _add_cmf_operators_chunk!(id::Symbol, assigned_bases, ints, Da, Db;
                                    verbose=0, blas_threads=1)
-    blas_threads === nothing || BLAS.set_num_threads(blas_threads)
-    local_ops = _get_cluster_ops_chunk(id)
-    nbytes = OrderedDict{Int,Int}()
-    for cb in assigned_bases
-        ci = cb.cluster
-        haskey(local_ops, ci.idx) ||
-            error("Worker $(Distributed.myid()) does not own ClusterOps for cluster $(ci.idx)")
-        _add_cmf_operator_for_cluster!(local_ops[ci.idx], cb, ints, Da, Db;
-                                       verbose=verbose)
-        nbytes[ci.idx] = _cluster_ops_nbytes(local_ops[ci.idx])
+    prev_blas = BLAS.get_num_threads()
+    BLAS.set_num_threads(_ops_build_blas_threads())
+    try
+        local_ops = _get_cluster_ops_chunk(id)
+        nbytes = OrderedDict{Int,Int}()
+        for cb in assigned_bases
+            ci = cb.cluster
+            haskey(local_ops, ci.idx) ||
+                error("Worker $(Distributed.myid()) does not own ClusterOps for cluster $(ci.idx)")
+            _add_cmf_operator_for_cluster!(local_ops[ci.idx], cb, ints, Da, Db;
+                                           verbose=verbose)
+            nbytes[ci.idx] = _cluster_ops_nbytes(local_ops[ci.idx])
+        end
+        return nbytes
+    finally
+        BLAS.set_num_threads(blas_threads === nothing ? prev_blas : blas_threads)
     end
-    return nbytes
 end
 
 """
