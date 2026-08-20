@@ -1,6 +1,6 @@
 # Sharded TPS-CEPA sweep over FOI thresholds for an Fe2S2 model.
 #
-# Launch (see generic_multinode_multithread.sh / run_multinode.sh):
+# Launch (see run_cepa_multinode_fe2s2.sh, its dedicated launcher):
 #   TPSCHEM_MACHINE_FILE=nodes.txt TPSCHEM_WORKER_THREADS=64 \
 #   julia --project=. examples/multinode/run_cepa_multinode_fe2s2.jl data_cmf_fe2s2.jld2
 #
@@ -139,7 +139,14 @@ cluster_bases = TPSChem.compute_cluster_eigenbasis_spin(
 )
 clustered_ham = TPSChem.extract_ClusteredTerms(ints, clusters)
 
-@printf("\nBuilding local cluster operators for the small reference solve...\n")
+# This builds the FULL cluster-operator set -- every cluster, full M, all
+# 3-body operators -- exactly what the distributed build below builds. Only
+# the CI *solve* that follows is small (a handful of roots); the build itself
+# is not, and it runs on the master alone before any worker helps. Operator
+# memory scales as M^2 (each 3-body array is M x M x norb^3), so at large M
+# this build is where the master's memory peaks. A misleading "small" label
+# here is exactly the kind of thing that hides an OOM until it happens.
+@printf("\nBuilding full cluster operators for the reference solve (dim(reference) is small, this build is not)...\n")
 flush(stdout)
 cluster_ops_ref = TPSChem.compute_cluster_ops(cluster_bases, ints)
 TPSChem.add_cmf_operators!(cluster_ops_ref, cluster_bases, ints, d1.a, d1.b)
@@ -156,7 +163,7 @@ eci, ref_vec, _ = TPSChem.tps_ci_direct(
 )
 
 cluster_ops_ref = nothing
-GC.gc()
+GC.gc(false)
 
 @printf("\nBuilding distributed cluster operators for sharded CEPA...\n")
 flush(stdout)

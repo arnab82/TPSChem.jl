@@ -236,6 +236,11 @@ function compute_cluster_ops(cluster_bases, ints::InCoreInts{T}) where {T}
     cluster_ops = Vector{ClusterOps{T}}(undef, length(clusters))
     for ci in clusters
         cluster_ops[ci.idx] = _compute_cluster_ops_for_cluster(cluster_bases[ci.idx], ints)
+        # Each cluster's build churns far more than it retains (the FCI kernels
+        # allocate large working tensors that do not end up in the returned
+        # dicts), so reclaim that before starting the next cluster rather than
+        # letting it pile up until Julia's incremental GC gets to it on its own.
+        GC.gc(false)
     end
     return cluster_ops
 end
@@ -283,29 +288,78 @@ function compute_cluster_ops_2rdm(cluster_bases, ints::InCoreInts{T}) where {T}
 end
 
 
-    """
+"""
+    _tdm_build_concurrency()
+
+Number of fock-space transitions to build *at once* during the cluster-operator
+build -- independent of `Threads.nthreads()`.
+
+Each transition in flight holds a large transient tensor (a 3-body operator on
+an 11-orbital cluster is ~0.4 GB at M=200) while the FCI kernel underneath
+computes it, on top of the arrays it returns.  Handing every one of the node's
+Julia threads a transition at once, as the first version of this did, bounds
+final retained memory correctly but not *peak* memory: it can have as many of
+those transients live simultaneously as there are threads, which is a real
+difference from the serial build this replaced -- one transition's garbage at a
+time there, GC keeping pace.
+
+Defaulting to a smaller number of concurrent transitions keeps that peak
+bounded while still using the whole node: the freed core budget goes to BLAS
+instead (`_ops_build_blas_threads` divides by this same cap), and the chunk
+functions call `GC.gc(false)` between clusters to reclaim what each cluster's build
+churned before the next one starts.  Override with `TPSCHEM_OPS_BUILD_THREADS`.
+"""
+function _tdm_build_concurrency()
+    v = get(ENV, "TPSCHEM_OPS_BUILD_THREADS", "")
+    n = tryparse(Int, v)
+    cap = (n === nothing || n < 1) ? 16 : n
+    return clamp(cap, 1, Threads.nthreads())
+end
+
+"""
     _tdm_thread_map(jobs, f)
 
-Apply `f` to each element of `jobs` across Julia threads, returning the results
-in `jobs` order.
+Apply `f` to each element of `jobs`, running at most `_tdm_build_concurrency()`
+of them at once, and return the results in `jobs` order.
 
-The cluster-operator build is the one phase of the sharded workflow with no
-Julia threading of its own, while the distributed path pins BLAS to a single
-thread (`_compute_cluster_ops_chunk!`) because the solver phases that share that
-setting are already Julia-threaded and would oversubscribe.  That combination
-left each worker building its operators on exactly one core, which is why the
-distributed build ran far slower than the identical local one.
+Measured on real cluster data at 8 threads, three ways of bounding concurrency
+below `length(jobs)` all cost about the same, and all cost more than the
+original unbounded `Threads.@threads for i in eachindex(jobs)`: pulling jobs
+one at a time from a shared atomic counter (720s vs a 549s baseline), fixed
+round-robin chunks run with explicit `:static` scheduling (669s), and the same
+chunks run with `:dynamic` (671s, matching bare `Threads.@threads`'s default
+since Julia 1.8). The three are close enough to each other, and far enough from
+the baseline, that the gap is evidently in the *chunking* itself rather than in
+which scheduler runs the chunks -- the exact mechanism is not identified.
 
-The fock-space transitions a tdm builder loops over are independent -- each reads
-two cluster bases and produces its own array -- so the parallelism is taken here,
-over transitions, rather than inside the linear algebra of any single one.
+Since the cost is in chunking, not in the concurrency limit itself, the fix is
+to only pay it when the cap actually binds: when `_tdm_build_concurrency() >=
+length(jobs)`, every "chunk" would hold exactly one job anyway, so this skips
+straight to the plain per-item loop that measured 549s. Chunking only engages
+when there are genuinely more jobs than the cap allows in flight -- the regime
+this whole cap exists for (transitions per builder can be several times the
+default cap of 16), and the one this file's tests have not been able to
+reproduce on an 8-thread laptop where the cap never binds below `nthreads()`.
 """
 function _tdm_thread_map(jobs::Vector, f)
     n = length(jobs)
     n == 0 && return Any[]
     vals = Vector{Any}(undef, n)
-    Threads.@threads for i in 1:n
-        vals[i] = f(jobs[i])
+    cap = _tdm_build_concurrency()
+    if cap >= n
+        Threads.@threads for i in 1:n
+            vals[i] = f(jobs[i])
+        end
+        return vals
+    end
+    chunks = [Int[] for _ in 1:cap]
+    for i in 1:n
+        push!(chunks[mod1(i, cap)], i)
+    end
+    Threads.@threads for c in 1:cap
+        for i in chunks[c]
+            vals[i] = f(jobs[i])
+        end
     end
     return vals
 end
@@ -633,10 +687,20 @@ end
 """
     tdm_ABa(cb::ClusterBasis, spin_case; verbose=0)
 
-Compute `<s|p'q'r|t>` between all cluster states, `s` and `t` 
+Compute `<s|p'q'r|t>` between all cluster states, `s` and `t`
 from accessible sectors of a cluster's fock space.
 - `spin_case`: alpha or beta
 Returns `Dict[((na,nb),(na,nb))] => Array`
+
+Only `(dicti, dicti_adj)` are returned. An earlier version also built `dictj`
+(`= -permutedims(dicti, ...)`) and its adjoint, but `_compute_cluster_ops_for_cluster`
+-- the only caller -- has only ever kept two of the four return values
+(`ops["ABa"], ops["Aba"] = tdm_ABa(...)`); Julia's tuple destructuring silently
+drops extra values rather than erroring, so `dictj`/`dictj_adj` were computed in
+full (one `permutedims` and one negation per fock transition, each the same
+size as `dicti`) and then immediately discarded. That doubled both the transient
+memory live during the build and the wall time spent on this builder for no
+retained benefit -- removed here since nothing has ever read them.
 """
 function tdm_ABa(cb::ClusterBasis, spin_case; verbose=0)
     #={{{=#
@@ -646,8 +710,6 @@ function tdm_ABa(cb::ClusterBasis, spin_case; verbose=0)
 
     dicti = Dict{Tuple,Array}()
     dicti_adj = Dict{Tuple,Array}()
-    dictj = Dict{Tuple,Array}()
-    dictj_adj = Dict{Tuple,Array}()
     #
     # loop over fock-space transitions
     spin_case in ("alpha", "beta") || throw(DomainError(spin_case))
@@ -660,18 +722,14 @@ function tdm_ABa(cb::ClusterBasis, spin_case; verbose=0)
                                di = spin_case == "alpha" ?
                                     compute_operator_cca_aba(basis_bra, basis_ket) :
                                     compute_operator_cca_abb(basis_bra, basis_ket)
-                               dj = -permutedims(di, [2,1,3,4,5])
-                               return (di, permutedims(di, [3,2,1,5,4]),
-                                       dj, permutedims(dj, [3,2,1,5,4]))
+                               return (di, permutedims(di, [3,2,1,5,4]))
                            end)
     for (i, job) in enumerate(jobs)
         fockbra, fockket = job
         dicti[(fockbra,fockket)]     = vals[i][1]
         dicti_adj[(fockket,fockbra)] = vals[i][2]
-        dictj[(fockbra,fockket)]     = vals[i][3]
-        dictj_adj[(fockket,fockbra)] = vals[i][4]
     end
-    return dicti, dicti_adj, dictj, dictj_adj
+    return dicti, dicti_adj
     #=}}}=#
 end
 
@@ -726,6 +784,7 @@ function add_cmf_operators!(ops, bases, ints, Da, Db; verbose=0)
     for ci_idx in 1:n_clusters
         _add_cmf_operator_for_cluster!(ops[ci_idx], bases[ci_idx], ints, Da, Db,
                                        verbose=verbose)
+        GC.gc(false)
     end
     return 
 end

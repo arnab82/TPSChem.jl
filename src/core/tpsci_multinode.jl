@@ -161,26 +161,31 @@ end
     _ops_build_blas_threads(; core_budget)
 
 BLAS thread count to use *while building cluster operators*, chosen so that
-`Threads.nthreads() * blas_threads` stays within `core_budget` (the worker's
-core count by default, overridable with `TPSCHEM_OPS_CORE_BUDGET`).
+`_tdm_build_concurrency() * blas_threads` stays within `core_budget` (the
+worker's core count by default, overridable with `TPSCHEM_OPS_CORE_BUDGET`).
 
-The builders are Julia-threaded over fock-space transitions (`_tdm_thread_map`),
-so both dimensions are live at once: 96 Julia threads gives BLAS 1, 8 Julia
-threads gives BLAS 12, a single Julia thread hands BLAS the whole node.  That
-last case is what the serial `compute_cluster_ops` does by inheriting the
-process default, and it is why the serial build is fast.
+The builders are Julia-threaded over fock-space transitions
+(`_tdm_thread_map`), but only up to `_tdm_build_concurrency()` at once, not
+`Threads.nthreads()` -- see that function for why concurrency is capped rather
+than using every thread. The core budget freed by capping concurrency goes to
+BLAS instead: with the default cap of 16 on a 96-core node this gives BLAS 6
+per concurrent transition, still using the whole node, but as 16 x 6 rather
+than 96 x 1. A single concurrent transition hands BLAS the whole node, which is
+what the serial `compute_cluster_ops` does by inheriting the process default,
+and it is why the serial build is fast.
 
-What this must not do is what the distributed path did before -- clamp BLAS to 1
-unconditionally while providing no Julia threading, so each worker built its
-operators on one core.  That is the whole reason the distributed build ran
-orders of magnitude slower than the identical serial one.
+What this must not do is what the distributed path did before this and the
+concurrency cap were added: clamp BLAS to 1 unconditionally while providing no
+Julia threading at all, so each worker built its operators on one core. That is
+the whole reason the distributed build ran orders of magnitude slower than the
+identical serial one.
 
-The clamp is still correct for the *solver* phases that share the `blas_threads`
-setting -- those are Julia-threaded already -- so the caller restores it once the
-build is done.
+The clamp is still correct for the *solver* phases that share the
+`blas_threads` setting -- those are Julia-threaded already -- so the caller
+restores it once the build is done.
 """
 function _ops_build_blas_threads(; core_budget::Int = _ops_core_budget())
-    jt = max(Threads.nthreads(), 1)
+    jt = max(_tdm_build_concurrency(), 1)
     return max(1, core_budget ÷ jt)
 end
 
@@ -204,6 +209,9 @@ function _compute_cluster_ops_chunk!(id::Symbol, assigned_bases, ints;
             local_ops[cb.cluster.idx] = ops_i
             nbytes[cb.cluster.idx] = _cluster_ops_nbytes(ops_i)
             h_sectors[cb.cluster.idx] = _cluster_ops_h_sectors(ops_i)
+            # Reclaim this cluster's build churn before starting the next --
+            # see _tdm_build_concurrency for why that churn can be large.
+            GC.gc(false)
         end
         _store_cluster_ops_chunk!(id, local_ops)
         return (nbytes=nbytes, h_sectors=h_sectors)
@@ -406,6 +414,7 @@ function _add_cmf_operators_chunk!(id::Symbol, assigned_bases, ints, Da, Db;
             _add_cmf_operator_for_cluster!(local_ops[ci.idx], cb, ints, Da, Db;
                                            verbose=verbose)
             nbytes[ci.idx] = _cluster_ops_nbytes(local_ops[ci.idx])
+            GC.gc(false)
         end
         return nbytes
     finally
