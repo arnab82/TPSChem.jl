@@ -1,24 +1,12 @@
 """
-    _open_matvec_thread_buckets(jobs_vec, nt)
+    _open_matvec_job_cost(job)
 
-Split the FOIS jobs into `nt` cost-balanced buckets, heaviest first.  The cost
-of one output Fock sector is estimated as the number of ket coefficients it
+Estimated cost of one output Fock sector: the number of ket coefficients it
 consumes times the number of terms coupling them, which is what
-`_open_matvec_thread_job` loops over.
+`_open_matvec_thread_job` loops over.  Used to visit the heaviest jobs first;
+the balancing itself comes from pulling jobs dynamically, so this only has to
+rank jobs roughly, not predict their runtime.
 """
-function _open_matvec_thread_buckets(jobs_vec, nt::Int)
-    buckets = [similar(jobs_vec, 0) for _ in 1:nt]
-    loads = zeros(Int, nt)
-    costs = [(job, _open_matvec_job_cost(job)) for job in jobs_vec]
-    sort!(costs; by=last, rev=true)
-    for (job, c) in costs
-        slot = argmin(loads)
-        push!(buckets[slot], job)
-        loads[slot] += c
-    end
-    return buckets
-end
-
 function _open_matvec_job_cost(job)
     c = 0
     for (terms, _, configs_ket) in job[2]
@@ -101,8 +89,14 @@ function open_matvec_thread(ci_vector::TPSCIstate{T,N,R}, cluster_ops, clustered
     tmp1 = Vector{MVector{N,Int16}}()
     tmp2 = Vector{MVector{N,Int16}}()
 
+    # Size the per-thread state by the default pool, not maxthreadid(): the
+    # :static loop below only runs on default-pool threads, and each slot costs
+    # ~2 MB of scratch, so counting interactive threads wastes that per phantom
+    # slot.  The scratch vectors are resize!d on use (see contract_matvec_thread),
+    # so they only need a modest starting capacity rather than a worst-case one:
+    # at 96 threads the old 10000-element start reserved ~190 MB per call.
     jobs_out = Vector{TPSCIstate{T,N,R}}()
-    for tid in 1:Threads.maxthreadid()
+    for tid in 1:Threads.nthreads()
         push!(jobs_out, TPSCIstate(clusters, T=T, R=R))
         push!(scr1, zeros(T, 1000))
         push!(scr2, zeros(T, 1000))
@@ -112,11 +106,11 @@ function open_matvec_thread(ci_vector::TPSCIstate{T,N,R}, cluster_ops, clustered
         push!(tmp2, zeros(Int16,N))
 
         tmp = Vector{Vector{T}}() 
-        [push!(tmp, zeros(T, 10000)) for i in 1:nscr]
+        [push!(tmp, zeros(T, 512)) for i in 1:nscr]
         push!(scr_f, tmp)
 
         tmp = Vector{Vector{Int16}}() 
-        [push!(tmp, zeros(Int16,10000)) for i in 1:nscr]
+        [push!(tmp, zeros(Int16, 512)) for i in 1:nscr]
         push!(scr_i, tmp)
 
         tmp = Vector{MVector{N,Int16}}() 
@@ -136,28 +130,53 @@ function open_matvec_thread(ci_vector::TPSCIstate{T,N,R}, cluster_ops, clustered
     #@time for job in jobs_vec
     #@qthreads for job in jobs_vec
     @printf(" %-50s", "Compute matrix-vector: ")
-    # Bucket the jobs by estimated cost before the :static loop rather than
-    # letting it chunk the iteration space contiguously.  Job costs here span
-    # ~150x median-to-max, which contiguous chunking averages out at small
-    # thread counts (1.04x imbalance at 8) but not at large ones: 1.20x at 32
-    # threads and 1.75x at 96.  Bucketing greedily is 1.00x at every count.
+    # Pull jobs from a shared counter: nt worker tasks, each taking the next job
+    # when it finishes its last.  Splitting the jobs up front instead -- either
+    # contiguously or by estimated cost -- balances only as well as the estimate
+    # does, and `_open_matvec_job_cost` is a poor predictor of runtime: measured
+    # per-slot, iterations carrying equal estimated cost differ by 5.6x in wall
+    # time, because the estimate counts ket coefficients and terms but not the
+    # cost of inserting into an output sector that grows as the FOIS does.
+    # Pulling needs no estimate to be right, and also absorbs cores that differ
+    # in speed (heterogeneous cores, or a node shared with another job).
     #
-    # :static is kept deliberately -- `jobs_out`/`scr_*` are indexed per slot and
-    # a task must own its slot exclusively, which :dynamic does not guarantee.
+    # Measured 8-thread parity with a cost-bucketed :static split (23.9 s both),
+    # where balance is already near-perfect; the reason to prefer pulling is that
+    # it does not depend on the cost model holding up at higher thread counts.
+    # Jobs are visited largest-first (LPT) so a big one is not picked up last and
+    # left running alone.
+    #
+    # Each task owns `slot` and indexes `jobs_out`/`scr_*` with it, so the state
+    # is exclusively held even though tasks may migrate between threads --
+    # correctness rests on the per-task slot, not on which thread runs it.
+    #
+    # NB: thread scaling here is limited by allocator contention, not by
+    # scheduling -- see `docs/tpsci_thread_scaling.md`.  This loop allocates
+    # ~8 GB per call, and Julia's allocator stops scaling past ~2 threads, so
+    # 8 threads in one process run slower than 4.  Scheduling changes cannot
+    # recover that; cutting allocation can.
     nt = Threads.nthreads()
-    buckets = _open_matvec_thread_buckets(jobs_vec, nt)
-    @time @Threads.threads :static for slot in 1:nt
-        for job in buckets[slot]
-            _open_matvec_thread_job(job[2], job[1], cluster_ops, nbody, thresh,
-                                     jobs_out[slot], scr_f[slot], scr_i[slot],
-                                     scr_m[slot], prescreen)
+    costs = [_open_matvec_job_cost(job) for job in jobs_vec]
+    order = sortperm(costs; rev=true)
+    njobs = length(jobs_vec)
+    next_job = Threads.Atomic{Int}(1)
+    @time @sync for slot in 1:nt
+        Threads.@spawn begin
+            while true
+                i = Threads.atomic_add!(next_job, 1)
+                i > njobs && break
+                job = jobs_vec[order[i]]
+                _open_matvec_thread_job(job[2], job[1], cluster_ops, nbody, thresh,
+                                         jobs_out[slot], scr_f[slot], scr_i[slot],
+                                         scr_m[slot], prescreen)
+            end
         end
     end
     flush(stdout)
 
     @printf(" %-50s", "Now collect thread results : ")
     flush(stdout)
-    @time for threadid in 1:Threads.maxthreadid()
+    @time for threadid in eachindex(jobs_out)
         for (fock, configs) in jobs_out[threadid].data
             haskey(sig, fock) == false || error(" why me")
             sig[fock] = configs
