@@ -10,7 +10,7 @@
 # larger than a single node.
 #
 # Launch:
-#   sbatch run_multinode.sh run_spt_multinode_cr2_morokuma.jl \
+#   sbatch generic_multinode_multithread.sh run_spt_multinode_cr2_morokuma.jl \
 #          ../../test/data_cmf_13_cr2_morokuma.jld2
 # or locally with 2 workers:
 #   julia -p 2 --project run_spt_multinode_cr2_morokuma.jl \

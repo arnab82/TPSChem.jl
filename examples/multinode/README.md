@@ -51,7 +51,7 @@ export TPSCHEM_OUTPUT_JLD2=post_analysis_rdms.jld2
 export TPSCHEM_REF_KEY=ref_vec
 export TPSCHEM_BUILD_SPIN_FLIP_1RDM=1
 export TPSCHEM_BUILD_2RDM=0        # set to 1 only when you need the full 2-RDM
-sbatch examples/multinode/run_multinode.sh \
+sbatch examples/multinode/generic_multinode_multithread.sh \
     examples/multinode/tpsci_property_rdm_driver.jl \
     /path/to/problem_with_ref_vec.jld2
 ```
@@ -82,7 +82,7 @@ export TPSCHEM_SPT_REF_KEY=v_var
 export TPSCHEM_THRESH_FOI=1e-6
 export TPSCHEM_NBODY=4
 export TPSCHEM_OPT_REF=0
-sbatch examples/multinode/run_multinode.sh \
+sbatch examples/multinode/generic_multinode_multithread.sh \
     examples/multinode/spt_variance_driver.jl \
     /path/to/problem_with_spt_state.jld2
 ```
@@ -275,7 +275,7 @@ SPT loops. They read `ints`, `clusters`, `d1` from a CMF JLD2
 
 ```bash
 # On a cluster (one worker per node) via the generic launcher:
-sbatch run_multinode.sh run_spt_multinode_cr2_morokuma.jl \
+sbatch generic_multinode_multithread.sh run_spt_multinode_cr2_morokuma.jl \
        ../../test/data_cmf_13_cr2_morokuma.jld2
 
 # Locally with two workers:

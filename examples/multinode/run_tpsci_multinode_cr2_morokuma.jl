@@ -9,7 +9,7 @@
 # `DistributedTPSCIstate` across all workers for the whole loop (never gathered).
 #
 # Launch (one Julia worker per node, many threads per worker):
-#   sbatch run_multinode.sh run_tpsci_multinode_cr2_morokuma.jl \
+#   sbatch generic_multinode_multithread.sh run_tpsci_multinode_cr2_morokuma.jl \
 #          ../../test/data_cmf_13_cr2_morokuma.jld2
 # or locally with 2 workers:
 #   julia -p 2 --project run_tpsci_multinode_cr2_morokuma.jl \

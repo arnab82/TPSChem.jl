@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # Usage:
-#   sbatch run_multinode.sh input_file.jl data_file.jld2 [extra files...]
+#   sbatch run_cepa_multinode_cr2_morokuma.sh input_file.jl data_file.jld2 [extra files...]
 #
 # Keep input_file.jl and data_file.jld2 in the directory where you submit the job,
 # or pass absolute paths.
@@ -28,12 +28,36 @@ export JULIAENV="${JULIAENV:-/N/u/abachhar/BigRed200/multinode-tpsci}"
 export MKL_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
+
+# Threads. SLURM grants --cpus-per-task per node. One node runs the master as
+# well as a worker, so that node's worker gets the cores the master is not using
+# and every worker-only node gets the full allocation. A single number for all
+# hosts is wrong either way: too low wastes cores on the worker-only nodes, too
+# high oversubscribes the master's node.
 export JULIA_NUM_THREADS="${JULIA_NUM_THREADS:-32}"
 export TPSCHEM_WORKER_THREADS="${TPSCHEM_WORKER_THREADS:-$SLURM_CPUS_PER_TASK}"
+_shared=$(( SLURM_CPUS_PER_TASK - JULIA_NUM_THREADS ))
+[ "$_shared" -lt 1 ] && _shared=1
+export TPSCHEM_MASTER_NODE_WORKER_THREADS="${TPSCHEM_MASTER_NODE_WORKER_THREADS:-$_shared}"
+
 export TPSCHEM_BLAS_THREADS="${TPSCHEM_BLAS_THREADS:-1}"
+export JULIA_WORKER_TIMEOUT="${JULIA_WORKER_TIMEOUT:-250}"
+
+# CEPA solver settings. :pcg is Jacobi-preconditioned CG (~3x fewer Hamiltonian
+# applies than MINRES, falls back to MINRES on any root whose shifted operator is
+# not positive definite). TPSCHEM_LINSOLVE_TOL is the inner Krylov tolerance;
+# TPSCHEM_CEPA_TOL still drives macro-iteration convergence.
+export TPSCHEM_SOLVER="${TPSCHEM_SOLVER:-pcg}"
+export TPSCHEM_LINSOLVE_TOL="${TPSCHEM_LINSOLVE_TOL:-1e-6}"
+export TPSCHEM_CEPA_TOL="${TPSCHEM_CEPA_TOL:-1e-8}"
+# :blocks refuses up front when the stored H will not fit, instead of silently
+# dropping to :matrixfree, which does not finish at these dimensions.
+export TPSCHEM_H_STORAGE="${TPSCHEM_H_STORAGE:-blocks}"
+# Aggregate GB budget across ALL workers, not per worker.
+export TPSCHEM_MAX_MEM_H="${TPSCHEM_MAX_MEM_H:-800}"
 
 if [ "$#" -lt 2 ]; then
-    echo "Usage: sbatch run_multinode.sh input_file.jl data_file.jld2 [extra files...]" >&2
+    echo "Usage: sbatch run_cepa_multinode_cr2_morokuma.sh input_file.jl data_file.jld2 [extra files...]" >&2
     exit 2
 fi
 
@@ -83,7 +107,11 @@ echo "Project: $JULIAENV"
 echo "Depot:   $JULIA_DEPOT_PATH"
 echo "Scratch: $TMPDIR"
 echo "Master threads: $JULIA_NUM_THREADS"
-echo "Worker threads: $TPSCHEM_WORKER_THREADS"
+echo "Worker threads: $TPSCHEM_WORKER_THREADS (master's node: $TPSCHEM_MASTER_NODE_WORKER_THREADS)"
+echo "BLAS threads:   $TPSCHEM_BLAS_THREADS"
+echo "Solver:         $TPSCHEM_SOLVER (linsolve_tol=$TPSCHEM_LINSOLVE_TOL)"
+echo "H storage:      $TPSCHEM_H_STORAGE (max_mem_H=$TPSCHEM_MAX_MEM_H GB aggregate)"
+echo "Worker timeout: $JULIA_WORKER_TIMEOUT s"
 echo "Nodes:"
 cat "$TPSCHEM_MACHINE_FILE"
 
