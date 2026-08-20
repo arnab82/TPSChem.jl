@@ -5,9 +5,20 @@
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
+#SBATCH --exclusive
 #SBATCH --time=95:00:00
 #SBATCH --mem=0
 #SBATCH -A r01859
+
+# --exclusive: this partition (general) can co-schedule other jobs' tasks on
+# the same physical node. Without it, --mem=0 ("give me all this node's
+# memory") is not a safe request -- if a second job also lands here with its
+# own memory grant, SLURM's cgroup accounting does not necessarily partition
+# the two cleanly, and combined usage can exceed the node's real RAM with no
+# warning from SLURM. That surfaces as an OS-level OOM, which on Linux often
+# shows up as a bus error with no clean Julia stacktrace, not a normal OOM
+# kill message. --exclusive removes the ambiguity: the whole node (every
+# core, all its memory) belongs to this job alone.
 
 set -euo pipefail
 
