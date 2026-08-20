@@ -1,6 +1,7 @@
 # Sharded TPS-CEPA sweep over FOI thresholds for an Fe2S2 model.
 #
-# Launch (see run_cepa_multinode_fe2s2.sh, its dedicated launcher):
+# Launch (see generic_multinode_multithread.sh; needs --cpus-per-task=96 and the
+# TPSCHEM_H_STORAGE/TPSCHEM_SOLVER overrides documented there for this driver):
 #   TPSCHEM_MACHINE_FILE=nodes.txt TPSCHEM_WORKER_THREADS=64 \
 #   julia --project=. examples/multinode/run_cepa_multinode_fe2s2.jl data_cmf_fe2s2.jld2
 #

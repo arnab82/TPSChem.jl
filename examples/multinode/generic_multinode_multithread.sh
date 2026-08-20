@@ -42,6 +42,20 @@ set -euo pipefail
 #   TPSCHEM_SKIP_MASTER_NODE=true # omit the first node from the worker list
 #   TPSCHEM_SAVE_SCRATCH=0        # do not copy scratch back after success
 #   TPSCHEM_SCRATCH_ROOT=/path    # defaults to /N/scratch/$USER
+#   JULIA_WORKER_TIMEOUT=250      # seconds to wait for a worker to connect; Julia's
+#                                 # own default is 60s
+#
+# CEPA-specific drivers (run_cepa_multinode_*.jl) read these directly, with
+# their own defaults if unset -- pass them via `sbatch --export=` or export
+# them before submitting when you need something other than the driver's
+# default:
+#   TPSCHEM_SOLVER=pcg           # or minres
+#   TPSCHEM_LINSOLVE_TOL=1e-6
+#   TPSCHEM_CEPA_TOL=1e-8
+#   TPSCHEM_H_STORAGE=blocks     # or matrixfree/auto -- driver-dependent default
+#   TPSCHEM_MAX_MEM_H=800        # aggregate GB across ALL workers, not per worker;
+#                                 # unset falls back to 200*nworkers, which does not
+#                                 # probe real node RAM
 
 if [ "$#" -lt 2 ]; then
     echo "Usage: sbatch generic_multinode_multithread.sh input.jl data.jld2 [extra files...]" >&2
@@ -70,6 +84,10 @@ export TPSCHEM_BLAS_THREADS="${TPSCHEM_BLAS_THREADS:-1}"
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
+# Julia's own default worker-connect timeout is 60s, which can be tight for
+# addprocs across several nodes doing Pkg.instantiate()/precompile() fresh
+# against a shared depot.
+export JULIA_WORKER_TIMEOUT="${JULIA_WORKER_TIMEOUT:-250}"
 
 WORKDIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 INPUT_FILE="$1"
@@ -142,6 +160,7 @@ echo "Scratch:        $JOB_SCRATCH"
 echo "Master threads: $JULIA_NUM_THREADS"
 echo "Worker threads: $TPSCHEM_WORKER_THREADS (master's node: $TPSCHEM_MASTER_NODE_WORKER_THREADS)"
 echo "BLAS threads:   $TPSCHEM_BLAS_THREADS"
+echo "Worker timeout: $JULIA_WORKER_TIMEOUT s"
 echo "Nodes:"
 cat "$TPSCHEM_MACHINE_FILE"
 
