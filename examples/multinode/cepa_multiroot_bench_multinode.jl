@@ -30,6 +30,7 @@ const MROOTS  = parse(Int, get(ENV, "CEPA_MN_M", "100"))
 const DATA    = get(ENV, "CEPA_MN_DATA",
                     joinpath(@__DIR__, "..", "..", "test", "data_cmf_13_cr2_morokuma.jld2"))
 const CHILD   = get(ENV, "CEPA_MN_CHILD", "")
+const CEPA_MIT = parse(Int, get(ENV, "CEPA_MN_MIT", "30"))
 
 if nprocs() == 1
     addprocs(NWORK; exeflags=["--project=$(Base.active_project())", "-t$NTHREAD"])
@@ -60,7 +61,7 @@ worker_rss() = Dict(pid => remotecall_fetch(Sys.maxrss, pid) for pid in workers(
 
 # ── Child mode: one end-to-end configuration ─────────────────────────────────
 if !isempty(CHILD)
-    tier, solver, multiroot = split(CHILD, ",")
+    tier, solver, multiroot, shift = split(CHILD, ",")
     ci, cluster_ops, clustered_ham = setup()
     # Solve the reference locally and hand over e0: the sharded Davidson cannot
     # start from the raw spin-Fock expansion (its initial guess is rank deficient),
@@ -68,7 +69,8 @@ if !isempty(CHILD)
     e0, ci = TPSChem.tps_ci_direct(ci, cluster_ops, clustered_ham, conv_thresh=1e-10)
     GC.gc()
     r = @timed TPSChem.do_tps_sharded_cepa(deepcopy(ci), cluster_ops, clustered_ham;
-                                           cepa_shift="cepa", nbody=4, e0=e0,
+                                           cepa_shift=String(shift), cepa_mit=CEPA_MIT,
+                                           nbody=4, e0=e0,
                                            thresh_foi=THRESH, tol=1e-8,
                                            thresh_sigma=0.0,
                                            h_storage=Symbol(tier),
@@ -78,8 +80,8 @@ if !isempty(CHILD)
     e, q = r.value
     TPSChem.destroy!(q)
     wr = worker_rss()
-    @printf("RESULT\t%s\t%s\t%s\t%.3f\t%.3f\t%.3f\t%.3f\t%s\n",
-            tier, solver, multiroot, r.time, r.bytes/2^30,
+    @printf("RESULT\t%s\t%s\t%s\t%s\t%.3f\t%.3f\t%.3f\t%.3f\t%s\n",
+            tier, solver, multiroot, shift, r.time, r.bytes/2^30,
             Sys.maxrss()/2^30, maximum(values(wr))/2^30,
             join((@sprintf("%.10f", x) for x in e), ","))
     exit(0)
@@ -147,44 +149,56 @@ for h in hroots; TPSChem.destroy!(h); end
 TPSChem.destroy!(hblock); TPSChem.destroy!(qspace); TPSChem.destroy!(dref)
 
 # ── Table 2 ──────────────────────────────────────────────────────────────────
-configs = [("blocks", "minres", "false"), ("blocks", "minres", "true"),
-           ("blocks", "pcg",    "false"), ("blocks", "pcg",    "true"),
-           ("matrixfree", "minres", "false"), ("matrixfree", "minres", "true")]
+# CEPA-0 runs a single macro-iteration, so the solve -- the only part blocking
+# touches -- is at its smallest relative to the one-time FOIS and H_qq build. ACPF
+# iterates the shift, repeating the solve while the build stays one-time, so it is
+# the case where blocking should show up even for the cheap stored-block apply.
+configs = [("blocks",     "minres", "false", "cepa"), ("blocks",     "minres", "true", "cepa"),
+           ("blocks",     "pcg",    "false", "cepa"), ("blocks",     "pcg",    "true", "cepa"),
+           ("matrixfree", "minres", "false", "cepa"), ("matrixfree", "minres", "true", "cepa"),
+           ("blocks",     "minres", "false", "acpf"), ("blocks",     "minres", "true", "acpf"),
+           ("blocks",     "pcg",    "false", "acpf"), ("blocks",     "pcg",    "true", "acpf"),
+           ("blocks",     "minres", "false", "aqcc"), ("blocks",     "minres", "true", "aqcc")]
 
-@printf("\n ┌ Table 2: end-to-end CEPA-0 (fresh master + workers each) ────────────────────────────┐\n")
-@printf(" %-11s %-7s %-10s %10s %10s %11s %11s\n",
-        "tier", "solver", "multiroot", "time (s)", "alloc GiB", "master GiB", "worker GiB")
+@printf("\n ┌ Table 2: end to end (fresh master + workers each, cepa_mit=%i) ──────────────────────┐\n", CEPA_MIT)
+@printf(" %-11s %-7s %-10s %-6s %10s %10s %11s %11s\n",
+        "tier", "solver", "multiroot", "shift", "time (s)", "alloc GiB", "master GiB", "worker GiB")
 rows = Any[]
-for (tier, slv, mr) in configs
+for (tier, slv, mr, sh) in configs
     cmd = `$(Base.julia_cmd()) --project=$(dirname(dirname(@__DIR__))) $(@__FILE__)`
     env = copy(ENV)
-    env["CEPA_MN_CHILD"] = "$tier,$slv,$mr"
+    env["CEPA_MN_CHILD"] = "$tier,$slv,$mr,$sh"
     env["JULIA_NUM_THREADS"] = "1"
     out = try
         read(setenv(cmd, env), String)
     catch err
-        @printf(" %-11s %-7s %-10s   FAILED (%s)\n", tier, slv, mr, sprint(showerror, err))
+        @printf(" %-11s %-7s %-10s %-6s   FAILED\n", tier, slv, mr, sh)
         continue
     end
     lines = split(out, '\n')
     idx = findfirst(l -> startswith(l, "RESULT"), lines)
     if idx === nothing
-        @printf(" %-11s %-7s %-10s   NO RESULT\n", tier, slv, mr)
+        @printf(" %-11s %-7s %-10s %-6s   NO RESULT\n", tier, slv, mr, sh)
         continue
     end
     f = split(lines[idx], '\t')
-    @printf(" %-11s %-7s %-10s %10.2f %10.3f %11.3f %11.3f\n",
-            f[2], f[3], f[4], parse(Float64,f[5]), parse(Float64,f[6]),
-            parse(Float64,f[7]), parse(Float64,f[8]))
-    push!(rows, (tier, slv, mr, parse.(Float64, split(f[9], ','))))
+    @printf(" %-11s %-7s %-10s %-6s %10.2f %10.3f %11.3f %11.3f\n",
+            f[2], f[3], f[4], f[5], parse(Float64,f[6]), parse(Float64,f[7]),
+            parse(Float64,f[8]), parse(Float64,f[9]))
+    push!(rows, (tier, slv, mr, sh, parse.(Float64, split(f[10], ','))))
     flush(stdout)
 end
 @printf(" └%s┘\n", "─"^86)
 
-if !isempty(rows)
-    ref = rows[1][4]
-    @printf("\n Energy agreement (vs %s/%s/multiroot=%s):\n", rows[1][1], rows[1][2], rows[1][3])
-    for (tier, slv, mr, e) in rows
+# Compare within a shift family: acpf and aqcc converge to different energies than
+# cepa-0, so a single global reference would be meaningless.
+for family in unique(r[4] for r in rows)
+    fam = [r for r in rows if r[4] == family]
+    isempty(fam) && continue
+    ref = fam[1][5]
+    @printf("\n Energy agreement, shift=%s (vs %s/%s/multiroot=%s):\n",
+            family, fam[1][1], fam[1][2], fam[1][3])
+    for (tier, slv, mr, sh, e) in fam
         @printf("   %-11s %-7s multiroot=%-6s  max|ΔE| = %.2e\n", tier, slv, mr,
                 maximum(abs.(e .- ref)))
     end
