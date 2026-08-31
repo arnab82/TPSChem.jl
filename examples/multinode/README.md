@@ -36,8 +36,13 @@ export TPSCHEM_THRESH_FOI=1e-8
 sbatch examples/multinode/run_tpsci_sharded_pt1_4nodes.slurm
 ```
 
-The CEPA driver builds the Q space once as a `DistributedTPSCIstate`, then runs
-MINRES root by root over that same sharded Q basis.
+The CEPA driver builds the Q space once as a `DistributedTPSCIstate`, then solves
+every root's amplitude equation over that same sharded Q basis — by default all
+roots in one solver pass, sharing a Hamiltonian apply.
+
+See [../CEPA_JOB_KEYWORDS.md](../CEPA_JOB_KEYWORDS.md) for what each submission
+keyword does, how to choose `TPSCHEM_H_STORAGE` / `TPSCHEM_SOLVER` /
+`TPSCHEM_BLOCK_ROOTS`, and the measured cost of each combination.
 
 ## TPSCI Property/RDM Post-Analysis
 

@@ -56,6 +56,7 @@ e_cepa, qspace = TPSChem.do_tps_sharded_cepa(
     thresh_sigma=thresh_sigma,
     compress=compress,
     solver=Symbol(get(ENV, "TPSCHEM_SOLVER", "pcg")),
+    block_roots=lowercase(get(ENV, "TPSCHEM_BLOCK_ROOTS", "true")) in ("1","true","yes","on"),
     linsolve_tol=parse(Float64, get(ENV, "TPSCHEM_LINSOLVE_TOL", "1e-6")),
     h_storage=h_storage,       # :blocks reuses the once-built H_Q every iteration
     max_mem_H=max_mem_H,

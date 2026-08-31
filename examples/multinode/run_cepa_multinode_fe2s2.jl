@@ -218,6 +218,7 @@ for thresh_foi_cepa in THRESH_FOI_LIST
             thresh_clip=env_float("TPSCHEM_THRESH_CLIP", 1e-5),
             compress=env_bool("TPSCHEM_COMPRESS_Q", false),
             solver=Symbol(get(ENV, "TPSCHEM_SOLVER", "pcg")),
+            block_roots=env_bool("TPSCHEM_BLOCK_ROOTS", true),
             h_storage=Symbol(get(ENV, "TPSCHEM_H_STORAGE", "blocks")),
             max_mem_H=max_mem_H,
             cg_maxiter=env_int("TPSCHEM_MINRES_MAXITER", 300),
