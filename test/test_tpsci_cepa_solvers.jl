@@ -64,4 +64,32 @@ using Printf
     # ignoring `build_hqq` and turning a minutes-long run into a days-long one.
     @test_throws ErrorException run_cepa(solver=:pcg_typo, build_hqq=:sparse)
     @test_throws ErrorException run_cepa(solver=:pcg, build_hqq=:sprase)
+
+    # ── multiroot vs one-root-at-a-time ──────────────────────────────────────────
+    # Blocking shares one H apply across the roots but keeps their shifts, Krylov
+    # scalars and convergence tests independent, so it must land on the same
+    # energies. thresh_sigma=0 makes the coupling vectors identical too: with any
+    # screening the blocked FOIS matvec keeps the union of the roots' surviving
+    # terms (screening is max-over-roots), which is a real difference in h.
+    exact = (thresh_foi=1e-4, nbody=4, tol=1e-10, thresh_sigma=0.0, verbose=0)
+    run_exact(; kwargs...) = first(TPSChem.do_fois_cepa(deepcopy(ci_vector), cluster_ops,
+                                                       clustered_ham; exact..., kwargs...))
+
+    for (slv, store) in ((:minres, :sparse), (:minres, :matvec), (:minres, :fois),
+                         (:pcg, :sparse), (:pcg, :direct), (:pcg, :matvec), (:pcg, :fois))
+        e_single = run_exact(solver=slv, build_hqq=store, multiroot=false)
+        e_block  = run_exact(solver=slv, build_hqq=store, multiroot=true)
+        @test isapprox(e_block, e_single, atol=1e-8)
+    end
+
+    # :fois one-at-a-time must also reproduce the stored-matrix answer, and the
+    # legacy :krylov default must survive the pathway rework unchanged.
+    @test isapprox(run_exact(solver=:minres, build_hqq=:fois, multiroot=false),
+                   run_exact(solver=:minres, build_hqq=:sparse, multiroot=false), atol=1e-8)
+    @test isapprox(run_exact(solver=:krylov), e_minres, atol=1e-7)
+
+    # acpf blocked vs unblocked on the root whose shift converges (see above).
+    e_acpf_block = run_cepa(solver=:minres, build_hqq=:sparse, cepa_shift="acpf",
+                            multiroot=true)
+    @test isapprox(e_acpf_block[1], e_acpf_minres[1], atol=1e-8)
 end
