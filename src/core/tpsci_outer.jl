@@ -1378,9 +1378,15 @@ Do CEPA in FOIS defined by ref and thresh_foi
     -`tol`: tolerance for convergence
     -`compress`: compress the first order interaction space
     -`compress_type`: type of compression
-    -`solver`: `:krylov` (default, matrix-free CG via open_matvec_thread) or
-               `:minres` (builds H_qq once as a dense matrix, then uses MINRES;
-               drastically reduces peak memory for large FOIS)
+    -`solver`: `:krylov` (default, matrix-free CG via open_matvec_thread),
+               `:minres` (builds H_qq once according to `build_hqq`, then uses
+               MINRES; drastically reduces peak memory for large FOIS), or
+               `:pcg` (same H_qq as `:minres`, solved with Jacobi-preconditioned
+               CG and warm starts; falls back to MINRES for any solve whose
+               shifted operator is not positive definite)
+    -`build_hqq`: how the Q-space Hamiltonian is formed for `:minres`/`:pcg` —
+               `:sparse`, `:direct`, `:parallel`, or `:matvec` (nothing stored).
+               Ignored when `solver=:krylov`.
     -`verbose`: verbosity level
 
 """
@@ -1394,8 +1400,8 @@ Apply a CEPA-style correction over the first-order interacting space (FOIS)
 defined over a CMF reference. Solves the zeroth-order problem in `ref`, builds
 the FOIS from up to `nbody`-body terms (threshold `thresh_foi`), and solves the
 dressed CEPA equations. `cepa_shift` selects the correction flavour (default
-`"cepa"`) and `solver` the linear solver (`:krylov` by default). Returns the
-CEPA-corrected energies and the associated wavefunction.
+`"cepa"`) and `solver` the linear solver — `:krylov` (default), `:minres`, or
+`:pcg`. Returns the CEPA-corrected energies and the associated wavefunction.
 """
 function do_fois_cepa(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
                         cepa_shift="cepa",
@@ -1469,6 +1475,117 @@ end
 
 
 """
+    cepa_pcg_linsolve(Hq_mv, b, Hdiag; eshift, tol=1e-8, maxiter=300, verbose=0, x0=nothing)
+
+Jacobi-preconditioned conjugate gradient for `(H_qq - eshift*I) x = b`.
+
+`Hq_mv` applies H_qq to a dense vector and `Hdiag` is the Q-space Hamiltonian
+diagonal, which is root independent — the caller builds it once and reuses it for
+every root and macro-iteration. The preconditioner is `M = diag(H_qq) - eshift`,
+with near-zero denominators floored exactly as `precondition_sharded` does.
+
+CG only converges for a positive-definite shifted operator. The caller is expected
+to have screened that with `minimum(Hdiag)`, but the diagonal test is necessary and
+not sufficient: if the iteration meets a direction with `p'Ap <= 0` it stops and
+reports `indefinite=true` so the caller can redo that solve with MINRES.
+
+Returns `(x, (iters=, residual=, converged=, indefinite=))`.
+"""
+function cepa_pcg_linsolve(Hq_mv, b::Vector{T}, Hdiag::Vector{T};
+                           eshift,
+                           tol=1e-8,
+                           maxiter=300,
+                           verbose=0,
+                           x0=nothing) where {T}
+#={{{=#
+    n = length(b)
+    length(Hdiag) == n ||
+        throw(DimensionMismatch("Hdiag has length $(length(Hdiag)), expected $n"))
+    shift = T(eshift)
+
+    # M = diag(H_qq) - eshift, floored the same way precondition_sharded floors it
+    # so a Q-space state sitting on top of the shift cannot blow the preconditioner up.
+    M = similar(Hdiag)
+    @inbounds for i in 1:n
+        d0 = Hdiag[i] - shift
+        fl = sqrt(eps(T)) * max(abs(shift), abs(Hdiag[i]), one(T))
+        M[i] = abs(d0) < fl ? copysign(fl, iszero(d0) ? one(T) : d0) : d0
+    end
+
+    x  = x0 === nothing ? zeros(T, n) : Vector{T}(copy(x0))
+    r  = copy(b)
+    Ap = Vector{T}(undef, n)
+
+    # Measure convergence against ||b||, not against the starting residual: a warm
+    # start makes the latter small, which would silently tighten `tol` on every
+    # macro-iteration and cancel the benefit of warm starting.
+    threshold = tol * max(norm(b), one(T))
+
+    # Warm start: solve for the correction, r = b - A*x0.
+    if x0 !== nothing
+        Ap .= Hq_mv(x) .- shift .* x
+        r .-= Ap
+    end
+
+    z = r ./ M
+    p = copy(z)
+    resid = norm(r)
+    rz = dot(r, z)
+    converged = resid <= threshold
+    indefinite = false
+    pAp0 = zero(T)
+    iters = 0
+
+    for it in 1:maxiter
+        converged && break
+        iters = it
+        Ap .= Hq_mv(p) .- shift .* p
+        pAp = dot(p, Ap)
+
+        # A genuinely indefinite operator gives pAp <= 0 and CG cannot proceed. Report
+        # it rather than throwing: the caller redoes the solve with MINRES, which is
+        # built for the symmetric-indefinite case.
+        if pAp <= zero(T)
+            verbose > 0 &&
+                @printf("   CEPA PCG met an indefinite direction (pAp = %.3e)\n", pAp)
+            indefinite = true
+            break
+        end
+        it == 1 && (pAp0 = pAp)
+        # Near the solution p -> 0, so pAp underflows on its own. That is convergence
+        # stalling at the floating-point floor, not a breakdown: test it relative to
+        # the first iteration rather than against eps.
+        if pAp <= eps(T) * pAp0
+            verbose > 1 && @printf("   CEPA PCG stalled at fp precision (iter %i)\n", it)
+            break
+        end
+
+        alpha = rz / pAp
+        x .+= alpha .* p
+        r .-= alpha .* Ap
+        resid = norm(r)
+        verbose > 2 && @printf("   CEPA PCG iter %4i residual %12.4e\n", it, resid)
+        if resid <= threshold
+            converged = true
+            break
+        end
+
+        z .= r ./ M
+        rz_new = dot(r, z)
+        beta = rz_new / rz
+        # p .= z + beta*p
+        @inbounds for i in 1:n
+            p[i] = z[i] + beta * p[i]
+        end
+        rz = rz_new
+    end
+
+    return x, (iters=iters, residual=resid, converged=converged, indefinite=indefinite)
+end
+#=}}}=#
+
+
+"""
     tpsci_cepa_solve(ref_vector, e0, cepa_vector, cluster_ops, clustered_ham, cepa_shift, cepa_mit; tol, verbose)
 
 Multi-root CEPA solver for TPSCIstate.
@@ -1487,10 +1604,18 @@ The amplitude equation for each root I is solved independently with the shared H
 
 where h[I] = <Q|H|A_I> (coupling vector for root I).
 
-Fully matrix-free: never builds H_xx explicitly.
-- h[I] is computed by applying H to |A_I> via open_matvec_thread then projecting to Q.
-- CG matvec H_xx*v uses the same open_matvec_thread + Q-projection.
-This scales to Q_dim ~ 10^6 with O(Q_dim) memory.
+`solver` picks how the amplitude equations are solved:
+- `:krylov` — fully matrix-free. Every KrylovKit CG matvec re-runs
+  `open_matvec_thread` over the whole Q-space, so memory stays O(Q_dim) but each
+  iteration costs a full FOIS matvec. `build_hqq` is ignored.
+- `:minres` — forms H_qq once according to `build_hqq`, then MINRES. Handles the
+  indefinite shifted operator that shows up for the higher roots.
+- `:pcg` — same H_qq as `:minres`, solved with Jacobi-preconditioned CG
+  (preconditioner `diag(H_qq) - eshift`, warm started across macro-iterations).
+  Falls back to MINRES for any solve whose shifted diagonal is not positive.
+
+h[I] is always computed matrix-free: apply H to |A_I> via `open_matvec_thread`,
+then project onto Q. That is one cheap P-space matvec per root.
 """
 function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
                            cepa_vector::TPSCIstate{T,N,R2},
@@ -1508,7 +1633,14 @@ function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
     n_clusters = length(ref_vector.clusters)
     dim_q = length(cepa_vector)
 
-    @printf(" CEPA solver: dim_q=%i, R=%i, shift=%s\n", dim_q, R, cepa_shift)
+    solver in (:krylov, :minres, :pcg) ||
+        error("Unknown CEPA solver: $solver. Use :krylov (matrix-free), :minres, or :pcg.")
+    build_hqq in (:matvec, :sparse, :direct, :parallel) ||
+        error("Unknown build_hqq: $build_hqq. Use :sparse, :direct, :parallel, or :matvec.")
+
+    @printf(" CEPA solver: dim_q=%i, R=%i, shift=%s, solver=%s, build_hqq=%s\n",
+            dim_q, R, cepa_shift, solver,
+            solver == :krylov ? "n/a (matrix-free)" : string(build_hqq))
 
     # ── Helper: project a TPSCIstate onto Q-space, return dense vector ─────────
     # Collects only the configs present in cepa_vector (Q-space).
@@ -1540,32 +1672,34 @@ function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
     # ── Build or wrap the Q-space matvec ─────────────────────────────────────────
     cepa_work = TPSCIstate(cepa_vector, R=1)   # reusable 1-root Q-space state
 
-    if solver == :minres
-        # Build H_qq once as a dense dim_q×dim_q matrix.
-        # This costs ~dim_q² × 8 bytes (e.g. 2.3 GB for dim_q=17093) stored once,
-        # replacing per-iteration open_matvec_thread calls that each allocate ~180 GiB.
-        @printf(" Building H_qq (%i × %i) [build_hqq=%s] — stored once for all MINRES solves\n",
-                dim_q, dim_q, build_hqq)
+    H_qq_stored = nothing   # set only when the Q-space matrix is actually built
+
+    if solver != :krylov
+        # Build H_qq once. This costs ~dim_q² × 8 bytes for the dense builders
+        # (e.g. 2.3 GB for dim_q=17093) stored once, replacing per-iteration
+        # open_matvec_thread calls that each allocate ~180 GiB.
+        @printf(" Q-space H_qq (%i × %i) [build_hqq=%s], reused by every %s solve\n",
+                dim_q, dim_q, build_hqq, uppercase(string(solver)))
         if build_hqq == :matvec
             # Peak memory: O(nthreads × dim_q) — no H_qq stored at all.
-            # Each MINRES iteration recomputes H_qq×v on the fly. Viable for dim_q=262K
+            # Each iteration recomputes H_qq×v on the fly. Viable for dim_q=262K
             # where both :sparse and open_matvec_thread OOM.
             @printf(" Using matrix-free H_qq matvec (no H_qq stored)\n")
             Hq_mv = v -> matvec_H_qq(cepa_work, cluster_ops, clustered_ham, v)
         elseif build_hqq == :sparse
             # Peak memory: O(nnz) — per-thread COO triplets, no dim_q² allocation
-            @time H_qq = build_H_qq_sparse(cepa_work, cluster_ops, clustered_ham)
+            @time H_qq_stored = build_H_qq_sparse(cepa_work, cluster_ops, clustered_ham)
             # @printf(" H_qq sparsity: nnz=%i  (%.2f%% fill)\n",
-            #         nnz(H_qq), 100*nnz(H_qq)/dim_q^2)
-            Hq_mv = v -> H_qq * v
+            #         nnz(H_qq_stored), 100*nnz(H_qq_stored)/dim_q^2)
+            Hq_mv = let A = H_qq_stored; v -> A * v; end
         elseif build_hqq == :direct
             # Peak memory: 1×dim_q²×8 B — threads write directly into H rows (no scratch copies)
-            @time H_qq = build_H_qq(cepa_work, cluster_ops, clustered_ham)
-            Hq_mv = v -> H_qq * v
+            @time H_qq_stored = build_H_qq(cepa_work, cluster_ops, clustered_ham)
+            Hq_mv = let A = H_qq_stored; v -> A * v; end
         else
             # build_hqq == :parallel — uses build_full_H_parallel (peak 2×dim_q²×8 B due to scratch)
-            @time H_qq = build_full_H_parallel(cepa_work, cepa_work, cluster_ops, clustered_ham, sym=true)
-            Hq_mv = v -> H_qq * v
+            @time H_qq_stored = build_full_H_parallel(cepa_work, cepa_work, cluster_ops, clustered_ham, sym=true)
+            Hq_mv = let A = H_qq_stored; v -> A * v; end
         end
     else
         function Hq_matvec(v::Vector{T})
@@ -1575,6 +1709,25 @@ function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
             return project_to_Q(sig, 1)
         end
         Hq_mv = Hq_matvec
+    end
+
+    # ── Jacobi preconditioner data for :pcg ──────────────────────────────────────
+    # The Q-space diagonal is root independent, so build it once here and reuse it
+    # for every root and macro-iteration. Only the shift changes.
+    Hdiag     = T[]
+    hdiag_min = zero(T)
+    Cd_prev   = zeros(T, 0, 0)
+    if solver == :pcg
+        if H_qq_stored !== nothing
+            Hdiag = Vector{T}(diag(H_qq_stored))
+        else
+            # build_hqq=:matvec keeps nothing around, so form the diagonal directly.
+            @printf(" Computing Q-space diagonal for the PCG preconditioner\n")
+            @time Hdiag = Vector{T}(compute_diagonal(cepa_work, cluster_ops, clustered_ham))
+        end
+        hdiag_min = minimum(Hdiag)
+        # Warm-start storage: amplitudes carry over between macro-iterations.
+        Cd_prev = zeros(T, dim_q, R)
     end
 
     Ec      = zeros(T, R)
@@ -1597,7 +1750,41 @@ function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
         for i in 1:R
             @printf(" CEPA Iter %3i  Root %i  Shift = %12.8f\n", it, i, shifts[i])
             eshift = e0[i] + shifts[i]
-            if solver == :minres
+            # CG only converges for a positive-definite shifted operator. The cheapest
+            # screen is the diagonal: if any Q-space state sits below the shift, go
+            # straight to MINRES for this solve.
+            try_pcg = solver == :pcg && (hdiag_min - eshift) > 0
+            if solver == :pcg && !try_pcg && verbose > 0
+                @printf("   shifted diagonal is not positive (min %.3e); using MINRES\n",
+                        hdiag_min - eshift)
+            end
+
+            Cd_i = nothing
+            if try_pcg
+                # Successive macro-iterations move the shift by only a small amount, so
+                # the previous amplitudes are an excellent guess and later solves
+                # converge in a few CG steps.
+                Cd_pcg, history = cepa_pcg_linsolve(Hq_mv, -h[:, i], Hdiag;
+                                                    eshift=eshift, tol=tol,
+                                                    maxiter=cg_maxiter, verbose=verbose,
+                                                    x0=(it > 1 ? view(Cd_prev, :, i) : nothing))
+                if history.indefinite
+                    # The diagonal screen is necessary but not sufficient: CG found a
+                    # direction the shifted operator is not positive on, so throw the
+                    # partial solve away and redo this root with MINRES.
+                    verbose > 0 &&
+                        @printf("   shifted operator is indefinite; redoing root %i with MINRES\n", i)
+                else
+                    Cd_i = Cd_pcg
+                    if verbose > 0
+                        @printf(" Iter %3i  Root %i  nops=%4i  res=%8.2e  E_corr = %16.12f%s\n",
+                                it, i, history.iters, history.residual, dot(Cd_i, h[:, i]),
+                                history.converged ? "" : "   (not converged)")
+                    end
+                end
+            end
+
+            if Cd_i === nothing && solver != :krylov
                 # MINRES handles symmetric indefinite (H_qq - eI can be indefinite)
                 H_eff = LinearMap{T}(v -> Hq_mv(v) .- eshift .* v, dim_q; issymmetric=true)
                 Cd_i, history = IterativeSolvers.minres(H_eff, -h[:, i];
@@ -1607,7 +1794,7 @@ function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
                     @printf(" Iter %3i  Root %i  nops=%4i  res=%8.2e  E_corr = %16.12f\n",
                             it, i, history.iters, history.data[:resnorm][end], dot(Cd_i, h[:, i]))
                 end
-            else
+            elseif Cd_i === nothing
                 Afunc = v -> Hq_mv(v) .- eshift .* v
                 Cd_i, info = KrylovKit.linsolve(Afunc, -h[:, i];
                                                 tol=tol, maxiter=cg_maxiter,
@@ -1618,6 +1805,8 @@ function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
                             it, i, info.numops, dot(Cd_i, h[:, i]))
                 end
             end
+
+            solver == :pcg && (Cd_prev[:, i] .= Cd_i)
             Ec[i] = dot(Cd_i, h[:, i])
         end
 
