@@ -94,6 +94,7 @@ include("core/spt_multinode.jl")
 include("core/tpsci_sharded_davidson.jl")
 include("core/spt_sharded.jl")
 include("core/tps_cepa_sharded.jl")
+include("core/tps_cepa_sharded_multiroot.jl")
 include("core/tpsci_helpers.jl")
 include("core/tpsci.jl")
 
@@ -205,5 +206,10 @@ export sharded_H_fit_report
 export print_sharded_H_fit
 export compute_diagonal_sharded
 export tps_sharded_cepa_solve
+export sharded_block_fused_ops!
+export apply_sharded_H_block
+export precondition_block_sharded
+export tps_sharded_cepa_pcg_block
+export tps_sharded_cepa_minres_block
 export do_tps_sharded_cepa
 end

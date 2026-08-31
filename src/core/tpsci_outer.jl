@@ -1857,6 +1857,7 @@ function do_fois_cepa(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
                         thresh_clip=1e-5,
                         tol=1e-8,
                         thresh_sigma=1e-8,
+                        cg_maxiter=300,
                         compress=false,
                         compress_type="matvec",
                         solver=:krylov,
@@ -1910,7 +1911,8 @@ function do_fois_cepa(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
     println()
     println(" Do CEPA: shared FOIS dim = ", length(pt1_vec))
     @time Ec, e_cepa = tpsci_cepa_solve(ref_vec, e0, pt1_vec, cluster_ops, clustered_ham,
-                                         cepa_shift, cepa_mit, tol=tol, thresh_sigma=thresh_sigma, solver=solver,
+                                         cepa_shift, cepa_mit, tol=tol, cg_maxiter=cg_maxiter,
+                                         thresh_sigma=thresh_sigma, solver=solver,
                                          build_hqq=build_hqq, multiroot=multiroot, verbose=verbose)
 
     for i in 1:R

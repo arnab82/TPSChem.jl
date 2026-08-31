@@ -446,9 +446,20 @@ function _tpsci_sharded_local_precondition_typed!(dest_id::Symbol,
     out = TPSCIstate(res.clusters, T=T, R=1)
     for (fock, configs) in res.data
         add_fockconfig!(out, fock)
+        # See the note in `precondition_block_sharded`: sharded states keep empty
+        # placeholder Fock sectors that a stored-H diagonal has no block for.
+        dfock = get(diag.data, fock, nothing)
+        if dfock === nothing
+            isempty(configs) ||
+                error("precondition_sharded: Fock sector $fock holds " *
+                      "$(length(configs)) configurations but is absent from the " *
+                      "diagonal on worker $(Distributed.myid())")
+            continue
+        end
         for (config, coeffs) in configs
-            d0 = thetaT - diag.data[fock][config][1]
-            scale = max(abs(thetaT), abs(diag.data[fock][config][1]), one(T))
+            dv = dfock[config][1]
+            d0 = thetaT - dv
+            scale = max(abs(thetaT), abs(dv), one(T))
             floor = sqrt(eps(T)) * scale
             d = abs(d0) < floor ? copysign(floor, iszero(d0) ? one(T) : d0) : d0
             out[fock][config] = MVector{1,T}(coeffs[1] / d)

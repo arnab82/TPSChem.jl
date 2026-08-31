@@ -32,6 +32,12 @@ const NROOTS  = parse(Int,     get(ENV, "CEPA_BENCH_NROOTS", "4"))
 const MROOTS  = parse(Int,     get(ENV, "CEPA_BENCH_M",      "100"))
 const NTHREAD = parse(Int,     get(ENV, "CEPA_BENCH_THREADS","4"))
 const CHILD   = get(ENV, "CEPA_BENCH_CHILD", "")
+# A :fois solve applies H through the whole FOIS every iteration -- tens of seconds
+# each here -- so an unbounded run is hours. Cap the budget: with the same cap on
+# both sides, multiroot and one-at-a-time do exactly the same number of applies and
+# the comparison measures precisely what blocking changes.
+const MAXIT   = parse(Int, get(ENV, "CEPA_BENCH_MAXITER", "300"))
+const FOISIT  = parse(Int, get(ENV, "CEPA_BENCH_FOIS_MAXITER", "6"))
 
 BLAS.set_num_threads(1)
 
@@ -73,7 +79,7 @@ if !isempty(CHILD)
     (r, peak) = with_peak_heap() do
         @timed TPSChem.do_fois_cepa(deepcopy(ci), cluster_ops, clustered_ham;
                                     thresh_foi=THRESH, nbody=4, tol=1e-8,
-                                    thresh_sigma=0.0,
+                                    thresh_sigma=0.0, cg_maxiter=MAXIT,
                                     solver=Symbol(solver),
                                     build_hqq=Symbol(storage),
                                     multiroot=(multiroot == "true"),
@@ -167,6 +173,7 @@ for (slv, st, mr) in configs
     env = copy(ENV)
     env["CEPA_BENCH_CHILD"] = "$slv,$st,$mr"
     env["JULIA_NUM_THREADS"] = string(NTHREAD)
+    env["CEPA_BENCH_MAXITER"] = string(st == "fois" ? FOISIT : MAXIT)
     out = try
         read(setenv(cmd, env), String)
     catch err
