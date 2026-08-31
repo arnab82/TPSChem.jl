@@ -1830,9 +1830,10 @@ Do CEPA in FOIS defined by ref and thresh_foi
                `:matvec` (nothing stored, entries recomputed per apply), `:fois`
                (applied through `open_matvec_thread`), or `:auto` (default:
                `:fois` for `:krylov`, `:direct` otherwise)
-    -`multiroot`: solve all R roots together, sharing one H apply per iteration
-               (default `true`). Not available for `solver=:krylov`, which is
-               single-RHS. See `tpsci_cepa_solve` for the full pathway table.
+    -`block_roots`: solve all R roots in one pass, sharing one H apply per
+               iteration, rather than one solve per root (default `true`). Not
+               available for `solver=:krylov`, which is single-RHS. See
+               `tpsci_cepa_solve` for the full pathway table.
     -`verbose`: verbosity level
 
 """
@@ -1862,7 +1863,7 @@ function do_fois_cepa(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
                         compress_type="matvec",
                         solver=:krylov,
                         build_hqq=:auto,
-                        multiroot=true,
+                        block_roots=true,
                         verbose=1) where {T,N,R}
     @printf("\n-------------------------------------------------------\n")
     @printf(" Do CEPA\n")
@@ -1913,7 +1914,7 @@ function do_fois_cepa(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
     @time Ec, e_cepa = tpsci_cepa_solve(ref_vec, e0, pt1_vec, cluster_ops, clustered_ham,
                                          cepa_shift, cepa_mit, tol=tol, cg_maxiter=cg_maxiter,
                                          thresh_sigma=thresh_sigma, solver=solver,
-                                         build_hqq=build_hqq, multiroot=multiroot, verbose=verbose)
+                                         build_hqq=build_hqq, block_roots=block_roots, verbose=verbose)
 
     for i in 1:R
         @printf(" E(cepa) root %i  corr= %12.8f  total= %12.8f\n", i, Ec[i], e_cepa[i])
@@ -2442,7 +2443,7 @@ end
 
 """
     tpsci_cepa_solve(ref_vector, e0, cepa_vector, cluster_ops, clustered_ham, cepa_shift, cepa_mit;
-                     solver, build_hqq, multiroot, tol, verbose)
+                     solver, build_hqq, block_roots, tol, verbose)
 
 Multi-root CEPA solver for TPSCIstate.
 
@@ -2486,7 +2487,9 @@ which combination was taken.
 - `:auto` (default) — `:fois` for `:krylov`, `:direct` otherwise, i.e. what each
   solver did before the other options existed.
 
-`multiroot` — whether the R roots are solved together. Batching does not reduce
+`block_roots` — whether the R roots are solved in one pass. The solver is
+multiroot either way; this decides whether the roots share the applies or take
+turns. Batching does not reduce
 flops; it amortises the work every root shares — streaming H_qq from memory,
 recomputing its entries, or screening FOIS terms — so the win is large exactly
 where that shared work dominates, which is all three of `:sparse`, `:matvec` and
@@ -2495,7 +2498,7 @@ only the matvec is shared. Blocked solves use the root-major `R × dim_q` layout
 described with the block operators above.
 
 h[I] is always computed matrix-free through `open_matvec_thread`. With
-`multiroot`, all R coupling vectors come from one FOIS matvec instead of R —
+`block_roots`, all R coupling vectors come from one FOIS matvec instead of R —
 note that its screening is `maximum(abs, coef_ket)` over the roots, so the blocked
 h keeps the union of the roots' surviving terms and is not bitwise identical to
 the root-at-a-time result.
@@ -2511,7 +2514,7 @@ function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
                            thresh_sigma = 1e-8,
                            solver=:krylov,
                            build_hqq=:auto,
-                           multiroot=true,
+                           block_roots=true,
                            verbose=0) where {T,N,R,R2}
 
     n_clusters = length(ref_vector.clusters)
@@ -2528,8 +2531,8 @@ function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
 
     # KrylovKit.linsolve takes one right-hand side, so :krylov cannot be blocked.
     # Everything else can, and there is no case where doing so costs time.
-    block = multiroot && R > 1 && solver != :krylov
-    if multiroot && R > 1 && solver == :krylov
+    block = block_roots && R > 1 && solver != :krylov
+    if block_roots && R > 1 && solver == :krylov
         @printf(" note: solver=:krylov is single-RHS, so the roots are solved one at a time.\n")
         @printf("       for a blocked matrix-free solve use solver=:pcg or :minres with build_hqq=:fois\n")
     end

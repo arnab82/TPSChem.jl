@@ -15,12 +15,13 @@ using JLD2
 using LinearAlgebra
 using Printf
 
-# Multiroot TPS-CEPA across nodes. Blocking shares one Hamiltonian apply and one
+# Blocked-root TPS-CEPA across nodes: all roots in one solver pass rather than one
+# pass per root. Blocking shares one Hamiltonian apply and one
 # set of fan-outs across the roots while each root keeps its own shift, Krylov
 # scalars and convergence test — so every blocked primitive must reproduce the
 # root-at-a-time one it replaces, and the end-to-end energies must match both the
 # unblocked sharded solver and the single-node one.
-@testset "tps-cepa multiroot multinode" begin
+@testset "tps-cepa blocked roots multinode" begin
     @load "_testdata_cmf_h8.jld2"
 
     T = Float64
@@ -184,11 +185,11 @@ using Printf
     for (tier, slv) in ((:blocks, :minres), (:blocks, :pcg), (:matrixfree, :minres))
         e_one, q_one = TPSChem.do_tps_sharded_cepa(deepcopy(ref_solved), cluster_ops,
             clustered_ham; cepa_shift="cepa", h_storage=tier, solver=slv,
-            multiroot=false, common...)
+            block_roots=false, common...)
         TPSChem.destroy!(q_one)
         e_blk, q_blk = TPSChem.do_tps_sharded_cepa(deepcopy(ref_solved), cluster_ops,
             clustered_ham; cepa_shift="cepa", h_storage=tier, solver=slv,
-            multiroot=true, common...)
+            block_roots=true, common...)
         TPSChem.destroy!(q_blk)
         @test length(e_blk) == nroots
         @test all(isfinite, e_blk)
@@ -199,11 +200,11 @@ using Printf
     # acpf drives the shift iteratively, which is what exercises the warm start.
     e_acpf_one, q1 = TPSChem.do_tps_sharded_cepa(deepcopy(ref_solved), cluster_ops,
         clustered_ham; cepa_shift="acpf", h_storage=:blocks, solver=:minres,
-        multiroot=false, common...)
+        block_roots=false, common...)
     TPSChem.destroy!(q1)
     e_acpf_blk, q2 = TPSChem.do_tps_sharded_cepa(deepcopy(ref_solved), cluster_ops,
         clustered_ham; cepa_shift="acpf", h_storage=:blocks, solver=:minres,
-        multiroot=true, common...)
+        block_roots=true, common...)
     TPSChem.destroy!(q2)
     @test maximum(abs.(e_acpf_blk .- e_acpf_one)) < 1e-8
 end

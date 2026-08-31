@@ -1,5 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Multiroot (blocked) TPS-CEPA across nodes.
+# Blocked-root TPS-CEPA across nodes: all R roots in one solver pass.
+#
+# Nothing here makes the method multiroot — it always was; R roots in, R energies
+# out. What changes is that the roots used to be solved one *attempt* at a time
+# and now share a single one.
 #
 # The sharded CEPA solver used to walk the roots one at a time: every root paid
 # its own Hamiltonian apply, its own fan-out per vector operation, and its own
@@ -917,9 +921,9 @@ end
     _tps_sharded_cepa_solve_block(ref_vector, e0, cepa_vector, cluster_ops, clustered_ham,
                                   cepa_shift, cepa_mit; ...) -> (Ec, e0 .+ Ec)
 
-Multiroot TPS-CEPA: the Q-space Hamiltonian is built once and every root's
-amplitude equation is solved in the same block, so one apply and one set of
-fan-outs serve all R roots.
+Solve every root's amplitude equation in one pass: the Q-space Hamiltonian is
+built once and all R equations ride on the same applies, so one apply and one set
+of fan-outs serve all R roots instead of R of each.
 
 Solver choice is made for the block as a unit. CG needs a positive-definite
 shifted operator and MINRES does not, so PCG runs only when *every* root clears

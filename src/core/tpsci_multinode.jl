@@ -1961,7 +1961,7 @@ function do_fois_cepa_sharded(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham
                               workers=Distributed.workers(),
                               threaded_worker=true,
                               blas_threads=1,
-                              multiroot=true,
+                              block_roots=true,
                               verbose=1) where {T,N,R}
     # Backward-compatible matrix-free entry point; delegates to the consolidated
     # do_tps_sharded_cepa with h_storage=:matrixfree (identical behavior). Call
@@ -1975,7 +1975,7 @@ function do_fois_cepa_sharded(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham
                                ci_max_ss_vecs=ci_max_ss_vecs,
                                ci_lindep_thresh=ci_lindep_thresh, cg_maxiter=cg_maxiter,
                                workers=workers, threaded_worker=threaded_worker,
-                               blas_threads=blas_threads, multiroot=multiroot,
+                               blas_threads=blas_threads, block_roots=block_roots,
                                verbose=verbose)
 end
 

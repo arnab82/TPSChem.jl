@@ -1,7 +1,8 @@
 #
-# CEPA solver pathway benchmark: multiroot vs one-root-at-a-time, single node.
+# CEPA solver pathway benchmark, single node: all roots in one solver pass vs one
+# pass per root.
 #
-#   JULIA_NUM_THREADS=4 julia --project=. examples/cepa_multiroot_bench.jl
+#   JULIA_NUM_THREADS=4 julia --project=. examples/cepa_blocked_roots_bench.jl
 #
 # Two tables:
 #   1. Operator throughput — one H_qq apply, one root vs a block of R, for each
@@ -9,7 +10,7 @@
 #      work every root shares (streaming H_qq, recomputing its entries, screening
 #      FOIS terms) is done once instead of R times.
 #   2. End-to-end CEPA-0 — full `do_fois_cepa` for each (solver, storage,
-#      multiroot) combination, with wall time, allocations and peak RSS.
+#      block_roots) combination, with wall time, allocations and peak RSS.
 #
 # Every configuration in table 2 runs in a fresh subprocess, because `Sys.maxrss()`
 # is a high-water mark for the whole process: measured in-process, one configuration's
@@ -34,10 +35,14 @@ const NTHREAD = parse(Int,     get(ENV, "CEPA_BENCH_THREADS","4"))
 const CHILD   = get(ENV, "CEPA_BENCH_CHILD", "")
 # A :fois solve applies H through the whole FOIS every iteration -- tens of seconds
 # each here -- so an unbounded run is hours. Cap the budget: with the same cap on
-# both sides, multiroot and one-at-a-time do exactly the same number of applies and
+# both sides, block_roots and one-at-a-time do exactly the same number of applies and
 # the comparison measures precisely what blocking changes.
 const MAXIT   = parse(Int, get(ENV, "CEPA_BENCH_MAXITER", "300"))
 const FOISIT  = parse(Int, get(ENV, "CEPA_BENCH_FOIS_MAXITER", "6"))
+const CEPA_MIT = parse(Int, get(ENV, "CEPA_BENCH_MIT", "30"))
+# Comma-separated shift names to run, e.g. CEPA_BENCH_SHIFTS=acpf,aqcc to add rows
+# to an already-measured table without repeating the expensive CEPA-0 ones.
+const SHIFTS  = split(get(ENV, "CEPA_BENCH_SHIFTS", "cepa,acpf,aqcc"), ",")
 
 BLAS.set_num_threads(1)
 
@@ -72,22 +77,23 @@ end
 
 # ── Child mode: run one end-to-end configuration and report one line ─────────
 if !isempty(CHILD)
-    solver, storage, multiroot = split(CHILD, ",")
+    solver, storage, block_roots, shift = split(CHILD, ",")
     ci, cluster_ops, clustered_ham = setup()
     GC.gc()
     rss0 = Sys.maxrss()
     (r, peak) = with_peak_heap() do
         @timed TPSChem.do_fois_cepa(deepcopy(ci), cluster_ops, clustered_ham;
+                                    cepa_shift=String(shift), cepa_mit=CEPA_MIT,
                                     thresh_foi=THRESH, nbody=4, tol=1e-8,
                                     thresh_sigma=0.0, cg_maxiter=MAXIT,
                                     solver=Symbol(solver),
                                     build_hqq=Symbol(storage),
-                                    multiroot=(multiroot == "true"),
+                                    block_roots=(block_roots == "true"),
                                     verbose=0)
     end
     e = r.value[1]
-    @printf("RESULT\t%s\t%s\t%s\t%.3f\t%.3f\t%.3f\t%.3f\t%s\n",
-            solver, storage, multiroot, r.time, r.bytes/2^30,
+    @printf("RESULT\t%s\t%s\t%s\t%s\t%.3f\t%.3f\t%.3f\t%.3f\t%s\n",
+            solver, storage, block_roots, shift, r.time, r.bytes/2^30,
             peak/2^30, max(Sys.maxrss(), rss0)/2^30,
             join((@sprintf("%.10f", x) for x in e), ","))
     exit(0)
@@ -98,7 +104,7 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 @printf("\n")
 println("═"^96)
-@printf(" CEPA multiroot benchmark — %s\n", basename(DATA))
+@printf(" CEPA blocked-roots benchmark — %s\n", basename(DATA))
 @printf(" julia threads = %i   BLAS threads = 1   R = %i   thresh_foi = %.0e   M = %i\n",
         Threads.nthreads(), NROOTS, THRESH, MROOTS)
 println("═"^96)
@@ -158,48 +164,63 @@ end
 @printf(" speedup = %i x (1-root time) / (block time): 1.0 means blocking bought nothing\n", NROOTS)
 
 # ── Table 2: end-to-end, one subprocess per configuration ────────────────────
-configs = [("minres", "sparse", "false"), ("minres", "sparse", "true"),
-           ("minres", "matvec", "false"), ("minres", "matvec", "true"),
-           ("minres", "fois",   "false"), ("minres", "fois",   "true"),
-           ("pcg",    "sparse", "false"), ("pcg",    "sparse", "true"),
-           ("krylov", "fois",   "false")]
+# CEPA-0 runs a single macro-iteration, so the solve -- the only part blocking
+# touches -- is at its smallest against the one-time FOIS and H_qq build. ACPF and
+# AQCC iterate the shift, repeating the solve while the build stays one-time, so
+# they are where blocking should pay even for a cheap stored-matrix apply.
+# :matvec and :fois are CEPA-0 only here: at seconds per apply, thirty
+# macro-iterations of them would run for hours, and their per-apply win is already
+# unambiguous in table 1.
+configs = [("minres", "sparse", "false", "cepa"), ("minres", "sparse", "true", "cepa"),
+           ("minres", "matvec", "false", "cepa"), ("minres", "matvec", "true", "cepa"),
+           ("minres", "fois",   "false", "cepa"), ("minres", "fois",   "true", "cepa"),
+           ("pcg",    "sparse", "false", "cepa"), ("pcg",    "sparse", "true", "cepa"),
+           ("krylov", "fois",   "false", "cepa"),
+           ("minres", "sparse", "false", "acpf"), ("minres", "sparse", "true", "acpf"),
+           ("pcg",    "sparse", "false", "acpf"), ("pcg",    "sparse", "true", "acpf"),
+           ("minres", "sparse", "false", "aqcc"), ("minres", "sparse", "true", "aqcc")]
+configs = [c for c in configs if c[4] in SHIFTS]
 
 @printf("\n ┌ Table 2: end-to-end CEPA-0 (fresh process each, peak RSS is real) ───────────────────┐\n")
-@printf(" %-8s %-8s %-10s %10s %10s %10s %10s\n",
-        "solver", "storage", "multiroot", "time (s)", "alloc GiB", "heap GiB", "RSS GiB")
+@printf(" %-8s %-8s %-8s %-6s %10s %10s %10s %10s\n",
+        "solver", "storage", "blocked", "shift", "time (s)", "alloc GiB", "heap GiB", "RSS GiB")
 rows = Any[]
-for (slv, st, mr) in configs
+for (slv, st, mr, sh) in configs
     cmd = `$(Base.julia_cmd()) --project=$(dirname(@__DIR__)) $(@__FILE__)`
     env = copy(ENV)
-    env["CEPA_BENCH_CHILD"] = "$slv,$st,$mr"
+    env["CEPA_BENCH_CHILD"] = "$slv,$st,$mr,$sh"
     env["JULIA_NUM_THREADS"] = string(NTHREAD)
     env["CEPA_BENCH_MAXITER"] = string(st == "fois" ? FOISIT : MAXIT)
     out = try
         read(setenv(cmd, env), String)
     catch err
-        @printf(" %-8s %-8s %-10s   FAILED (%s)\n", slv, st, mr, sprint(showerror, err))
+        @printf(" %-8s %-8s %-8s %-6s   FAILED\n", slv, st, mr, sh)
         continue
     end
     line = findfirst(l -> startswith(l, "RESULT"), split(out, '\n'))
     if line === nothing
-        @printf(" %-8s %-8s %-10s   NO RESULT\n", slv, st, mr)
+        @printf(" %-8s %-8s %-8s %-6s   NO RESULT\n", slv, st, mr, sh)
         continue
     end
     f = split(split(out, '\n')[line], '\t')
-    @printf(" %-8s %-8s %-10s %10.2f %10.3f %10.3f %10.3f\n",
-            f[2], f[3], f[4], parse(Float64,f[5]), parse(Float64,f[6]),
-            parse(Float64,f[7]), parse(Float64,f[8]))
-    push!(rows, (slv, st, mr, parse.(Float64, split(f[9], ','))))
+    @printf(" %-8s %-8s %-8s %-6s %10.2f %10.3f %10.3f %10.3f\n",
+            f[2], f[3], f[4], f[5], parse(Float64,f[6]), parse(Float64,f[7]),
+            parse(Float64,f[8]), parse(Float64,f[9]))
+    push!(rows, (slv, st, mr, sh, parse.(Float64, split(f[10], ','))))
     flush(stdout)
 end
 @printf(" └%s┘\n", "─"^86)
 
 # ── Energies must agree across every pathway ─────────────────────────────────
-if !isempty(rows)
-    ref = rows[1][4]
-    @printf("\n Energy agreement (vs %s/%s/multiroot=%s):\n", rows[1][1], rows[1][2], rows[1][3])
-    for (slv, st, mr, e) in rows
-        @printf("   %-8s %-8s multiroot=%-6s  max|ΔE| = %.2e\n",
+# Compare within a shift family: acpf and aqcc converge to different energies than
+# cepa-0, so one global reference would be meaningless.
+for family in unique(r[4] for r in rows)
+    fam = [r for r in rows if r[4] == family]
+    ref = fam[1][5]
+    @printf("\n Energy agreement, shift=%s (vs %s/%s/blocked=%s):\n",
+            family, fam[1][1], fam[1][2], fam[1][3])
+    for (slv, st, mr, sh, e) in fam
+        @printf("   %-8s %-8s blocked=%-6s  max|ΔE| = %.2e\n",
                 slv, st, mr, maximum(abs.(e .- ref)))
     end
 end

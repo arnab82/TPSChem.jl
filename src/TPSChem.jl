@@ -94,7 +94,7 @@ include("core/spt_multinode.jl")
 include("core/tpsci_sharded_davidson.jl")
 include("core/spt_sharded.jl")
 include("core/tps_cepa_sharded.jl")
-include("core/tps_cepa_sharded_multiroot.jl")
+include("core/tps_cepa_sharded_blocked.jl")
 include("core/tpsci_helpers.jl")
 include("core/tpsci.jl")
 

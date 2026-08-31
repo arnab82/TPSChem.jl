@@ -437,12 +437,12 @@ function tps_sharded_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
                                 workers=cepa_vector.workers,
                                 threaded_worker=true,
                                 blas_threads=1,
-                                multiroot=true,
+                                block_roots=true,
                                 verbose=0) where {T,N,R,Rq}
     # Blocked path: one Hamiltonian apply and one set of fan-outs for every root.
     # Nothing about the stored H, the Fock routing or the communication pattern is
     # root-specific, so the roots only ever paid for that work R times over.
-    if multiroot && R > 1
+    if block_roots && R > 1
         return _tps_sharded_cepa_solve_block(ref_vector, e0, cepa_vector, cluster_ops,
                                              clustered_ham, cepa_shift, cepa_mit;
                                              tol=tol, cg_maxiter=cg_maxiter, nbody=nbody,
@@ -639,7 +639,7 @@ function do_tps_sharded_cepa(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
                              workers=Distributed.workers(),
                              threaded_worker=true,
                              blas_threads=1,
-                             multiroot=true,
+                             block_roots=true,
                              verbose=1) where {T,N,R}
     worker_ids = ensure_tpsci_multinode_workers!(workers=workers)
     if verbose > 0
@@ -651,7 +651,7 @@ function do_tps_sharded_cepa(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
         @printf("   Calculation type        = %s\n", cepa_shift)
         @printf("   H storage               = %s\n", h_storage)
         @printf("   Roots                   = %s\n",
-                (multiroot && R > 1) ? "block($R)" : "one-at-a-time($R)")
+                (block_roots && R > 1) ? "block($R)" : "one-at-a-time($R)")
         @printf("   Workers                 = %s\n", worker_ids)
         @printf("\n-------------------------------------------------------\n")
         flush(stdout)
@@ -736,7 +736,7 @@ function do_tps_sharded_cepa(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
         warm_start=warm_start, h_storage=h_storage,
         max_mem_H=max_mem_H,
         workers=worker_ids, threaded_worker=threaded_worker,
-        blas_threads=blas_threads, multiroot=multiroot, verbose=verbose)
+        blas_threads=blas_threads, block_roots=block_roots, verbose=verbose)
     verbose > 1 && @printf(" TPS-CEPA solve: %.2f s\n", time() - _t_cepa)
 
     if verbose > 0

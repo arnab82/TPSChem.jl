@@ -1,15 +1,16 @@
 #
-# Multinode CEPA pathway benchmark: multiroot vs one-root-at-a-time.
+# Multinode CEPA pathway benchmark: all roots in one solver pass vs one pass per
+# root.
 #
 #   CEPA_MN_WORKERS=2 CEPA_MN_THREADS=4 julia --project=. \
-#       examples/multinode/cepa_multiroot_bench_multinode.jl
+#       examples/multinode/cepa_blocked_roots_bench_multinode.jl
 #
-# Two tables, mirroring examples/cepa_multiroot_bench.jl:
+# Two tables, mirroring examples/cepa_blocked_roots_bench.jl:
 #   1. One sharded Hamiltonian apply, one root vs a block of R, for both storage
 #      tiers. This isolates what blocking changes across nodes: the stored H, the
 #      Fock-sector routing and the number of remote round trips are identical for
 #      every root, so batching them costs one apply instead of R.
-#   2. End-to-end `do_tps_sharded_cepa` per (tier, solver, multiroot), with wall
+#   2. End-to-end `do_tps_sharded_cepa` per (tier, solver, block_roots), with wall
 #      time and peak RSS on the master and on every worker.
 #
 # Each end-to-end configuration runs in a fresh master that spawns fresh workers,
@@ -61,7 +62,7 @@ worker_rss() = Dict(pid => remotecall_fetch(Sys.maxrss, pid) for pid in workers(
 
 # ── Child mode: one end-to-end configuration ─────────────────────────────────
 if !isempty(CHILD)
-    tier, solver, multiroot, shift = split(CHILD, ",")
+    tier, solver, block_roots, shift = split(CHILD, ",")
     ci, cluster_ops, clustered_ham = setup()
     # Solve the reference locally and hand over e0: the sharded Davidson cannot
     # start from the raw spin-Fock expansion (its initial guess is rank deficient),
@@ -75,13 +76,13 @@ if !isempty(CHILD)
                                            thresh_sigma=0.0,
                                            h_storage=Symbol(tier),
                                            solver=Symbol(solver),
-                                           multiroot=(multiroot == "true"),
+                                           block_roots=(block_roots == "true"),
                                            workers=workers(), verbose=0)
     e, q = r.value
     TPSChem.destroy!(q)
     wr = worker_rss()
     @printf("RESULT\t%s\t%s\t%s\t%s\t%.3f\t%.3f\t%.3f\t%.3f\t%s\n",
-            tier, solver, multiroot, shift, r.time, r.bytes/2^30,
+            tier, solver, block_roots, shift, r.time, r.bytes/2^30,
             Sys.maxrss()/2^30, maximum(values(wr))/2^30,
             join((@sprintf("%.10f", x) for x in e), ","))
     exit(0)
@@ -91,7 +92,7 @@ end
 # Parent
 # ─────────────────────────────────────────────────────────────────────────────
 println("="^100)
-@printf(" Multinode CEPA multiroot benchmark — %s\n", basename(DATA))
+@printf(" Multinode CEPA blocked-roots benchmark — %s\n", basename(DATA))
 @printf(" workers = %i   threads/worker = %i   BLAS = 1   R = %i   thresh_foi = %.0e\n",
         nworkers(), NTHREAD, NROOTS, THRESH)
 println("="^100)
@@ -162,7 +163,7 @@ configs = [("blocks",     "minres", "false", "cepa"), ("blocks",     "minres", "
 
 @printf("\n ┌ Table 2: end to end (fresh master + workers each, cepa_mit=%i) ──────────────────────┐\n", CEPA_MIT)
 @printf(" %-11s %-7s %-10s %-6s %10s %10s %11s %11s\n",
-        "tier", "solver", "multiroot", "shift", "time (s)", "alloc GiB", "master GiB", "worker GiB")
+        "tier", "solver", "blocked", "shift", "time (s)", "alloc GiB", "master GiB", "worker GiB")
 rows = Any[]
 for (tier, slv, mr, sh) in configs
     cmd = `$(Base.julia_cmd()) --project=$(dirname(dirname(@__DIR__))) $(@__FILE__)`
@@ -196,10 +197,10 @@ for family in unique(r[4] for r in rows)
     fam = [r for r in rows if r[4] == family]
     isempty(fam) && continue
     ref = fam[1][5]
-    @printf("\n Energy agreement, shift=%s (vs %s/%s/multiroot=%s):\n",
+    @printf("\n Energy agreement, shift=%s (vs %s/%s/blocked=%s):\n",
             family, fam[1][1], fam[1][2], fam[1][3])
     for (tier, slv, mr, sh, e) in fam
-        @printf("   %-11s %-7s multiroot=%-6s  max|ΔE| = %.2e\n", tier, slv, mr,
+        @printf("   %-11s %-7s blocked=%-6s  max|ΔE| = %.2e\n", tier, slv, mr,
                 maximum(abs.(e .- ref)))
     end
 end
