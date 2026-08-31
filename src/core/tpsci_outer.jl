@@ -2299,6 +2299,13 @@ function cepa_minres_block(op, B::Matrix{T}, eshifts::Vector{T};
     w_curr = zeros(T, R, n)
     w_next = zeros(T, R, n)
 
+    # Measure convergence against ||b||, not against the starting residual. A warm
+    # start makes the latter small, so scaling `tol` by it would demand a solve
+    # `tol` times tighter than the previous macro-iteration achieved -- compounding
+    # every round and cancelling the benefit of warm starting outright. (Cold
+    # starts are unaffected: there v_curr is still b, so the two agree.)
+    bnorm = zeros(T, R); _block_nrm2!(bnorm, B)
+
     if X0 !== nothing
         # v_next doubles as scratch for A*x0, exactly as IterativeSolvers does.
         _apply_shifted!(v_next, op, X, eshifts)
@@ -2308,7 +2315,7 @@ function cepa_minres_block(op, B::Matrix{T}, eshifts::Vector{T};
     end
 
     resnorm = zeros(T, R); _block_nrm2!(resnorm, v_curr)
-    tolerance = [tol * resnorm[c] for c in 1:R]
+    tolerance = [tol * bnorm[c] for c in 1:R]
 
     H1 = zeros(T, R); H2 = zeros(T, R); H3 = zeros(T, R); H4 = zeros(T, R)
     rhs1 = copy(resnorm); rhs2 = zeros(T, R)
@@ -2733,7 +2740,19 @@ function _cepa_single_solve(op, b::Vector{T}, Hdiag::Vector{T}, eshift::T,
     if Cd_i === nothing && solver != :krylov
         # MINRES handles symmetric indefinite (H_qq - eI can be indefinite)
         H_eff = LinearMap{T}(v -> op(v) .- eshift .* v, dim_q; issymmetric=true)
-        Cd_i, history = IterativeSolvers.minres(H_eff, b; reltol=tol, maxiter=maxiter, log=true)
+        # Warm start from the previous macro-iteration's amplitudes, and hold the
+        # target at tol*||b|| while doing it. `reltol` is relative to the *starting*
+        # residual, which a warm start makes small -- leaving it on would demand a
+        # solve `tol` times tighter every round and throw the warm start away.
+        if x0 === nothing
+            Cd_i, history = IterativeSolvers.minres(H_eff, b; reltol=tol,
+                                                    maxiter=maxiter, log=true)
+        else
+            Cd_i, history = IterativeSolvers.minres!(copy(x0), H_eff, b;
+                                                     reltol=zero(T),
+                                                     abstol=tol*max(norm(b), one(T)),
+                                                     maxiter=maxiter, log=true)
+        end
         if verbose > 0
             @printf(" Iter %3i  Root %i  [minres]  nops=%4i  res=%8.2e  E_corr = %16.12f\n",
                     it, root, history.iters, history.data[:resnorm][end], dot(Cd_i, hvec))

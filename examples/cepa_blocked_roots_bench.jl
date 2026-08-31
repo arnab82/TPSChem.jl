@@ -181,7 +181,10 @@ configs = [("minres", "sparse", "false", "cepa"), ("minres", "sparse", "true", "
            ("minres", "sparse", "false", "aqcc"), ("minres", "sparse", "true", "aqcc")]
 configs = [c for c in configs if c[4] in SHIFTS]
 
-@printf("\n ┌ Table 2: end-to-end CEPA-0 (fresh process each, peak RSS is real) ───────────────────┐\n")
+# One run per configuration, and on the cheap stored tiers the whole solve is a
+# second or so out of a twelve-second run -- comfortably inside run-to-run
+# variance. Repeat a row before reading anything into a small difference.
+@printf("\n ┌ Table 2: end to end (fresh process each, peak RSS is real, cepa_mit=%i) ─────────────┐\n", CEPA_MIT)
 @printf(" %-8s %-8s %-8s %-6s %10s %10s %10s %10s\n",
         "solver", "storage", "blocked", "shift", "time (s)", "alloc GiB", "heap GiB", "RSS GiB")
 rows = Any[]

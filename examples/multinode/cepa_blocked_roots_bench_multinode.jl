@@ -32,6 +32,9 @@ const DATA    = get(ENV, "CEPA_MN_DATA",
                     joinpath(@__DIR__, "..", "..", "test", "data_cmf_13_cr2_morokuma.jld2"))
 const CHILD   = get(ENV, "CEPA_MN_CHILD", "")
 const CEPA_MIT = parse(Int, get(ENV, "CEPA_MN_MIT", "30"))
+# Comma-separated shift names to run, e.g. CEPA_MN_SHIFTS=acpf,aqcc to add rows to
+# an already-measured table without repeating the expensive CEPA-0 ones.
+const SHIFTS  = split(get(ENV, "CEPA_MN_SHIFTS", "cepa,acpf,aqcc"), ",")
 
 if nprocs() == 1
     addprocs(NWORK; exeflags=["--project=$(Base.active_project())", "-t$NTHREAD"])
@@ -160,6 +163,7 @@ configs = [("blocks",     "minres", "false", "cepa"), ("blocks",     "minres", "
            ("blocks",     "minres", "false", "acpf"), ("blocks",     "minres", "true", "acpf"),
            ("blocks",     "pcg",    "false", "acpf"), ("blocks",     "pcg",    "true", "acpf"),
            ("blocks",     "minres", "false", "aqcc"), ("blocks",     "minres", "true", "aqcc")]
+configs = [c for c in configs if c[4] in SHIFTS]
 
 @printf("\n ┌ Table 2: end to end (fresh master + workers each, cepa_mit=%i) ──────────────────────┐\n", CEPA_MIT)
 @printf(" %-11s %-7s %-10s %-6s %10s %10s %11s %11s\n",
