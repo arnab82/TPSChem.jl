@@ -29,18 +29,73 @@ question is whether H_qq fits in memory.
 | `:fois` | `:matrixfree` | nothing; H applied through `open_matvec_thread` | last resort |
 | `:auto` (default) | `:auto` (default) | — | picks for you (multinode checks the memory budget) |
 
-**Check the fill before committing to a big run.** H_qq is *not* very sparse —
-around 34–36% on the Cr2 systems measured. The solver prints
+**Size the storage to the node, then check the fill.** Once H_qq is stored the
+solve costs almost nothing on top of it — a blocked MINRES holds seven `R × dim_q`
+blocks, which is 61 MB at `dim_q = 181000` with 6 roots, against a matrix measured
+in hundreds of GB. So the sane budget is most of the node for the matrix (say 80%)
+and a rounding error for the solve. That is the whole argument for storing it: the
+matrix-free path it replaces allocated 8.7 GiB *per matvec*.
+
+Given a budget *B*, the question is which container fits — and **do not assume
+`:sparse` is the sparse-friendly choice.** H_qq is often not very sparse: 34–36%
+measured on the Cr2 systems here, and fill rises as the cluster count falls and
+the local bases grow, because more configuration pairs stay Fock-connected. Fill
+is system-specific and worth measuring rather than assuming.
+
+That matters because **CSC only beats dense below 50% fill**. CSC stores 16 bytes
+per entry (a `Float64` plus an `Int64` row index); dense stores 8 bytes per entry
+and no indices. So:
+
+| fill | `:sparse` CSC | `:direct` dense | which is smaller |
+|---|---|---|---|
+| 20% | `dim_q² × 3.2 B` | `dim_q² × 8 B` | sparse |
+| 50% | `dim_q² × 8 B` | `dim_q² × 8 B` | break even |
+| 75% | `dim_q² × 12 B` | `dim_q² × 8 B` | **dense** |
+
+At `dim_q = 181000` that is 394 GB for `:sparse` against 263 GB for `:direct` —
+`:sparse` is the worse of the two, and above 50% fill it is also slower to apply
+(indirect indexing beats nothing about a contiguous column).
+
+Worse, the `:sparse` **build** peaks well above its final size: it accumulates
+per-thread `(I, J, V)` COO triplets at ~24 bytes per entry before `sparse()`
+compresses them. At 75% fill and `dim_q = 181000` that is ~590 GB transient, on
+top of the CSC. A `:sparse` job can therefore die in the builder even when the
+final matrix would have fitted.
+
+The solver prints what it found, and now says so when the choice was wrong:
 
 ```
-H_qq nnz = 17203358  (34.089% fill, 0.26 GiB CSC)
+ dense would be:              244.71 GiB  (CSC breaks even with dense at 50% fill)
+ H_qq nnz = 24600000000  (75.000% fill, 367.28 GiB CSC)
+ note: 75% fill — build_hqq=:direct would store this in 244.71 GiB
+       instead of 367.28 GiB, and apply faster. :sparse only pays below 50%.
 ```
 
-At 35% fill, storage is `dim_q² × 0.35 × 16 B`. That is 0.26 GiB at
-`dim_q = 7104`, but **~180 GB at `dim_q = 181000`** — so past roughly
-`dim_q ≈ 40000` on a 256 GB node, `:sparse`/`:blocks` stops being an option and
-`:matvec` is the realistic choice. Multinode `:auto` runs this check itself and
-announces a downgrade to `:matrixfree`; single node does not, so look at the
+**Single-node storage rule**, given a measured fill *f* and a memory budget *B*
+(80% of the node is a reasonable *B* — the solve needs well under a GB on top):
+
+- *f* < 50% and `dim_q² × f × 16 B` < *B* → `:sparse`
+- *f* ≥ 50% and `dim_q² × 8 B` < *B* → `:direct`
+- otherwise → `:matvec`, and consider going multinode instead
+
+Largest `dim_q` that fits a 176 GB budget (80% of a 220 GB node):
+
+| container | bytes/entry | max dim_q |
+|---|---|---|
+| `:sparse` at 20% fill | 3.2 | 234000 |
+| `:sparse` at 35% fill | 5.6 | 177000 |
+| `:sparse` at 50% fill | 8.0 | 148000 |
+| `:direct` (full dense) | 8.0 | 148000 | 
+
+`:direct` is fill-independent, which makes it the predictable option when the fill
+is unknown. Note that `build_H_qq` computes only the lower triangle and then
+mirrors it, so a packed-triangle store would fit `dim_q` up to 209000 in the same
+budget — that container does not exist yet.
+
+Multinode `:blocks` sidesteps the whole question: it stores **dense per-Fock-block**
+(8 B per entry, no index overhead) and shards it across nodes, so its footprint is
+`nnz × 8 B` divided by the node count. `:auto` runs the feasibility check itself
+and announces a downgrade to `:matrixfree`; single node does not, so read the
 printed fill.
 
 Relative cost of one apply at `dim_q = 7104` (4 threads, R = 4 roots):

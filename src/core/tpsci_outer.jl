@@ -2554,11 +2554,25 @@ function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
     # ── Build (or wrap) the Q-space operator ─────────────────────────────────────
     H_qq_stored = nothing   # set only when a matrix is actually materialised
     Hq = if storage == :sparse
+        # CSC pays 16 B per stored entry (value + Int64 row index) against dense's
+        # 8 B, so it only wins below 50% fill -- and H_qq is often well above that.
+        # The COO build peaks higher still: per-thread (I, J, V) triplets are ~24 B
+        # per entry before `sparse()` compresses them, on top of the CSC itself.
         @printf(" Building H_qq (%i × %i) [sparse] — reused by every solve\n", dim_q, dim_q)
+        @printf(" %-28s %.2f GiB  (CSC breaks even with dense at 50%% fill)\n",
+                " dense would be:", dim_q^2*sizeof(T)/2^30)
+        flush(stdout)
         @time H_qq_stored = build_H_qq_sparse(cepa_work, cluster_ops, clustered_ham)
+        fill_frac = nnz(H_qq_stored)/dim_q^2
         @printf(" H_qq nnz = %i  (%.3f%% fill, %.2f GiB CSC)\n",
-                nnz(H_qq_stored), 100*nnz(H_qq_stored)/dim_q^2,
+                nnz(H_qq_stored), 100*fill_frac,
                 (nnz(H_qq_stored)*(sizeof(T)+8) + (dim_q+1)*8)/2^30)
+        if fill_frac > 0.5
+            @printf(" note: %.0f%% fill — build_hqq=:direct would store this in %.2f GiB\n",
+                    100*fill_frac, dim_q^2*sizeof(T)/2^30)
+            @printf("       instead of %.2f GiB, and apply faster. :sparse only pays below 50%%.\n",
+                    (nnz(H_qq_stored)*(sizeof(T)+8) + (dim_q+1)*8)/2^30)
+        end
         ThreadedSymSpMV(H_qq_stored)
     elseif storage == :direct
         # Peak memory: 1×dim_q²×8 B — threads write directly into H rows (no scratch)
