@@ -123,8 +123,11 @@ q1 = TPSCIstate(q, R=1)
 # ── Table 1: operator throughput ─────────────────────────────────────────────
 @printf("\n")
 @printf(" ┌ Table 1: storage containers — memory and time ──────────────────────────────────────┐\n")
-@printf(" %-9s %10s %10s %11s %11s %8s %11s\n",
-        "storage", "build (s)", "stored", "1-root (s)", "block (s)", "speedup", "per-root (s)")
+# Both time columns are ONE apply; they differ in how many roots ride on it.
+# "R sequential" is what R roots actually cost the old way: R separate applies.
+@printf(" %-9s %10s %10s %11s %13s %12s %8s\n",
+        "storage", "build (s)", "stored",
+        "1 root (s)", "$(NROOTS) seq (s)", "$(NROOTS) blk (s)", "speedup")
 
 x  = randn(dim_q)
 X  = randn(NROOTS, dim_q)
@@ -172,8 +175,8 @@ for storage in (:sparse, :packed, :direct, :matvec, :fois)
     t1 = best(() -> TPSChem.mul_block!(Y1, op1, X1), reps)
     tR = best(() -> TPSChem.mul_block!(YR, opR, X), reps)
     push!(results1, (storage, tbuild, stored, t1, tR))
-    @printf(" %-9s %10.2f %9.3fG %11.4f %11.4f %7.2fx %11.4f   %s\n",
-            storage, tbuild, gib(stored), t1, tR, NROOTS*t1/tR, tR/NROOTS, note)
+    @printf(" %-9s %10.2f %9.3fG %11.4f %13.4f %12.4f %7.2fx   %s\n",
+            storage, tbuild, gib(stored), t1, NROOTS*t1, tR, NROOTS*t1/tR, note)
     flush(stdout)
 end
 @printf(" └%s┘\n", "─"^86)
@@ -192,7 +195,11 @@ let target = parse(Int, get(ENV, "CEPA_BENCH_TARGET_DIMQ", "181214"))
             "packed*", TPSChem._packed_length(target)*8/1e9)
 end
 
-@printf("\n speedup = %i x (1-root time) / (block time); 1.0 means blocking bought nothing\n", NROOTS)
+@printf("\n 1 root  = one apply carrying one root\n")
+@printf(" %i seq   = %i roots the old way: %i separate applies, = %i x the '1 root' column\n",
+        NROOTS, NROOTS, NROOTS, NROOTS)
+@printf(" %i blk   = one apply carrying all %i roots\n", NROOTS, NROOTS)
+@printf(" speedup = (%i seq) / (%i blk); 1.0 means blocking bought nothing\n", NROOTS, NROOTS)
 
 # ── Table 2: end-to-end, one subprocess per configuration ────────────────────
 # CEPA-0 runs a single macro-iteration, so the solve -- the only part blocking
