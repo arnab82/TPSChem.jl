@@ -23,11 +23,29 @@ question is whether H_qq fits in memory.
 
 | single node `build_hqq` | multinode `h_storage` | stores | when to use |
 |---|---|---|---|
-| `:sparse` | `:blocks` | the sparse matrix, `O(nnz)` | it fits — fastest applies by far |
-| `:direct` / `:parallel` | — | dense, `dim_q² × 8 B` | small `dim_q` only |
-| `:matvec` | — | nothing; entries recomputed per apply | matrix will not fit |
+| `:packed` | — | lower triangle, `dim_q(dim_q+1)/2 × 8 B` | **the default choice when a matrix fits** |
+| `:sparse` | `:blocks` | CSC, `nnz × 16 B` | only below 25% fill |
+| `:direct` / `:parallel` | — | dense, `dim_q² × 8 B` | superseded by `:packed`, which holds the same numbers in half the space |
+| `:matvec` | — | nothing; entries recomputed per apply | no matrix fits |
 | `:fois` | `:matrixfree` | nothing; H applied through `open_matvec_thread` | last resort |
 | `:auto` (default) | `:auto` (default) | — | picks for you (multinode checks the memory budget) |
+
+Measured, cr2_13 at `dim_q = 7104`, 4 threads, R = 4 roots:
+
+| storage | build | stored | 1-root apply | block apply |
+|---|---|---|---|---|
+| `:sparse` (34% fill) | 4.21 s | 0.256 GiB | 0.0106 s | 0.0144 s |
+| **`:packed`** | **3.57 s** | **0.188 GiB** | **0.0077 s** | **0.0105 s** |
+| `:direct` | 3.73 s | 0.376 GiB | 0.0149 s | 0.0304 s |
+| `:matvec` | 0.03 s | 0.001 GiB | 3.54 s | 4.41 s |
+| `:fois` | 0.03 s | — | 40.7 s | 41.4 s |
+
+`:packed` is the smallest *and* the fastest of the stored containers here, and the
+quickest to build. Against `:direct` that is exactly the halving you would expect —
+same numbers, half the bytes, and these applies are memory-bandwidth-bound, so
+half the bytes is half the time. Against `:sparse` it wins because CSC costs
+`16 × fill` bytes per entry-equivalent against packed's 4, so `:sparse` only
+overtakes it below 25% fill.
 
 **Size the storage to the node, then check the fill.** Once H_qq is stored the
 solve costs almost nothing on top of it — a blocked MINRES holds seven `R × dim_q`
@@ -83,14 +101,14 @@ Largest `dim_q` that fits a 176 GB budget (80% of a 220 GB node):
 | container | bytes/entry | max dim_q |
 |---|---|---|
 | `:sparse` at 20% fill | 3.2 | 234000 |
+| **`:packed`** | **4.0** | **209000** |
 | `:sparse` at 35% fill | 5.6 | 177000 |
 | `:sparse` at 50% fill | 8.0 | 148000 |
-| `:direct` (full dense) | 8.0 | 148000 | 
+| `:direct` (full dense) | 8.0 | 148000 |
 
-`:direct` is fill-independent, which makes it the predictable option when the fill
-is unknown. Note that `build_H_qq` computes only the lower triangle and then
-mirrors it, so a packed-triangle store would fit `dim_q` up to 209000 in the same
-budget — that container does not exist yet.
+`:packed` is fill-independent, so it is the predictable choice when the fill is
+unknown — and at `dim_q = 181214` it needs 131 GB where `:sparse` at 35% fill
+needs 179 GB and `:direct` needs 263 GB. `:sparse` only beats it below 25% fill.
 
 Multinode `:blocks` sidesteps the whole question: it stores **dense per-Fock-block**
 (8 B per entry, no index overhead) and shards it across nodes, so its footprint is

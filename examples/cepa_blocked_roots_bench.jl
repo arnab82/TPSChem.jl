@@ -122,46 +122,77 @@ q1 = TPSCIstate(q, R=1)
 
 # ── Table 1: operator throughput ─────────────────────────────────────────────
 @printf("\n")
-@printf(" ┌ Table 1: one H_qq apply — single root vs block of %i ─────────────────────────────────┐\n", NROOTS)
-@printf(" %-10s %12s %12s %10s %12s %12s\n",
-        "storage", "1-root (s)", "block (s)", "speedup", "per-root (s)", "build (s)")
+@printf(" ┌ Table 1: storage containers — memory and time ──────────────────────────────────────┐\n")
+@printf(" %-9s %10s %10s %11s %11s %8s %11s\n",
+        "storage", "build (s)", "stored", "1-root (s)", "block (s)", "speedup", "per-root (s)")
 
 x  = randn(dim_q)
 X  = randn(NROOTS, dim_q)
 X1 = reshape(x, 1, dim_q)
 best(f, n) = minimum(begin GC.gc(); @elapsed f() end for _ in 1:n)
+gib(bytes) = bytes / 2^30
 
 results1 = Any[]
-for storage in (:sparse, :direct, :matvec, :fois)
-    local op1, opR, tbuild
+for storage in (:sparse, :packed, :direct, :matvec, :fois)
+    local op1, opR, tbuild, stored, note
+    note = ""
     tbuild = @elapsed begin
         if storage == :sparse
             A = TPSChem.build_H_qq_sparse(q1, cluster_ops, clustered_ham)
             op1 = TPSChem.ThreadedSymSpMV(A); opR = op1
-            @printf(" %-10s nnz = %i (%.2f%% fill, %.2f GiB)\n", "sparse",
-                    nnz(A), 100*nnz(A)/dim_q^2, (nnz(A)*16 + 8dim_q)/2^30)
+            # CSC is 16 B/entry: the value plus an Int64 row index.
+            stored = nnz(A)*(8+8) + (dim_q+1)*8
+            note = @sprintf("%.2f%% fill", 100*nnz(A)/dim_q^2)
+        elseif storage == :packed
+            A = TPSChem.build_H_qq_packed(q1, cluster_ops, clustered_ham)
+            op1 = TPSChem.PackedSymH(A, dim_q; nroots=1)
+            opR = TPSChem.PackedSymH(A, dim_q; nroots=NROOTS)
+            stored = length(A)*8
+            note = "lower triangle"
         elseif storage == :direct
             A = TPSChem.build_H_qq(q1, cluster_ops, clustered_ham)
             op1 = TPSChem.ThreadedSymDenseMV(A); opR = op1
+            stored = dim_q^2*8
+            note = "both triangles"
         elseif storage == :matvec
             op1 = TPSChem.StructuredHqq(q1, cluster_ops, clustered_ham; nroots=1)
             opR = TPSChem.StructuredHqq(q1, cluster_ops, clustered_ham; nroots=NROOTS)
+            # Nothing is stored; the cost is per-thread accumulators.
+            stored = Threads.maxthreadid()*NROOTS*dim_q*8
+            note = "thread scratch only"
         else
             op1 = TPSChem.FoisHqq(q, cluster_ops, clustered_ham; nbody=4, nroots=1)
             opR = TPSChem.FoisHqq(q, cluster_ops, clustered_ham; nbody=4, nroots=NROOTS)
+            stored = NROOTS*dim_q*8
+            note = "nothing stored"
         end
     end
     Y1 = zeros(1, dim_q); YR = zeros(NROOTS, dim_q)
     reps = storage == :fois ? 2 : 3
     t1 = best(() -> TPSChem.mul_block!(Y1, op1, X1), reps)
     tR = best(() -> TPSChem.mul_block!(YR, opR, X), reps)
-    push!(results1, (storage, t1, tR, tbuild))
-    @printf(" %-10s %12.4f %12.4f %9.2fx %12.4f %12.2f\n",
-            storage, t1, tR, NROOTS*t1/tR, tR/NROOTS, tbuild)
+    push!(results1, (storage, tbuild, stored, t1, tR))
+    @printf(" %-9s %10.2f %9.3fG %11.4f %11.4f %7.2fx %11.4f   %s\n",
+            storage, tbuild, gib(stored), t1, tR, NROOTS*t1/tR, tR/NROOTS, note)
     flush(stdout)
 end
 @printf(" └%s┘\n", "─"^86)
-@printf(" speedup = %i x (1-root time) / (block time): 1.0 means blocking bought nothing\n", NROOTS)
+
+# Extrapolate each container to a target dim_q: the stored sizes scale as dim_q^2
+# (fill held fixed), which is the number that decides what fits on a node.
+let target = parse(Int, get(ENV, "CEPA_BENCH_TARGET_DIMQ", "181214"))
+    @printf("\n Storage extrapolated to dim_q = %i (scaling the measured sizes by (dim_q_target/dim_q)^2):\n",
+            target)
+    scale = (target/dim_q)^2
+    for (storage, _, stored, _, _) in results1
+        storage in (:sparse, :packed, :direct) || continue
+        @printf("   %-9s %8.1f GB\n", storage, gib(stored)*scale*2^30/1e9)
+    end
+    @printf("   %-9s %8.1f GB   (fill-independent, = dim_q(dim_q+1)/2 * 8 B)\n",
+            "packed*", TPSChem._packed_length(target)*8/1e9)
+end
+
+@printf("\n speedup = %i x (1-root time) / (block time); 1.0 means blocking bought nothing\n", NROOTS)
 
 # ── Table 2: end-to-end, one subprocess per configuration ────────────────────
 # CEPA-0 runs a single macro-iteration, so the solve -- the only part blocking

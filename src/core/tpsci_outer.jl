@@ -427,6 +427,229 @@ Base.size(op::ThreadedSymDenseMV) = size(op.A)
 Base.eltype(::ThreadedSymDenseMV{T}) where {T} = T
 
 
+# ── Packed symmetric storage ─────────────────────────────────────────────────
+#
+# H_qq is symmetric, and `build_H_qq` already computes only its lower triangle
+# before mirroring it into a full dim_q x dim_q array -- so the dense path stores
+# exactly twice what it needs. Keeping just the triangle halves that, and unlike
+# a sparse container the size does not depend on a fill fraction.
+#
+# Layout: lower triangle packed **by row**, so row i occupies
+# `data[i(i-1)/2 + 1 : i(i-1)/2 + i]`. LAPACK's packed formats pack by column,
+# which would scatter each row across the whole array; packing by row keeps a
+# thread's reads contiguous in both the build and the apply, and costs nothing
+# because for a symmetric matrix the two layouts hold the same numbers.
+
+"""
+    _packed_index(i, j) -> Int
+
+Position of the lower-triangle entry `(i, j)`, `j <= i`, in row-packed storage.
+"""
+@inline _packed_index(i::Int, j::Int) = ((i * (i - 1)) >> 1) + j
+
+"""
+    _packed_length(n) -> Int
+
+Number of stored entries for an `n x n` symmetric matrix: `n(n+1)/2`.
+"""
+@inline _packed_length(n::Int) = (n * (n + 1)) >> 1
+
+"""
+    _packed_balanced_ranges(n, nchunks) -> Vector{UnitRange{Int}}
+
+Split `1:n` into contiguous row ranges holding roughly equal numbers of stored
+entries. Row `i` holds `i` of them, so an even split by row index would give the
+last thread `n` times the work of the first; the boundaries here come from
+inverting the triangular number `i(i+1)/2`.
+"""
+function _packed_balanced_ranges(n::Int, nchunks::Int)
+#={{{=#
+    n > 0 || return UnitRange{Int}[]
+    nchunks = clamp(nchunks, 1, n)
+    total = _packed_length(n)
+    ranges = UnitRange{Int}[]
+    start = 1
+    for c in 1:nchunks-1
+        start > n && break
+        target = (total * c) / nchunks
+        # smallest i with i(i+1)/2 >= target
+        stop = clamp(ceil(Int, (sqrt(1 + 8 * target) - 1) / 2), start, n)
+        push!(ranges, start:stop)
+        start = stop + 1
+    end
+    start <= n && push!(ranges, start:n)
+    return ranges
+end
+#=}}}=#
+
+"""
+    build_H_qq_packed(ci_vector, cluster_ops, clustered_ham) -> Vector{T}
+
+Build H_qq for the Q space defined by `ci_vector`, storing only the lower
+triangle, row-packed.
+
+Peak memory is the final size — `dim_q(dim_q+1)/2 * 8` bytes and nothing else.
+That is half of `build_H_qq`, and it compares even better against
+`build_H_qq_sparse`, whose per-thread COO triplets transiently cost ~24 bytes per
+stored entry before `sparse()` compresses them.
+
+Each thread owns whole rows, and row `i` writes only positions
+`i(i-1)/2 + 1 ... i(i-1)/2 + i`, so the writes are contiguous and disjoint: no
+locks, no scratch, no race.
+"""
+function build_H_qq_packed(ci_vector::TPSCIstate{T,N,R}, cluster_ops,
+                           clustered_ham::ClusteredOperator) where {T,N,R}
+#={{{=#
+    dim = length(ci_vector)
+    data = zeros(T, _packed_length(dim))
+
+    jobs = Vector{Tuple{Int,FockConfig{N},ClusterConfig{N}}}()
+    bra_idx = 0
+    for (fock_bra, configs_bra) in ci_vector.data
+        for (config_bra, _) in configs_bra
+            bra_idx += 1
+            push!(jobs, (bra_idx, fock_bra, config_bra))
+        end
+    end
+
+    Threads.@threads :dynamic for job in jobs
+        bra_idx_j  = job[1]
+        fock_bra   = job[2]
+        config_bra = job[3]
+        base = (bra_idx_j * (bra_idx_j - 1)) >> 1
+        ket_idx = 0
+
+        for (fock_ket, configs_ket) in ci_vector.data
+            fock_trans = fock_bra - fock_ket
+            if !haskey(clustered_ham, fock_trans)
+                ket_idx += length(configs_ket)
+                continue
+            end
+            for (config_ket, _) in configs_ket
+                ket_idx += 1
+                ket_idx <= bra_idx_j || continue   # lower triangle only
+
+                me = zero(T)
+                for term in clustered_ham[fock_trans]
+                    check_term(term, fock_bra, config_bra, fock_ket, config_ket) || continue
+                    me += contract_matrix_element(term, cluster_ops, fock_bra, config_bra,
+                                                  fock_ket, config_ket)
+                end
+                iszero(me) && continue
+                @inbounds data[base + ket_idx] += me
+            end
+        end
+    end
+
+    return data
+end
+#=}}}=#
+
+"""
+    PackedSymH(data, n; chunks_per_thread=4, nroots=1)
+
+Q-space operator over a row-packed lower triangle (see `build_H_qq_packed`).
+
+Half the memory of a full dense `H_qq`, independent of any fill fraction, and it
+moves half the bytes per apply — which is what matters, since these applies are
+memory-bandwidth-bound. `LinearAlgebra`'s packed kernel (`BLAS.spmv!`) does not
+thread and gives that advantage back, so the kernels here are hand-threaded.
+
+Row `i` contributes twice, once to `y[i]` by a contiguous dot over the row and
+once to `y[1:i-1]` by an axpy — and the axpy overlaps the rows other threads own.
+Each thread therefore accumulates into its own buffer, which is reduced at the
+end: `O(nthreads * R * n)` of scratch, about 0.5 GB at 64 threads, 6 roots and
+`n = 181000`, against a matrix measured in hundreds of GB.
+"""
+mutable struct PackedSymH{T}
+    data::Vector{T}
+    n::Int
+    ranges::Vector{UnitRange{Int}}
+    scr::Vector{Matrix{T}}          # per-thread R x n accumulators
+end
+
+function PackedSymH(data::Vector{T}, n::Int; chunks_per_thread::Int=4,
+                    nroots::Int=1) where {T}
+    length(data) == _packed_length(n) ||
+        throw(DimensionMismatch("packed data has $(length(data)) entries, expected $(_packed_length(n)) for n=$n"))
+    ranges = _packed_balanced_ranges(n, chunks_per_thread * Threads.nthreads())
+    scr = [zeros(T, nroots, n) for _ in 1:Threads.maxthreadid()]
+    return PackedSymH{T}(data, n, ranges, scr)
+end
+
+Base.size(op::PackedSymH) = (op.n, op.n)
+Base.eltype(::PackedSymH{T}) where {T} = T
+
+"""
+    qspace_diagonal(op) -> Vector or nothing
+
+The Q-space Hamiltonian diagonal, for the `:pcg` preconditioner, or `nothing`
+when the operator stores nothing to read it from and the caller must recompute it.
+"""
+function qspace_diagonal end
+
+qspace_diagonal(op::ThreadedSymSpMV{T}) where {T} = Vector{T}(diag(op.A))
+qspace_diagonal(op::ThreadedSymDenseMV{T}) where {T} = Vector{T}(diag(op.A))
+qspace_diagonal(::Any) = nothing
+
+function qspace_diagonal(op::PackedSymH{T}) where {T}
+    d = Vector{T}(undef, op.n)
+    @inbounds for i in 1:op.n
+        d[i] = op.data[_packed_index(i, i)]
+    end
+    return d
+end
+
+function mul_block!(Y::Matrix{T}, op::PackedSymH{T}, X::Matrix{T}) where {T}
+#={{{=#
+    nr, n = size(X)
+    n == op.n || throw(DimensionMismatch("X has $n columns, expected $(op.n)"))
+    size(Y) == (nr, n) || throw(DimensionMismatch("Y is $(size(Y)), expected $((nr, n))"))
+    nr <= size(op.scr[1], 1) ||
+        throw(DimensionMismatch("operator was built for $(size(op.scr[1],1)) roots, got $nr"))
+
+    data = op.data
+    for s in op.scr
+        fill!(s, zero(T))
+    end
+
+    Threads.@threads :static for rng in op.ranges
+        acc = op.scr[Threads.threadid()]
+        @inbounds for i in rng
+            base = (i * (i - 1)) >> 1
+            for j in 1:i-1
+                a = data[base + j]
+                iszero(a) && continue
+                # One stored entry serves both triangles, and both slices are
+                # contiguous in the root index — the point of the block layout.
+                @simd for c in 1:nr
+                    acc[c, i] += a * X[c, j]
+                    acc[c, j] += a * X[c, i]
+                end
+            end
+            a = data[base + i]                     # diagonal, counted once
+            @simd for c in 1:nr
+                acc[c, i] += a * X[c, i]
+            end
+        end
+    end
+
+    Y .= view(op.scr[1], 1:nr, :)
+    for t in 2:length(op.scr)
+        Y .+= view(op.scr[t], 1:nr, :)
+    end
+    return Y
+end
+#=}}}=#
+
+function LinearAlgebra.mul!(y::Vector{T}, op::PackedSymH{T}, x::Vector{T}) where {T}
+    mul_block!(reshape(y, 1, length(y)), op, reshape(x, 1, length(x)))
+    return y
+end
+
+(op::PackedSymH{T})(x::Vector{T}) where {T} = mul!(similar(x, op.n), op, x)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Block (multi-root) Q-space operators.
 #
@@ -2482,8 +2705,13 @@ which combination was taken.
   the legacy default.
 
 `build_hqq` — how H is applied on Q:
-- `:sparse` — H_qq stored as a sparse matrix, `O(nnz)` to build. Applied through
-  [`ThreadedSymSpMV`](@ref), which threads what `SparseArrays` runs on one core.
+- `:sparse` — H_qq stored as CSC, 16 bytes per stored entry (value plus an
+  `Int64` row index). Smallest only below 25% fill; its COO build also peaks at
+  ~24 bytes per entry. Applied through [`ThreadedSymSpMV`](@ref), which threads
+  what `SparseArrays` runs on one core.
+- `:packed` — the lower triangle only, row-packed: `dim_q(dim_q+1)/2 * 8` bytes,
+  independent of fill, and its peak equals its final size. Half of `:direct` for
+  the same information, and half the bytes moved per apply ([`PackedSymH`](@ref)).
 - `:direct` / `:parallel` — H_qq stored dense, `dim_q^2 * 8` bytes.
 - `:matvec` — nothing stored; entries are recomputed every apply
   ([`StructuredHqq`](@ref)). `O(nthreads × R × dim_q)` memory, so this is what is
@@ -2530,8 +2758,9 @@ function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
     # ── Pathway selection ────────────────────────────────────────────────────────
     solver in (:krylov, :minres, :pcg) ||
         error("Unknown CEPA solver: $solver. Use :krylov, :minres, or :pcg.")
-    build_hqq in (:auto, :fois, :matvec, :sparse, :direct, :parallel) ||
-        error("Unknown build_hqq: $build_hqq. Use :auto, :fois, :matvec, :sparse, :direct, or :parallel.")
+    build_hqq in (:auto, :fois, :matvec, :sparse, :packed, :direct, :parallel) ||
+        error("Unknown build_hqq: $build_hqq. Use :auto, :fois, :matvec, :sparse, " *
+              ":packed, :direct, or :parallel.")
 
     # :auto reproduces what each solver used to do on its own.
     storage = build_hqq == :auto ? (solver == :krylov ? :fois : :direct) : build_hqq
@@ -2552,7 +2781,6 @@ function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
     nrb = block ? R : 1
 
     # ── Build (or wrap) the Q-space operator ─────────────────────────────────────
-    H_qq_stored = nothing   # set only when a matrix is actually materialised
     Hq = if storage == :sparse
         # CSC pays 16 B per stored entry (value + Int64 row index) against dense's
         # 8 B, so it only wins below 50% fill -- and H_qq is often well above that.
@@ -2562,29 +2790,38 @@ function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
         @printf(" %-28s %.2f GiB  (CSC breaks even with dense at 50%% fill)\n",
                 " dense would be:", dim_q^2*sizeof(T)/2^30)
         flush(stdout)
-        @time H_qq_stored = build_H_qq_sparse(cepa_work, cluster_ops, clustered_ham)
-        fill_frac = nnz(H_qq_stored)/dim_q^2
-        @printf(" H_qq nnz = %i  (%.3f%% fill, %.2f GiB CSC)\n",
-                nnz(H_qq_stored), 100*fill_frac,
-                (nnz(H_qq_stored)*(sizeof(T)+8) + (dim_q+1)*8)/2^30)
-        if fill_frac > 0.5
-            @printf(" note: %.0f%% fill — build_hqq=:direct would store this in %.2f GiB\n",
-                    100*fill_frac, dim_q^2*sizeof(T)/2^30)
-            @printf("       instead of %.2f GiB, and apply faster. :sparse only pays below 50%%.\n",
-                    (nnz(H_qq_stored)*(sizeof(T)+8) + (dim_q+1)*8)/2^30)
+        @time A = build_H_qq_sparse(cepa_work, cluster_ops, clustered_ham)
+        fill_frac = nnz(A)/dim_q^2
+        csc_gib = (nnz(A)*(sizeof(T)+8) + (dim_q+1)*8)/2^30
+        @printf(" H_qq nnz = %i  (%.3f%% fill, %.2f GiB CSC)\n", nnz(A), 100*fill_frac, csc_gib)
+        # CSC costs 16 B/entry against packed's 4 and dense's 8, so it only wins
+        # at low fill. Say so rather than leaving it to be discovered later.
+        if fill_frac > 0.25
+            @printf(" note: %.0f%% fill — build_hqq=:packed would store this in %.2f GiB\n",
+                    100*fill_frac, _packed_length(dim_q)*sizeof(T)/2^30)
+            @printf("       instead of %.2f GiB. :sparse only pays below 25%% fill.\n", csc_gib)
         end
-        ThreadedSymSpMV(H_qq_stored)
+        ThreadedSymSpMV(A)
+    elseif storage == :packed
+        # Peak memory IS the final size: dim_q(dim_q+1)/2 * 8 B, no scratch and no
+        # dependence on fill. Half of :direct, and below 25% fill :sparse is smaller.
+        @printf(" Building H_qq (%i × %i) [packed lower triangle, %.2f GiB] — reused by every solve\n",
+                dim_q, dim_q, _packed_length(dim_q)*sizeof(T)/2^30)
+        flush(stdout)
+        @time A = build_H_qq_packed(cepa_work, cluster_ops, clustered_ham)
+        PackedSymH(A, dim_q; nroots=nrb)
     elseif storage == :direct
-        # Peak memory: 1×dim_q²×8 B — threads write directly into H rows (no scratch)
-        @printf(" Building H_qq (%i × %i) [dense, %.2f GiB] — reused by every solve\n",
-                dim_q, dim_q, dim_q^2*sizeof(T)/2^30)
-        @time H_qq_stored = build_H_qq(cepa_work, cluster_ops, clustered_ham)
-        ThreadedSymDenseMV(H_qq_stored)
+        # Peak memory: 1×dim_q²×8 B — threads write directly into H rows (no scratch).
+        # Twice :packed, which stores the same information.
+        @printf(" Building H_qq (%i × %i) [dense, %.2f GiB — :packed stores this in %.2f GiB]\n",
+                dim_q, dim_q, dim_q^2*sizeof(T)/2^30, _packed_length(dim_q)*sizeof(T)/2^30)
+        @time A = build_H_qq(cepa_work, cluster_ops, clustered_ham)
+        ThreadedSymDenseMV(A)
     elseif storage == :parallel
         # build_full_H_parallel peaks at 2×dim_q²×8 B because of its scratch copies
         @printf(" Building H_qq (%i × %i) [dense/parallel] — reused by every solve\n", dim_q, dim_q)
-        @time H_qq_stored = build_full_H_parallel(cepa_work, cepa_work, cluster_ops, clustered_ham, sym=true)
-        ThreadedSymDenseMV(H_qq_stored)
+        @time A = build_full_H_parallel(cepa_work, cepa_work, cluster_ops, clustered_ham, sym=true)
+        ThreadedSymDenseMV(A)
     elseif storage == :matvec
         @printf(" H_qq recomputed on every apply [matvec] — nothing stored, %.2f GiB of thread scratch\n",
                 Threads.maxthreadid()*nrb*dim_q*sizeof(T)/2^30)
@@ -2620,12 +2857,14 @@ function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, e0::Vector,
     Hdiag     = T[]
     hdiag_min = zero(T)
     if solver == :pcg
-        if H_qq_stored !== nothing
-            Hdiag = Vector{T}(diag(H_qq_stored))
-        else
+        # Operators holding a matrix read their own diagonal; the ones that store
+        # nothing return `nothing`, and it gets contracted from scratch instead.
+        d = qspace_diagonal(Hq)
+        if d === nothing
             @printf(" Computing Q-space diagonal for the PCG preconditioner\n")
-            @time Hdiag = Vector{T}(compute_diagonal(cepa_work, cluster_ops, clustered_ham))
+            @time d = compute_diagonal(cepa_work, cluster_ops, clustered_ham)
         end
+        Hdiag = Vector{T}(d)
         hdiag_min = minimum(Hdiag)
     end
 

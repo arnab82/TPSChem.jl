@@ -37,17 +37,21 @@ using Printf
                                                       clustered_ham; common..., kwargs...))
 
     # CEPA-0: single shift, so every solver sees the same linear system.
-    e_minres    = run_cepa(solver=:minres, build_hqq=:sparse)
-    e_pcg       = run_cepa(solver=:pcg,    build_hqq=:sparse)
-    e_pcg_dense = run_cepa(solver=:pcg,    build_hqq=:direct)
-    e_pcg_mf    = run_cepa(solver=:pcg,    build_hqq=:matvec)
-    e_krylov    = run_cepa(solver=:krylov)
+    e_minres     = run_cepa(solver=:minres, build_hqq=:sparse)
+    e_pcg        = run_cepa(solver=:pcg,    build_hqq=:sparse)
+    e_pcg_dense  = run_cepa(solver=:pcg,    build_hqq=:direct)
+    e_pcg_packed = run_cepa(solver=:pcg,    build_hqq=:packed)
+    e_pcg_mf     = run_cepa(solver=:pcg,    build_hqq=:matvec)
+    e_krylov     = run_cepa(solver=:krylov)
 
     @test length(e_minres) == nroots
-    @test isapprox(e_pcg,       e_minres, atol=1e-8)
-    @test isapprox(e_pcg_dense, e_minres, atol=1e-8)
-    @test isapprox(e_pcg_mf,    e_minres, atol=1e-8)
-    @test isapprox(e_krylov,    e_minres, atol=1e-8)
+    @test isapprox(e_pcg,        e_minres, atol=1e-8)
+    @test isapprox(e_pcg_dense,  e_minres, atol=1e-8)
+    # :packed holds the same numbers as :direct in half the memory, so it must
+    # agree with it exactly, not merely to the solver tolerance.
+    @test isapprox(e_pcg_packed, e_pcg_dense, atol=1e-10)
+    @test isapprox(e_pcg_mf,     e_minres, atol=1e-8)
+    @test isapprox(e_krylov,     e_minres, atol=1e-8)
 
     # ACPF drives the shift iteratively, which is what exercises the PCG warm start.
     # It also exercises the MINRES hand-off: the excited-root shift wanders far enough
@@ -75,8 +79,9 @@ using Printf
     run_exact(; kwargs...) = first(TPSChem.do_fois_cepa(deepcopy(ci_vector), cluster_ops,
                                                        clustered_ham; exact..., kwargs...))
 
-    for (slv, store) in ((:minres, :sparse), (:minres, :matvec), (:minres, :fois),
-                         (:pcg, :sparse), (:pcg, :direct), (:pcg, :matvec), (:pcg, :fois))
+    for (slv, store) in ((:minres, :sparse), (:minres, :packed), (:minres, :matvec),
+                         (:minres, :fois), (:pcg, :sparse), (:pcg, :packed),
+                         (:pcg, :direct), (:pcg, :matvec), (:pcg, :fois))
         e_single = run_exact(solver=slv, build_hqq=store, block_roots=false)
         e_block  = run_exact(solver=slv, build_hqq=store, block_roots=true)
         @test isapprox(e_block, e_single, atol=1e-8)
